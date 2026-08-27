@@ -21,6 +21,11 @@ const server_messages = @import("server_messages.zig");
 const transcript = @import("transcript.zig");
 
 const client_x25519_private = [_]u8{0x31} ** 31 ++ [_]u8{0x07};
+
+/// A self-signed leaf carrying a 512-bit RSA key — smaller than any
+/// modulus `verifyRsaPss` accepts, and the smallest openssl will mint.
+/// Throwaway material, never a credential.
+const rsa512_leaf_der = @embedFile("testdata/rsa512-leaf.der");
 const server_x25519_private = [_]u8{0x93} ** 31 ++ [_]u8{0x0e};
 
 const Buffers = struct {
@@ -308,12 +313,22 @@ fn serverFlightProtector(
 }
 
 test "a hostile server flight errors rather than panicking" {
-    // Both shapes below used to reach an assertion on attacker-shaped
-    // input: CertificateVerify with no Certificate yet, and a second
-    // Certificate overwriting the first. They must be protocol errors.
-    const shapes = [_]enum { verify_without_certificate, duplicate_certificate }{
-        .verify_without_certificate,
-        .duplicate_certificate,
+    // Every shape below once reached an assertion on attacker-shaped
+    // input. They must be protocol errors.
+    const Shape = struct {
+        kind: enum { verify_without_certificate, duplicate_certificate, undersized_rsa_leaf },
+        expected: anyerror,
+    };
+    const shapes = [_]Shape{
+        // CertificateVerify with nothing to verify against.
+        .{ .kind = .verify_without_certificate, .expected = error.UnexpectedMessage },
+        // A second Certificate overwriting the first.
+        .{ .kind = .duplicate_certificate, .expected = error.UnexpectedMessage },
+        // An RSA leaf whose modulus is smaller than any size we verify.
+        // `captureLeaf` only sanity-floors the encoded key, so the length
+        // that decides this is the peer's; the size gate lives in
+        // `verifyRsaPss` and must *refuse*, never assert.
+        .{ .kind = .undersized_rsa_leaf, .expected = error.BadCertificate },
     };
     for (shapes) |shape| {
         var buffers: Buffers = .{};
@@ -340,7 +355,7 @@ test "a hostile server flight errors rather than panicking" {
         var used: usize = 0;
         const extensions = server_messages.encryptedExtensions(plaintext[used..], "http/1.1");
         used += extensions.len;
-        switch (shape) {
+        switch (shape.kind) {
             .verify_without_certificate => {
                 // CertificateVerify with nothing to verify against.
                 const forged = server_messages.certificateVerify(plaintext[used..], 0x0403, &(.{0x30} ** 70));
@@ -353,11 +368,21 @@ test "a hostile server flight errors rather than panicking" {
                 const second = server_messages.certificateChain(plaintext[used..], chain);
                 used += second.len;
             },
+            .undersized_rsa_leaf => {
+                const leaf: []const u8 = rsa512_leaf_der;
+                const certificate = server_messages.certificateChain(plaintext[used..], &.{leaf});
+                used += certificate.len;
+                // rsa_pss_rsae_sha256 over a 512-bit modulus: the scheme
+                // and the key kind agree, so this reaches the size gate
+                // rather than being turned away by the kind check.
+                const forged = server_messages.certificateVerify(plaintext[used..], 0x0804, &(.{0x30} ** 64));
+                used += forged.len;
+            },
         }
         var forged_record: [record.wire_record_bytes_max]u8 = undefined;
         const sealed = try forger.seal(.handshake, plaintext[0..used], &forged_record);
         try testing.expectError(
-            error.UnexpectedMessage,
+            shape.expected,
             harness.client.handleRecord(sealed, &buffers.scratch),
         );
         try testing.expectEqual(ClientHandshake.State.failed, harness.client.state);

@@ -531,8 +531,12 @@ fn captureLeaf(self: *ClientHandshake, body: []const u8) Error!void {
             },
             else => return error.BadCertificate,
         },
-        // The key is a DER `RSAPublicKey`; its modulus length is checked
-        // where the signature is, since that is what bounds both.
+        // The key is a DER `RSAPublicKey`. Only a sanity floor here — two
+        // INTEGERs and a SEQUENCE header cannot be shorter and still be
+        // one — because the length that actually matters is the *modulus*,
+        // and `verifyRsaPss` is where that is read and bounded to the four
+        // sizes std supports. Nothing downstream may key an assertion off
+        // this number: it is the peer's to choose.
         .rsaEncryption => {
             if (public_key.len < 64) return error.BadCertificate;
             self.leaf_key_kind = .rsa;
@@ -546,7 +550,14 @@ fn captureLeaf(self: *ClientHandshake, body: []const u8) Error!void {
 /// §4.4.3, taken against the *presented* leaf: possession, not identity.
 fn verifyCertificate(self: *ClientHandshake, arm: anytype, message: handshake.Message) Error!void {
     if (self.config.certificate_policy == .insecure_no_verification) return;
-    assert(self.leaf_public_key_bytes >= 65);
+    // A leaf was captured — the flight ordering in `drainFlight` guarantees
+    // it. Deliberately *not* an assertion about the key's length: that is a
+    // number the peer chooses, and the previous `>= 65` here was an ECDSA
+    // floor left standing when RSA leaves arrived with a floor of 64. A
+    // leaf whose `RSAPublicKey` DER is exactly 64 bytes would have reached
+    // it and panicked. Each verifier asserts its own precondition instead,
+    // where the kind is known.
+    assert(self.leaf_key_kind != .none);
     var body = wire.Cursor.init(message.body());
     const scheme = try body.takeU16();
     const signature = try body.takeSlice(try body.takeU16());
