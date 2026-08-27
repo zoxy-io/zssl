@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const libcrypto = openssl_dependency.artifact("openssl");
+    const libcrypto = openssl_dependency.artifact("crypto");
     libcrypto.root_module.sanitize_c = .off;
 
     const zssl_module = b.addModule("zssl", .{

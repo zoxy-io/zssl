@@ -8,9 +8,12 @@ first line.
 Read before writing code:
 
 - [docs/DESIGN.md](docs/DESIGN.md) — scope, the trust split, the slice
-  plan, and the testing stance.
+  ladder and what each slice's oracle proved, and the testing stance.
 - [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) — the enforced style
   contract, a verbatim copy of zoxy's.
+- [docs/BOGO.md](docs/BOGO.md) — the one gate still outstanding, and why
+  it is staged rather than half-built. Everything below tests what zssl
+  *accepts*; BoGo is what tests the refusals.
 
 ## Gates
 
@@ -42,11 +45,12 @@ Read before writing code:
     bytes yield a value or an error and never a panic. `zig build test`
     runs each once over its corpus; the coverage-guided `--fuzz` search
     is blocked on a 0.16.0 toolchain bug (see DESIGN.md §6).
-- `zig build interop` — the real-OpenSSL gate: `openssl s_client`
-  against our `ServerHandshake` (openssl's X.509 verifying our
-  certificate) and our `ClientHandshake` against `openssl s_server`,
-  over loopback sockets. Exits 2 and says so when no TLS 1.3-capable
-  `openssl` is on PATH, rather than failing.
+- `zig build interop` — the real-OpenSSL gate, over loopback sockets:
+  `openssl s_client` against our `ServerHandshake`, with openssl's own
+  X.509 verifying our certificate, and our `ClientHandshake` against
+  `openssl s_server -rev`, opening the reversed echo openssl sealed
+  back. Exits 2 with a readable SKIP when no TLS 1.3-capable `openssl`
+  is on PATH, rather than failing.
 - `zig build test -Doptimize=ReleaseSafe` — the same suite in the mode
   release builds ship (assertions stay on; libcrypto builds with
   `sanitize_c = .off` in every mode — zoxy's #283).
@@ -54,12 +58,3 @@ Read before writing code:
 
 Test vectors are generated, not transcribed: `scripts/extract_rfc8448.py`
 parses the RFC text into `src/rfc8448_vectors.zig`.
-
-## Status
-
-Slices 1 (foundations), 2 (ServerHandshake), 3 (resumption), 4
-(KeyUpdate, the kTLS switchover contract, ClientHandshake), and most of
-5 (fuzzing and real-OpenSSL interop) — see DESIGN.md §6 for what each
-proved. The one item still outstanding is the **BoGo shim**, the only
-adversarial gate on the ladder; `docs/BOGO.md` states what it needs and
-why it is not claimed as done.
