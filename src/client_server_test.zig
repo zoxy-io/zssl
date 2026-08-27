@@ -57,11 +57,21 @@ const Harness = struct {
     server: ServerHandshake,
     client: ClientHandshake,
 
-    fn init(
-        harness: *Harness,
-        store: ?*TicketStore,
-        resume_session: ?ClientHandshake.Resumption,
-    ) !void {
+    /// What a test varies. Everything defaults to the ordinary
+    /// ECDSA-leaf, single-ALPN session the bulk of these tests want.
+    const Options = struct {
+        store: ?*TicketStore = null,
+        resume_session: ?ClientHandshake.Resumption = null,
+        /// What the server selects, or null to select nothing.
+        server_alpn: ?[]const u8 = "http/1.1",
+        client_alpn: []const []const u8 = &.{"http/1.1"},
+        certificate_policy: ClientHandshake.CertificatePolicy = .leaf_signature,
+        chain_verifier: ?ClientHandshake.ChainVerifier = null,
+    };
+
+    fn init(harness: *Harness, options: Options) !void {
+        const store = options.store;
+        const resume_session = options.resume_session;
         harness.credentials = try Credentials.load(
             @embedFile("testdata/cert.pem"),
             @embedFile("testdata/key.pem"),
@@ -72,7 +82,7 @@ const Harness = struct {
             .credentials = &harness.credentials,
             .server_random = .{0x6d} ** 32,
             .x25519_private = server_x25519_private,
-            .alpn = "http/1.1",
+            .alpn = options.server_alpn,
             .reassembly = &harness.server_reassembly,
             .flight = &harness.flight,
             .psk_lookup = if (store) |context| .{
@@ -85,8 +95,9 @@ const Harness = struct {
             .x25519_private = client_x25519_private,
             .session_id = &(.{0x44} ** 32),
             .server_name = "spike.zoxy.test",
-            .alpn = "http/1.1",
-            .certificate_policy = .ecdsa_leaf_signature,
+            .alpn_protocols = options.client_alpn,
+            .certificate_policy = options.certificate_policy,
+            .chain_verifier = options.chain_verifier,
             .resume_session = resume_session,
             .reassembly = &harness.client_reassembly,
         });
@@ -161,11 +172,11 @@ test "production client ↔ server: handshake, data, ticket capture, resumption"
 
     // Session one, full handshake with leaf verification and ALPN.
     var first: Harness = undefined;
-    try first.init(null, null);
+    try first.init(.{});
     defer first.deinit();
     try first.connect(&buffers);
     try testing.expect(first.client.certificate_verified);
-    try testing.expect(first.client.alpn_confirmed);
+    try testing.expectEqualSlices(u8, "http/1.1", first.client.alpnSelected().?);
     try testing.expect(!first.client.resumed);
     try testing.expect(!first.server.resumed);
 
@@ -215,7 +226,7 @@ test "production client ↔ server: handshake, data, ticket capture, resumption"
 
     // Session two: resumed on the captured ticket, no certificate leg.
     var second: Harness = undefined;
-    try second.init(&store, resumption);
+    try second.init(.{ .store = &store, .resume_session = resumption });
     defer second.deinit();
     try second.connect(&buffers);
     try testing.expect(second.server.resumed);
@@ -229,7 +240,7 @@ test "production client ↔ server: handshake, data, ticket capture, resumption"
 test "KeyUpdate both ways: generations rotate and the kTLS export tracks them" {
     var buffers: Buffers = .{};
     var harness: Harness = undefined;
-    try harness.init(null, null);
+    try harness.init(.{});
     defer harness.deinit();
     try harness.connect(&buffers);
     try expectExportAgreement(&harness.server, &harness.client);
@@ -307,7 +318,7 @@ test "a hostile server flight errors rather than panicking" {
     for (shapes) |shape| {
         var buffers: Buffers = .{};
         var harness: Harness = undefined;
-        try harness.init(null, null);
+        try harness.init(.{});
         defer harness.deinit();
 
         // Drive the real handshake far enough that the client holds the
@@ -356,7 +367,7 @@ test "a hostile server flight errors rather than panicking" {
 test "the client refuses HelloRetryRequest, structurally" {
     var buffers: Buffers = .{};
     var harness: Harness = undefined;
-    try harness.init(null, null);
+    try harness.init(.{});
     defer harness.deinit();
     _ = harness.client.start(&buffers.client_out);
 
@@ -373,4 +384,149 @@ test "the client refuses HelloRetryRequest, structurally" {
         harness.client.handleRecord(wire_buffer[0 .. record.header_bytes + retry.len], &buffers.scratch),
     );
     try testing.expectEqual(ClientHandshake.State.failed, harness.client.state);
+}
+
+/// A `chain_verifier` that records what it was shown and answers with a
+/// verdict the test chose in advance.
+const ChainSpy = struct {
+    verdict: bool,
+    calls: u8 = 0,
+    entries: usize = 0,
+    leaf_bytes: usize = 0,
+    malformed: bool = false,
+
+    fn verify(context: *anyopaque, chain: ClientHandshake.CertificateList) bool {
+        const spy: *ChainSpy = @ptrCast(@alignCast(context));
+        spy.calls += 1;
+        var it = chain.iterator();
+        while (it.next() catch {
+            spy.malformed = true;
+            return false;
+        }) |entry| {
+            if (spy.entries == 0) spy.leaf_bytes = entry.len;
+            spy.entries += 1;
+        }
+        return spy.verdict;
+    }
+
+    fn verifier(spy: *ChainSpy) ClientHandshake.ChainVerifier {
+        return .{ .context = spy, .verify = ChainSpy.verify };
+    }
+};
+
+test "the chain verifier is shown the peer's chain, leaf first" {
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    var spy: ChainSpy = .{ .verdict = true };
+    try harness.init(.{ .chain_verifier = spy.verifier() });
+    defer harness.deinit();
+    try harness.connect(&buffers);
+
+    try testing.expectEqual(@as(u8, 1), spy.calls);
+    try testing.expect(!spy.malformed);
+    try testing.expectEqual(@as(usize, 1), spy.entries);
+    // The leaf it saw is the fixture the server actually holds, not a
+    // slice that merely had a plausible length.
+    const leaf = harness.credentials.certificates[0];
+    try testing.expectEqual(leaf.len, spy.leaf_bytes);
+    const certificate: std.crypto.Certificate = .{ .buffer = leaf, .index = 0 };
+    const parsed = try certificate.parse();
+    try testing.expectEqual(
+        std.crypto.Certificate.Parsed.PubKeyAlgo.X9_62_id_ecPublicKey,
+        std.meta.activeTag(parsed.pub_key_algo),
+    );
+}
+
+test "a chain the embedder refuses fails the handshake" {
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    var spy: ChainSpy = .{ .verdict = false };
+    try harness.init(.{ .chain_verifier = spy.verifier() });
+    defer harness.deinit();
+
+    // The refusal is the embedder's, but the abort is ours: a chain the
+    // embedder rejected must never reach `connected`.
+    try testing.expectError(error.BadCertificate, harness.connect(&buffers));
+    try testing.expectEqual(@as(u8, 1), spy.calls);
+    try testing.expectEqual(ClientHandshake.State.failed, harness.client.state);
+    try testing.expect(!harness.client.certificate_verified);
+}
+
+test "ALPN: the client reports which of its offers the server took" {
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    // `h2` first, and the server takes the second — so a client that
+    // simply echoed its own preference would fail this.
+    try harness.init(.{
+        .client_alpn = &.{ "h2", "http/1.1" },
+        .server_alpn = "http/1.1",
+    });
+    defer harness.deinit();
+    try harness.connect(&buffers);
+
+    try testing.expectEqualSlices(u8, "http/1.1", harness.client.alpnSelected().?);
+}
+
+test "ALPN: a protocol the client never offered is refused" {
+    // Our own server will not commit this — it selects only from what
+    // the hello advertised — so the violation has to be forged under the
+    // genuine handshake keys. RFC 7301 §3.2 makes it the client's job to
+    // catch, and a client that trusted the selection would hand the
+    // embedder a protocol it never agreed to speak.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{ .client_alpn = &.{"h2"}, .server_alpn = "h2" });
+    defer harness.deinit();
+
+    const hello = harness.client.start(&buffers.client_out);
+    const flight = try harness.server.handleRecord(hello, &buffers.server_out);
+    const server_hello_record = recordAt(flight.send, 0);
+    _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
+    try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
+
+    var forger = try serverFlightProtector(
+        &client_x25519_private,
+        hello,
+        server_hello_record,
+    );
+    defer forger.deinit();
+    var plaintext: [4096]u8 = undefined;
+    // "http/1.1" was never in the offer — only "h2" was.
+    const extensions = server_messages.encryptedExtensions(&plaintext, "http/1.1");
+    var forged_record: [record.wire_record_bytes_max]u8 = undefined;
+    const sealed = try forger.seal(.handshake, extensions, &forged_record);
+
+    try testing.expectError(
+        error.BadAlpn,
+        harness.client.handleRecord(sealed, &buffers.scratch),
+    );
+    try testing.expectEqual(ClientHandshake.State.failed, harness.client.state);
+    try testing.expectEqual(@as(?[]const u8, null), harness.client.alpnSelected());
+}
+
+test "ALPN: a server that selects nothing leaves the choice unmade" {
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{ .client_alpn = &.{ "h2", "http/1.1" }, .server_alpn = null });
+    defer harness.deinit();
+    try harness.connect(&buffers);
+
+    // Not an error: the embedder decides whether it can proceed without
+    // one, which is what a load generator meeting an HTTP/1.1-only
+    // server needs to be able to report rather than crash on.
+    try testing.expectEqual(@as(?[]const u8, null), harness.client.alpnSelected());
+}
+
+test "insecure_no_verification completes against a server that sends a certificate" {
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{ .certificate_policy = .insecure_no_verification });
+    defer harness.deinit();
+
+    // Regression: the flight-ordering check keyed off the captured leaf
+    // key, which this policy never captures — so every such handshake
+    // died on `UnexpectedMessage` at the server's CertificateVerify.
+    try harness.connect(&buffers);
+    try testing.expectEqual(ClientHandshake.State.connected, harness.client.state);
+    try testing.expect(!harness.client.certificate_verified);
 }

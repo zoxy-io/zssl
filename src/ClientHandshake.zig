@@ -11,18 +11,27 @@
 //!   §4.1.4 forbids a retry that changes nothing) or unsatisfiable
 //!   (demanding a group we cannot compute). Both are
 //!   `error.HandshakeFailure`, not a retry.
-//! - **Certificate policy is an explicit seam.** `.ecdsa_leaf_signature`
-//!   proves the peer holds the key its leaf names, via `std.crypto`'s
-//!   ECDSA over the leaf's own SPKI; chain building and RFC 9525 name
-//!   matching are the embedder's, deferred with reasons in DESIGN.md §1.
+//! - **Certificate policy is an explicit seam.** `.leaf_signature` proves
+//!   the peer holds the key its leaf names, via `std.crypto`'s ECDSA or
+//!   RSA-PSS over the leaf's own SPKI; chain building and RFC 9525 name
+//!   matching are the embedder's, deferred with reasons in DESIGN.md §1
+//!   and reachable through `Config.chain_verifier`.
 //!   `.insecure_no_verification` is for pinned-transport tests and says
 //!   so in its name.
+//!
+//! RSA leaves are accepted here and nowhere else in zssl. The server half
+//! signs with ECDSA only, on a latency argument (DESIGN.md §1) that is
+//! about *our* signing cost; a client originating to arbitrary upstreams
+//! does not get to pick what the far side presents, and most of the
+//! public web presents RSA. Verification is RSA-PSS only — §4.4.3 bans
+//! rsa_pkcs1_* in CertificateVerify.
 
 const std = @import("std");
 const assert = std.debug.assert;
 
 const alert = @import("alert.zig");
 const backend = @import("crypto/backend_openssl.zig");
+const certificate_list = @import("certificate_list.zig");
 const cipher_suite = @import("cipher_suite.zig");
 const client_hello = @import("client_hello.zig");
 const client_messages = @import("client_messages.zig");
@@ -48,17 +57,29 @@ hello_bytes: u16,
 resumed: bool,
 /// True once the leaf's CertificateVerify checked out under the policy.
 certificate_verified: bool,
-/// True once the server confirmed our ALPN protocol in
-/// EncryptedExtensions; the embedder decides whether absence is fatal.
-alpn_confirmed: bool,
-/// The leaf's SEC1 public key, captured for CertificateVerify.
+/// True once the peer's Certificate message was seen. Tracked apart from
+/// the captured key because `.insecure_no_verification` captures no key
+/// and the flight's ordering still has to be checked.
+certificate_seen: bool,
+/// Which of `Config.alpn_protocols` the server selected in
+/// EncryptedExtensions, if any; the embedder decides whether absence is
+/// fatal. An index rather than a slice: the offered names are the
+/// embedder's memory and this must not imply a lifetime it cannot keep.
+alpn_selected: ?u8,
+/// The leaf's public key as CertificateVerify needs it: a SEC1 point for
+/// ECDSA, a DER `RSAPublicKey` for RSA.
 leaf_public_key: [leaf_public_key_bytes_max]u8,
-leaf_public_key_bytes: u8,
+leaf_public_key_bytes: u16,
+leaf_key_kind: LeafKeyKind,
 
 const ClientHandshake = @This();
 
-/// An uncompressed P-384 SEC1 point is the largest key we accept.
-const leaf_public_key_bytes_max: u8 = 97;
+/// An RSA-4096 `RSAPublicKey` — two INTEGERs and a SEQUENCE header — is
+/// the largest key we accept; the uncompressed P-384 SEC1 point that
+/// bounds the EC side is 97.
+const leaf_public_key_bytes_max: u16 = 560;
+
+const LeafKeyKind = enum { none, ecdsa, rsa };
 
 pub const State = enum(u8) {
     idle,
@@ -70,12 +91,16 @@ pub const State = enum(u8) {
 };
 
 pub const CertificatePolicy = enum {
-    /// Verify CertificateVerify against the leaf's own public key. Chain
-    /// and name validation remain the embedder's (DESIGN.md §1).
-    ecdsa_leaf_signature,
+    /// Verify CertificateVerify against the leaf's own public key —
+    /// ECDSA P-256/P-384 or RSA-PSS. Chain and name validation remain the
+    /// embedder's (DESIGN.md §1); see `Config.chain_verifier`.
+    leaf_signature,
     /// No certificate checks at all. For tests and pinned transports.
     insecure_no_verification,
 };
+
+pub const CertificateList = certificate_list.CertificateList;
+pub const ChainVerifier = certificate_list.ChainVerifier;
 
 pub const Resumption = struct {
     identity: []const u8,
@@ -92,8 +117,16 @@ pub const Config = struct {
     /// embedder-random, may be empty.
     session_id: []const u8 = &.{},
     server_name: ?[]const u8 = null,
-    alpn: ?[]const u8 = null,
+    /// Offered in preference order (RFC 7301 §3.1); empty offers none.
+    /// The slices are the embedder's and must outlive the handshake.
+    alpn_protocols: []const []const u8 = &.{},
     certificate_policy: CertificatePolicy,
+    /// Shown the peer's chain, leaf first, while the Certificate message
+    /// is still in reassembly — the seam for chain building and RFC 9525
+    /// name matching, which are the embedder's by design. Returning false
+    /// aborts with `error.BadCertificate`. Not consulted under
+    /// `.insecure_no_verification`, which is what that policy means.
+    chain_verifier: ?ChainVerifier = null,
     resume_session: ?Resumption = null,
     send_change_cipher_spec: bool = true,
     /// Caller-owned reassembly space; must hold the server's certificate
@@ -147,6 +180,11 @@ pub const out_bytes_min: u32 = record.wire_record_bytes_max;
 pub fn init(config: *const Config) ClientHandshake {
     assert(config.session_id.len <= 32);
     assert(config.reassembly.len >= 8192);
+    assert(config.alpn_protocols.len <= client_messages.alpn_protocols_max);
+    for (config.alpn_protocols) |protocol| {
+        assert(protocol.len >= 1);
+        assert(protocol.len <= client_messages.alpn_protocol_bytes_max);
+    }
     assert(!std.mem.allEqual(u8, &config.x25519_private, 0));
     if (config.resume_session) |resumption| {
         assert(resumption.psk_bytes == 32 or resumption.psk_bytes == 48);
@@ -162,10 +200,22 @@ pub fn init(config: *const Config) ClientHandshake {
         .hello_bytes = 0,
         .resumed = false,
         .certificate_verified = false,
-        .alpn_confirmed = false,
+        .certificate_seen = false,
+        .alpn_selected = null,
         .leaf_public_key = undefined,
         .leaf_public_key_bytes = 0,
+        .leaf_key_kind = .none,
     };
+}
+
+/// The protocol the server selected from `Config.alpn_protocols`, or
+/// null if it named none. Whether that absence is fatal is the
+/// embedder's call — a server that ignores an `h2` offer and answers
+/// HTTP/1.1 is a real thing to meet, and reporting it beats refusing it.
+pub fn alpnSelected(self: *const ClientHandshake) ?[]const u8 {
+    const index = self.alpn_selected orelse return null;
+    assert(index < self.config.alpn_protocols.len);
+    return self.config.alpn_protocols[index];
 }
 
 pub fn deinit(self: *ClientHandshake) void {
@@ -198,7 +248,7 @@ pub fn start(self: *ClientHandshake, out: []u8) []const u8 {
         .session_id = self.config.session_id,
         .x25519_public = &x25519_public,
         .server_name = self.config.server_name,
-        .alpn = self.config.alpn,
+        .alpn_protocols = self.config.alpn_protocols,
         .psk = psk,
     });
     self.hello_bytes = @intCast(message.len);
@@ -387,16 +437,20 @@ fn drainFlight(self: *ClientHandshake, arm: anytype, out: []u8) Error!Event {
                 if (self.resumed) return error.UnexpectedMessage;
                 // §4.4.2 sends exactly one Certificate; a second would
                 // otherwise reach `captureLeaf`'s precondition as a panic.
-                if (self.leaf_public_key_bytes != 0) return error.UnexpectedMessage;
+                if (self.certificate_seen) return error.UnexpectedMessage;
                 try self.captureLeaf(message.body());
                 arm.transcript.update(message.bytes);
             },
             .certificate_verify => {
                 if (self.resumed) return error.UnexpectedMessage;
                 // §4.4.3 signs what §4.4.2 presented, so the order is
-                // fixed: no leaf captured yet means the peer inverted the
+                // fixed: no Certificate yet means the peer inverted the
                 // flight, which is a protocol error and not our panic.
-                if (self.leaf_public_key_bytes == 0) return error.UnexpectedMessage;
+                // Tracked by `certificate_seen`, not by the captured key:
+                // under `.insecure_no_verification` there is no key, and
+                // keying this off one rejected every such handshake that
+                // met a server which actually sent a certificate.
+                if (!self.certificate_seen) return error.UnexpectedMessage;
                 try self.verifyCertificate(arm, message);
                 arm.transcript.update(message.bytes);
             },
@@ -419,41 +473,72 @@ fn checkEncryptedExtensions(self: *ClientHandshake, body: []const u8) Error!void
         const extension_type = try cursor.takeU16();
         const data = try cursor.takeSlice(try cursor.takeU16());
         if (extension_type == 16) {
-            const ours = self.config.alpn orelse return error.BadAlpn;
+            if (self.config.alpn_protocols.len == 0) return error.BadAlpn;
             var list = wire.Cursor.init(data);
             const list_bytes = try list.takeU16();
             if (list_bytes != list.remaining()) return error.BadAlpn;
+            // §3.2: the server names exactly one protocol, and it must be
+            // one of ours.
             const name = try list.takeSlice(try list.takeByte());
-            if (!std.mem.eql(u8, name, ours)) return error.BadAlpn;
             if (list.remaining() != 0) return error.BadAlpn;
-            self.alpn_confirmed = true;
+            self.alpn_selected = for (self.config.alpn_protocols, 0..) |ours, index| {
+                if (std.mem.eql(u8, name, ours)) break @intCast(index);
+            } else return error.BadAlpn;
         }
     }
 }
 
-/// Pull the leaf's SEC1 public key out of the Certificate message. Under
-/// `.insecure_no_verification` the message is only length-checked.
+/// Show the chain to the embedder, then pull the leaf's public key out
+/// for CertificateVerify. Under `.insecure_no_verification` the message
+/// is only length-checked and neither step runs.
 fn captureLeaf(self: *ClientHandshake, body: []const u8) Error!void {
-    assert(self.leaf_public_key_bytes == 0);
+    assert(self.leaf_key_kind == .none);
     var cursor = wire.Cursor.init(body);
+    // certificate_request_context: empty in a server Certificate (§4.4.2).
     if (try cursor.takeByte() != 0) return error.BadCertificate;
-    _ = try cursor.takeU24();
-    const leaf_bytes = try cursor.takeU24();
-    if (leaf_bytes == 0) return error.BadCertificate;
-    const leaf_der = try cursor.takeSlice(leaf_bytes);
+    const list_bytes = try cursor.takeU24();
+    const list_der = try cursor.takeSlice(list_bytes);
+    if (cursor.remaining() != 0) return error.BadCertificate;
+    self.certificate_seen = true;
     if (self.config.certificate_policy == .insecure_no_verification) return;
+
+    // Identity before possession. The embedder builds the chain and
+    // matches the name; we prove the key underneath is held. A chain we
+    // would reject is rejected before its leaf's signature is worth
+    // checking, and before any of it reaches the transcript.
+    if (self.config.chain_verifier) |verifier| {
+        const chain = CertificateList.init(list_der);
+        // A list whose framing does not parse is not a chain the
+        // embedder can judge — refuse it here rather than hand over
+        // entries we could not walk.
+        _ = chain.count() catch return error.BadCertificate;
+        if (!verifier.verify(verifier.context, chain)) return error.BadCertificate;
+    }
+
+    var entries = CertificateList.init(list_der).iterator();
+    const leaf_der = (entries.next() catch return error.BadCertificate) orelse
+        return error.BadCertificate;
     const certificate: std.crypto.Certificate = .{ .buffer = leaf_der, .index = 0 };
     const parsed = certificate.parse() catch return error.BadCertificate;
+    const public_key = parsed.pubKey();
+    if (public_key.len > leaf_public_key_bytes_max) return error.BadCertificate;
     switch (parsed.pub_key_algo) {
         .X9_62_id_ecPublicKey => |curve| switch (curve) {
-            .X9_62_prime256v1, .secp384r1 => {},
+            .X9_62_prime256v1, .secp384r1 => {
+                // Uncompressed P-256 floor; `fromSec1` rejects the rest.
+                if (public_key.len < 65) return error.BadCertificate;
+                self.leaf_key_kind = .ecdsa;
+            },
             else => return error.BadCertificate,
+        },
+        // The key is a DER `RSAPublicKey`; its modulus length is checked
+        // where the signature is, since that is what bounds both.
+        .rsaEncryption => {
+            if (public_key.len < 64) return error.BadCertificate;
+            self.leaf_key_kind = .rsa;
         },
         else => return error.BadCertificate,
     }
-    const public_key = parsed.pubKey();
-    if (public_key.len > leaf_public_key_bytes_max) return error.BadCertificate;
-    if (public_key.len < 65) return error.BadCertificate; // Uncompressed P-256 floor.
     @memcpy(self.leaf_public_key[0..public_key.len], public_key);
     self.leaf_public_key_bytes = @intCast(public_key.len);
 }
@@ -469,20 +554,62 @@ fn verifyCertificate(self: *ClientHandshake, arm: anytype, message: handshake.Me
     var content_buffer: [server_messages.certificate_verify_content_bytes_max]u8 = undefined;
     const content = server_messages.certificateVerifyContent(.server, &arm.transcriptHash(), &content_buffer);
     const public_key = self.leaf_public_key[0..self.leaf_public_key_bytes];
+    // The scheme must match the key the leaf actually carries: an ECDSA
+    // scheme over an RSA key (or the reverse) is a peer error, not a
+    // parse to attempt. Checked here so each verifier's precondition is
+    // the kind it was written for.
+    switch (scheme) {
+        0x0403, 0x0503 => if (self.leaf_key_kind != .ecdsa) return error.BadSignature,
+        0x0804, 0x0805, 0x0806 => if (self.leaf_key_kind != .rsa) return error.BadSignature,
+        else => return error.BadSignature,
+    }
     switch (scheme) {
         0x0403 => try verifyEcdsa(std.crypto.sign.ecdsa.EcdsaP256Sha256, public_key, content, signature),
         0x0503 => try verifyEcdsa(std.crypto.sign.ecdsa.EcdsaP384Sha384, public_key, content, signature),
-        else => return error.BadSignature,
+        0x0804 => try verifyRsaPss(std.crypto.hash.sha2.Sha256, public_key, content, signature),
+        0x0805 => try verifyRsaPss(std.crypto.hash.sha2.Sha384, public_key, content, signature),
+        0x0806 => try verifyRsaPss(std.crypto.hash.sha2.Sha512, public_key, content, signature),
+        else => unreachable, // The switch above admitted only these.
     }
     self.certificate_verified = true;
 }
 
 fn verifyEcdsa(comptime Ecdsa: type, public_key: []const u8, content: []const u8, signature_der: []const u8) Error!void {
     assert(content.len >= 98); // 64 spaces, the context string, a hash.
-    assert(signature_der.len >= 8);
+    assert(public_key.len >= 65);
+    if (signature_der.len < 8) return error.BadSignature;
     const key = Ecdsa.PublicKey.fromSec1(public_key) catch return error.BadCertificate;
     const signature = Ecdsa.Signature.fromDer(signature_der) catch return error.BadSignature;
     signature.verify(content, key) catch return error.BadSignature;
+}
+
+/// RSA-PSS (§4.4.3's `rsa_pss_rsae_*`), through `std.crypto`'s
+/// implementation rather than libcrypto's — the same choice the ECDSA
+/// side makes, and for the same reason: verification of a public-length
+/// message is not where the constant-time argument bites.
+///
+/// `public_key` is the leaf's DER `RSAPublicKey`. The modulus lengths are
+/// the four `std.crypto.Certificate.rsa` supports, 1024 through 4096
+/// bits; anything else is a certificate we cannot check rather than a
+/// signature that failed, hence `BadCertificate`.
+fn verifyRsaPss(comptime Hash: type, public_key: []const u8, content: []const u8, signature: []const u8) Error!void {
+    assert(content.len >= 98);
+    const rsa = std.crypto.Certificate.rsa;
+    const components = rsa.PublicKey.parseDer(public_key) catch return error.BadCertificate;
+    switch (components.modulus.len) {
+        inline 128, 256, 384, 512 => |modulus_bytes| {
+            // §4.4.3 fixes the signature at exactly one modulus wide;
+            // `PSSSignature.fromBytes` would zero-pad a short one into a
+            // different signature, so the length is checked, not coerced.
+            if (signature.len != modulus_bytes) return error.BadSignature;
+            const key = rsa.PublicKey.fromBytes(components.exponent, components.modulus) catch
+                return error.BadCertificate;
+            const sig = rsa.PSSSignature.fromBytes(modulus_bytes, signature);
+            rsa.PSSSignature.verify(modulus_bytes, sig, content, key, Hash) catch
+                return error.BadSignature;
+        },
+        else => return error.BadCertificate,
+    }
 }
 
 fn completeHandshake(self: *ClientHandshake, arm: anytype, message: handshake.Message, out: []u8) Error!Event {
@@ -490,7 +617,7 @@ fn completeHandshake(self: *ClientHandshake, arm: anytype, message: handshake.Me
     if (!self.resumed) {
         // Policy says who may skip the certificate leg: only a session a
         // PSK already authenticates.
-        if (self.config.certificate_policy == .ecdsa_leaf_signature) {
+        if (self.config.certificate_policy == .leaf_signature) {
             if (!self.certificate_verified) return error.BadCertificate;
         }
     }

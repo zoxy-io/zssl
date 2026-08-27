@@ -261,12 +261,12 @@ fn fuzzClientMachine(input: []const u8) !void {
         .client_random = @splat(0x1a),
         .x25519_private = @splat(0x31),
         .server_name = "spike.zoxy.test",
-        .alpn = "http/1.1",
-        .certificate_policy = .ecdsa_leaf_signature,
+        .alpn_protocols = &.{"http/1.1"},
+        .certificate_policy = .leaf_signature,
         .reassembly = &reassembly,
     });
     defer client.deinit();
-    var hello_out: [record.header_bytes + 1200]u8 = undefined;
+    var hello_out: [ClientHandshake.out_bytes_min]u8 = undefined;
     _ = client.start(&hello_out);
     feedMachine(&client, input);
 }

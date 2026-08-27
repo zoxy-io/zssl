@@ -140,8 +140,9 @@ var client = zssl.ClientHandshake.init(&.{
     .client_random = entropy[0..32].*,
     .x25519_private = entropy[32..64].*,
     .server_name = "origin.internal",
-    .alpn = "http/1.1",
-    .certificate_policy = .ecdsa_leaf_signature,
+    .alpn_protocols = &.{ "h2", "http/1.1" },
+    .certificate_policy = .leaf_signature,
+    .chain_verifier = .{ .context = &trust, .verify = &yourChainCheck },
     .reassembly = &reassembly,
 });
 defer client.deinit();
@@ -159,11 +160,26 @@ while (try records.next()) |wire_record| {
 }
 ```
 
-`certificate_policy` is an explicit seam. `.ecdsa_leaf_signature` proves
-the peer holds the key its certificate names; **chain building and RFC
-9525 name matching are yours to do**, deliberately, because a proxy's
-trust decisions belong to the proxy. `.insecure_no_verification` exists
-for pinned transports and tests, and says so in its name.
+`alpn_protocols` is offered in preference order; `client.alpnSelected()`
+reports what the server took, or null if it took nothing — an answer
+rather than an error, because a server that ignores an `h2` offer is
+something a client should report, not die on.
+
+Certificate handling is split in two, on purpose.
+
+**Possession** is zssl's: `.leaf_signature` verifies the server's
+CertificateVerify against the key its leaf presents — ECDSA P-256/P-384
+or RSA-PSS, since an originating client does not choose what its
+upstreams present. `.insecure_no_verification` skips it entirely and
+says so in its name.
+
+**Identity** is yours: `chain_verifier` is shown the peer's chain, leaf
+first, while the bytes are still live, and returning false aborts the
+handshake before the leaf's signature is even checked. **Chain building
+and RFC 9525 name matching are yours to do**, deliberately, because a
+proxy's trust decisions belong to the proxy — `std.crypto.Certificate`
+has the pieces. Configure no verifier and zssl proves possession alone,
+which authenticates the key and says nothing about who holds it.
 
 ### Resumption and kTLS
 
@@ -195,15 +211,17 @@ refused, not downgraded.
 ## Scope
 
 **In:** TLS 1.3 (RFC 8446), the three standard cipher suites, x25519,
-ECDSA P-256/P-384, SNI, ALPN, HelloRetryRequest, PSK resumption with
-server-side tickets, KeyUpdate, and kTLS key export.
+ECDSA P-256/P-384 signing, RSA-PSS *verification* on the client side,
+SNI, ALPN, HelloRetryRequest, PSK resumption with server-side tickets,
+KeyUpdate, and kTLS key export.
 
 **Out, permanently:** TLS 1.2 and earlier, renegotiation, compression,
 RSA and DSA key exchange. A caller that needs these wants a different
 library.
 
 **Out, for now:** 0-RTT (a replay-analysis decision, not a convenience),
-X.509 chain validation, client certificates, and QUIC.
+X.509 chain validation (the embedder's, through `chain_verifier`),
+client certificates, and QUIC.
 
 Everything above is argued in [docs/DESIGN.md](docs/DESIGN.md) §1.
 

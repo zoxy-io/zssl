@@ -1,6 +1,6 @@
 //! The real-OpenSSL interop gate (slice 5).
 //!
-//! Two legs, both against the `openssl` binary — genuine libssl, a TLS
+//! Three legs, all against the `openssl` binary — genuine libssl, a TLS
 //! stack sharing no line of code with this one, written by different
 //! people over thirty years:
 //!
@@ -10,6 +10,12 @@
 //!   2. Our `ClientHandshake` handshakes with `openssl s_server -rev`,
 //!      our certificate policy checking *their* CertificateVerify, and
 //!      our record layer opening the reversed echo they seal back.
+//!   3. The same leg again against an **RSA** server certificate,
+//!      generated here by openssl itself. ECDSA and RSA are different
+//!      code paths in `ClientHandshake.verifyCertificate`, and the RSA
+//!      one exists precisely for upstreams we do not control — so it is
+//!      proven against a real RSA signer rather than a vector. Both legs
+//!      also run the `chain_verifier` seam and assert it saw the chain.
 //!
 //! In both directions application bytes cross afterwards, because a
 //! handshake that completes but cannot carry traffic has proven the
@@ -42,6 +48,13 @@ const cert_path = "zig-out/interop/cert.pem";
 const key_path = "zig-out/interop/key.pem";
 const s_client_log_path = "zig-out/interop/s_client.log";
 const s_server_log_path = "zig-out/interop/s_server.log";
+/// Generated at run time rather than embedded: an RSA fixture would be a
+/// second key pair to keep in `src/testdata/`, which is shared with
+/// zoxy's copy, and this leg only needs openssl to sign something with
+/// an RSA key — which openssl can do on the spot.
+const rsa_cert_path = "zig-out/interop/rsa-cert.pem";
+const rsa_key_path = "zig-out/interop/rsa-key.pem";
+const s_server_rsa_log_path = "zig-out/interop/s_server_rsa.log";
 const work_dir = "zig-out/interop";
 
 /// The whole gate, both legs, generously bounded. A hang here is a bug
@@ -88,14 +101,37 @@ pub fn main(init: std.process.Init) !u8 {
     std.debug.print("interop: ok — openssl s_client completed against ServerHandshake\n", .{});
 
     watchdog_stage.store(2, .release);
-    runClientLeg(io, arena, openssl) catch |err| {
+    runClientLeg(io, arena, openssl, .{
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .log_path = s_server_log_path,
+        .port = port_base + port_attempts,
+        .expect_algo = .X9_62_id_ecPublicKey,
+    }) catch |err| {
         std.debug.print("interop: FAIL — our client against s_server ({t})\n", .{err});
         return 1;
     };
-    std.debug.print("interop: ok — ClientHandshake completed against openssl s_server\n", .{});
+    std.debug.print("interop: ok — ClientHandshake completed against openssl s_server (ECDSA)\n", .{});
 
     watchdog_stage.store(3, .release);
-    std.debug.print("interop: PASS — both legs\n", .{});
+    generateRsaFixture(io, arena, openssl) catch |err| {
+        std.debug.print("interop: FAIL — could not generate the RSA fixture ({t})\n", .{err});
+        return 1;
+    };
+    runClientLeg(io, arena, openssl, .{
+        .cert_path = rsa_cert_path,
+        .key_path = rsa_key_path,
+        .log_path = s_server_rsa_log_path,
+        .port = port_base + port_attempts + 1,
+        .expect_algo = .rsaEncryption,
+    }) catch |err| {
+        std.debug.print("interop: FAIL — our client against s_server, RSA ({t})\n", .{err});
+        return 1;
+    };
+    std.debug.print("interop: ok — ClientHandshake completed against openssl s_server (RSA)\n", .{});
+
+    watchdog_stage.store(4, .release);
+    std.debug.print("interop: PASS — all three legs\n", .{});
     return 0;
 }
 
@@ -105,7 +141,8 @@ fn watchdogTask(io: Io) void {
     const name = switch (stage) {
         0 => "startup",
         1 => "s_client against our server",
-        2 => "our client against s_server",
+        2 => "our client against s_server (ECDSA)",
+        3 => "our client against s_server (RSA)",
         else => "teardown",
     };
     std.debug.print("interop: FAIL — wedged in: {s}\n", .{name});
@@ -255,23 +292,115 @@ fn runServerLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8) !void {
     }
 }
 
-/// Leg 2: `openssl s_server` accepts one connection from our client.
-fn runClientLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8) !void {
+/// Have openssl mint a throwaway RSA-2048 self-signed leaf for leg 3.
+///
+/// 2048 bits because it is what the public web overwhelmingly presents,
+/// and because it exercises the 256-byte modulus arm of
+/// `verifyRsaPss` — the one an upstream is most likely to hand us.
+/// openssl chooses `rsa_pss_rsae_sha256` for the CertificateVerify on
+/// its own, which is the scheme we most need proven.
+fn generateRsaFixture(io: Io, arena: std.mem.Allocator, openssl: []const u8) !void {
+    var child = try std.process.spawn(io, .{
+        .argv = &.{
+            openssl,    "req",
+            "-x509",    "-newkey",
+            "rsa:2048", "-nodes",
+            "-keyout",  rsa_key_path,
+            "-out",     rsa_cert_path,
+            "-days",    "1",
+            "-subj",    "/CN=spike.zoxy.test",
+            "-addext",  "subjectAltName=DNS:spike.zoxy.test",
+            // The default digest is fine, but pinning it keeps the
+            // fixture identical across openssl versions.
+            "-sha256",
+        },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .pipe,
+    });
+    // Read stderr before waiting: openssl narrates key generation there,
+    // and a full pipe would deadlock the child we are about to reap.
+    var stderr = child.stderr.?.reader(io, try arena.alloc(u8, 4096));
+    var sink: [4096]u8 = undefined;
+    const complained = stderr.interface.readSliceShort(&sink) catch 0;
+    switch (try child.wait(io)) {
+        .exited => |code| if (code != 0) {
+            std.debug.print("interop: openssl req said: {s}\n", .{sink[0..complained]});
+            return error.RsaFixtureFailed;
+        },
+        else => return error.RsaFixtureSignalled,
+    }
+}
+
+/// The `chain_verifier` seam, as an embedder would use it minus the
+/// X.509: count what the peer presented so the leg can assert the chain
+/// actually reached us. Returning false here would abort the handshake,
+/// which is the property the seam exists to give an embedder.
+const ChainWitness = struct {
+    entries: usize = 0,
+    leaf_bytes: usize = 0,
+    malformed: bool = false,
+    /// What the leaf's SPKI actually says, so a leg can assert it drove
+    /// the code path it claims to. Without this the RSA leg would still
+    /// pass if openssl quietly presented an ECDSA certificate, and the
+    /// arm it exists to cover would go untested.
+    leaf_algo: ?std.meta.Tag(std.crypto.Certificate.Parsed.PubKeyAlgo) = null,
+
+    fn verify(context: *anyopaque, chain: zssl.certificate_list.CertificateList) bool {
+        const self: *ChainWitness = @ptrCast(@alignCast(context));
+        var it = chain.iterator();
+        while (it.next() catch {
+            self.malformed = true;
+            return false;
+        }) |entry| {
+            if (self.entries == 0) {
+                self.leaf_bytes = entry.len;
+                const certificate: std.crypto.Certificate = .{ .buffer = entry, .index = 0 };
+                if (certificate.parse()) |parsed| {
+                    self.leaf_algo = parsed.pub_key_algo;
+                } else |_| {
+                    self.malformed = true;
+                    return false;
+                }
+            }
+            self.entries += 1;
+        }
+        return true;
+    }
+};
+
+const ClientLegOptions = struct {
+    cert_path: []const u8,
+    key_path: []const u8,
+    log_path: []const u8,
+    port: u16,
+    /// The leaf key type this leg exists to exercise.
+    expect_algo: std.meta.Tag(std.crypto.Certificate.Parsed.PubKeyAlgo),
+};
+
+/// Legs 2 and 3: `openssl s_server` accepts one connection from our
+/// client, presenting whichever key type `options` names.
+fn runClientLeg(
+    io: Io,
+    arena: std.mem.Allocator,
+    openssl: []const u8,
+    options: ClientLegOptions,
+) !void {
     // The child binds, so pick a port it is likely to get and let the
     // connect retry cover the race.
-    const port = port_base + port_attempts;
+    const port = options.port;
     const accept_arg = try std.fmt.allocPrint(arena, "{d}", .{port});
     // Both streams to one log: `-quiet` makes s_server echo the
     // plaintext it decrypted to stdout, which is the evidence this leg
     // rests on — our bytes came out the far side readable.
-    const log = try Io.Dir.cwd().createFile(io, s_server_log_path, .{});
+    const log = try Io.Dir.cwd().createFile(io, options.log_path, .{});
     defer log.close(io);
     var child = try std.process.spawn(io, .{
         .argv = &.{
             openssl,   "s_server",
             "-accept", accept_arg,
-            "-cert",   cert_path,
-            "-key",    key_path,
+            "-cert",   options.cert_path,
+            "-key",    options.key_path,
             "-tls1_3", "-naccept",
             // `-rev` echoes each line back reversed over TLS, which is
             // what lets our client prove it can *decrypt* records real
@@ -295,13 +424,19 @@ fn runClientLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8) !void {
     var reassembly: [16384]u8 = undefined;
     var entropy: [64]u8 = undefined;
     io.random(&entropy);
+    var witness: ChainWitness = .{};
     var client = ClientHandshake.init(&.{
         .client_random = entropy[0..32].*,
         .x25519_private = entropy[32..64].*,
         .server_name = "spike.zoxy.test",
+        // s_server offers no ALPN, so this proves the offer is *sent*
+        // and its absence from EncryptedExtensions is survivable — not
+        // that a selection round-trips, which the unit suite covers.
+        .alpn_protocols = &.{ "h2", "http/1.1" },
         // openssl presents the fixture leaf; our policy proves it holds
         // the key its certificate names.
-        .certificate_policy = .ecdsa_leaf_signature,
+        .certificate_policy = .leaf_signature,
+        .chain_verifier = .{ .context = &witness, .verify = ChainWitness.verify },
         .reassembly = &reassembly,
     });
     defer client.deinit();
@@ -310,6 +445,15 @@ fn runClientLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8) !void {
     pump.init(io, stream);
     try pump.handshakeClient(&client);
     if (!client.certificate_verified) return error.CertificateNotVerified;
+    // The seam ran, and ran on real bytes: a verifier that is never
+    // called would leave an embedder believing it had validated a chain
+    // it never saw.
+    if (witness.malformed) return error.ChainMalformed;
+    if (witness.entries == 0) return error.ChainVerifierNotCalled;
+    if (witness.leaf_bytes < 64) return error.ChainLeafImplausible;
+    if (witness.leaf_algo != options.expect_algo) return error.UnexpectedLeafKeyType;
+    // s_server names no protocol, so neither may we.
+    if (client.alpnSelected() != null) return error.UnexpectedAlpnSelection;
 
     var out: [record.wire_record_bytes_max]u8 = undefined;
     const greeting = "hello from zssl client\n";
@@ -331,23 +475,23 @@ fn runClientLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8) !void {
     reaped = true;
     switch (term) {
         .exited => |code| if (code != 0) {
-            try printFile(io, arena, s_server_log_path);
+            try printFile(io, arena, options.log_path);
             return error.SserverFailed;
         },
         else => {
-            try printFile(io, arena, s_server_log_path);
+            try printFile(io, arena, options.log_path);
             return error.SserverSignalled;
         },
     }
     // openssl's own account of the session: it negotiated 1.3 and
     // counted an accept that *finished*, which a handshake that merely
     // started would not produce.
-    if (!try fileContains(io, arena, s_server_log_path, "Protocol version: TLSv1.3")) {
-        try printFile(io, arena, s_server_log_path);
+    if (!try fileContains(io, arena, options.log_path, "Protocol version: TLSv1.3")) {
+        try printFile(io, arena, options.log_path);
         return error.NoTls13Negotiated;
     }
-    if (!try fileContains(io, arena, s_server_log_path, "1 server accepts that finished")) {
-        try printFile(io, arena, s_server_log_path);
+    if (!try fileContains(io, arena, options.log_path, "1 server accepts that finished")) {
+        try printFile(io, arena, options.log_path);
         return error.AcceptDidNotFinish;
     }
 }

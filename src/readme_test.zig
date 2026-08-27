@@ -31,6 +31,19 @@ fn store(ticket: zssl.ClientHandshake.Ticket) !void {
     std.debug.assert(ticket.ticket.len >= 1);
 }
 
+/// Stand-in for the embedder's trust store, and the chain check the
+/// README hands to `chain_verifier`. Real ones build the chain and match
+/// the name; this one only has to typecheck as one.
+const TrustStore = struct { checked: usize = 0 };
+var trust: TrustStore = .{};
+
+fn yourChainCheck(context: *anyopaque, chain: zssl.certificate_list.CertificateList) bool {
+    const store_ptr: *TrustStore = @ptrCast(@alignCast(context));
+    var it = chain.iterator();
+    while (it.next() catch return false) |_| store_ptr.checked += 1;
+    return true;
+}
+
 test "README: terminating TLS" {
     const socket: Socket = .{};
     const cert_pem = @embedFile("testdata/cert.pem");
@@ -83,8 +96,9 @@ test "README: originating TLS" {
         .client_random = entropy[0..32].*,
         .x25519_private = entropy[32..64].*,
         .server_name = "origin.internal",
-        .alpn = "http/1.1",
-        .certificate_policy = .ecdsa_leaf_signature,
+        .alpn_protocols = &.{ "h2", "http/1.1" },
+        .certificate_policy = .leaf_signature,
+        .chain_verifier = .{ .context = &trust, .verify = &yourChainCheck },
         .reassembly = &reassembly,
     });
     defer client.deinit();

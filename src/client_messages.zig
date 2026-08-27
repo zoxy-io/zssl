@@ -18,8 +18,14 @@ const wire = @import("wire.zig");
 const CipherSuite = cipher_suite.CipherSuite;
 
 /// Base fields plus every extension at its cap (a 255-byte server name,
-/// a 512-byte ticket identity, a 48-byte binder).
-pub const hello_bytes_max: u16 = 1152;
+/// a 512-byte ticket identity, a 48-byte binder, a full ALPN list).
+pub const hello_bytes_max: u16 = 1280;
+
+/// ALPN offer caps. Four is what a client that speaks HTTP needs — `h2`
+/// and `http/1.1` with room to spare — and each name is bounded so the
+/// hello's own bound stays a constant rather than a function of config.
+pub const alpn_protocols_max: u8 = 4;
+pub const alpn_protocol_bytes_max: u8 = 32;
 
 pub const PskParams = struct {
     identity: []const u8,
@@ -33,7 +39,9 @@ pub const HelloParams = struct {
     session_id: []const u8,
     x25519_public: *const [32]u8,
     server_name: ?[]const u8 = null,
-    alpn: ?[]const u8 = null,
+    /// Offered in preference order (RFC 7301 §3.1); empty omits the
+    /// extension entirely.
+    alpn_protocols: []const []const u8 = &.{},
     psk: ?PskParams = null,
 };
 
@@ -45,6 +53,7 @@ pub fn clientHello(out: []u8, params: *const HelloParams) []const u8 {
     assert(params.session_id.len <= 32);
     if (params.server_name) |name| assert(name.len >= 1);
     if (params.server_name) |name| assert(name.len <= 255);
+    assert(params.alpn_protocols.len <= alpn_protocols_max);
     var builder = wire.Builder.init(out);
     const message = handshake.beginMessage(&builder, .client_hello);
     builder.putU16(0x0303);
@@ -87,21 +96,34 @@ fn helloExtensions(builder: *wire.Builder, params: *const HelloParams) void {
     builder.putU16(client_hello.group_x25519);
     builder.patchU16(group_list);
     builder.patchU16(groups);
-    builder.putU16(13); // signature_algorithms: the two ECDSA schemes.
+    // signature_algorithms (§4.2.3): what we will accept in the server's
+    // CertificateVerify. ECDSA first — it is what zssl's own server signs
+    // with, and the cheaper verify — then RSA-PSS, because a client that
+    // originates to arbitrary upstreams meets RSA leaves constantly and a
+    // list without them is a handshake failure against most of the public
+    // web. rsa_pkcs1_* is absent on purpose: §4.4.3 forbids it in
+    // CertificateVerify, and listing it would invite a signature we then
+    // refuse.
+    builder.putU16(13);
     const schemes = builder.markU16();
     const scheme_list = builder.markU16();
-    builder.putU16(0x0403);
-    builder.putU16(0x0503);
+    builder.putU16(0x0403); // ecdsa_secp256r1_sha256
+    builder.putU16(0x0503); // ecdsa_secp384r1_sha384
+    builder.putU16(0x0804); // rsa_pss_rsae_sha256
+    builder.putU16(0x0805); // rsa_pss_rsae_sha384
+    builder.putU16(0x0806); // rsa_pss_rsae_sha512
     builder.patchU16(scheme_list);
     builder.patchU16(schemes);
-    if (params.alpn) |protocol| {
-        assert(protocol.len >= 1);
-        assert(protocol.len <= 32);
+    if (params.alpn_protocols.len >= 1) {
         builder.putU16(16); // application_layer_protocol_negotiation
         const body = builder.markU16();
         const list = builder.markU16();
-        builder.putByte(@intCast(protocol.len));
-        builder.putSlice(protocol);
+        for (params.alpn_protocols) |protocol| {
+            assert(protocol.len >= 1);
+            assert(protocol.len <= alpn_protocol_bytes_max);
+            builder.putByte(@intCast(protocol.len));
+            builder.putSlice(protocol);
+        }
         builder.patchU16(list);
         builder.patchU16(body);
     }
@@ -178,13 +200,16 @@ test "the production hello parses under our own strict parser" {
         .session_id = &(.{0xee} ** 32),
         .x25519_public = &public,
         .server_name = "origin.internal",
-        .alpn = "http/1.1",
+        .alpn_protocols = &.{ "h2", "http/1.1" },
     });
     const hello = try client_hello.parse(encoded);
     try std.testing.expectEqualSlices(u8, "origin.internal", hello.server_name.?);
     try std.testing.expect(hello.supports_tls13);
     try std.testing.expect(hello.supportsGroup(client_hello.group_x25519));
     try std.testing.expect(hello.offersScheme(0x0403));
+    // RSA-PSS travels beside ECDSA: an upstream with an RSA leaf must not
+    // see a list that forces it to fail the handshake.
+    try std.testing.expect(hello.offersScheme(0x0804));
     try std.testing.expectEqualSlices(u8, &public, hello.key_share_x25519.?);
     try std.testing.expect(hello.offersSuite(.aes_128_gcm_sha256));
     try std.testing.expect(hello.offersSuite(.aes_256_gcm_sha384));

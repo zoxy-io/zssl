@@ -14,10 +14,15 @@ proxy needs instead of what a general TLS library carries.
   compatibility fields 1.3 froze.
 - Server-side handshake first; a client handshake exists for tests and,
   later, for upstream origination.
-- The three RFC 8446 suites. ECDSA P-256/P-384 signing only — RSA is
+- The three RFC 8446 suites. ECDSA P-256/P-384 **signing** only — RSA is
   excluded by the embedder's policy (a ~1–2 ms RSA sign is the number
   that once justified a worker pool; ECDSA's ~100–400 µs is why there
-  isn't one).
+  isn't one). That argument is about signing cost, which is a cost we
+  pay when *we* hold the key; it does not reach **verification**, where
+  the peer chose the algorithm. So `ClientHandshake` accepts RSA-PSS
+  leaves: an originating client meets whatever its upstreams present,
+  and most of the public web presents RSA. rsa_pkcs1_* stays out —
+  §4.4.3 forbids it in CertificateVerify.
 - x25519 key exchange; PSK resumption with server-side NewSessionTicket
   issuance; ALPN and SNI reads.
 - kTLS key export (§4).
@@ -27,9 +32,12 @@ library): TLS 1.2, renegotiation, compression, RSA key exchange, DSA,
 SSLv3-era anything, post-handshake client auth.
 
 **Out, deliberately deferred**: 0-RTT (a replay-analysis decision, not a
-protocol convenience), X.509 chain *validation* (becomes load-bearing
-only when the embedder originates TLS to upstreams; RFC 9525 binds then,
-not before).
+protocol convenience), X.509 chain *validation* — which stays out of
+zssl but is no longer out of reach: `ClientHandshake.Config.chain_verifier`
+shows the embedder the peer's chain, leaf first, and its refusal aborts
+the handshake. The split is possession here, identity there. It became
+load-bearing exactly when predicted, when an embedder (zrk) originated
+TLS to upstreams it does not control, and RFC 9525 binds that embedder.
 
 ## §2 The trust split
 
@@ -137,8 +145,9 @@ wrap. zssl never writes padding; it strips peers' padding per §5.4.
    export both directions after any KeyUpdate, then stop feeding the
    machine*. `ClientHandshake` is the origination half: SNI, ALPN with
    RFC 7301 selection checks, the certificate-policy seam
-   (`.ecdsa_leaf_signature` proves key possession via std.crypto against
-   the presented leaf; chain/name stay deferred per §1), ticket capture
+   (`.leaf_signature` proves key possession via std.crypto against
+   the presented leaf — ECDSA or RSA-PSS; chain/name are the embedder's
+   through `chain_verifier`, per §1), ticket capture
    through the event surface, resumption, and a *structural* refusal of
    HelloRetryRequest — a single-group client has no second offer to
    make, so both HRR shapes (illegal repeat, unsatisfiable demand) abort.
