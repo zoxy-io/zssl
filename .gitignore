@@ -1,2 +1,6 @@
 .zig-cache/
 zig-out/
+# Fetched dependency sources (the unpacked upstream OpenSSL tree). Build
+# output, never vendored: build.zig.zon's content hash is the record of
+# what we build against.
+/zig-pkg/
