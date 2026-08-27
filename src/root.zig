@@ -1,11 +1,14 @@
 //! zssl — a sans-I/O TLS 1.3 protocol layer over libcrypto primitives.
 //!
-//! Scope and design live in docs/DESIGN.md; the style contract is
-//! docs/TIGER_STYLE.md (zoxy's, adopted verbatim). Slice 1 is the
-//! foundation: record framing and protection, the key schedule,
-//! ClientHello parsing, the libcrypto AEAD/X25519 backend, and the kTLS
-//! key-export seam — each asserted against RFC 8448's traced handshake
-//! byte for byte.
+//! The protocol layer is Zig — records, the key schedule, both handshake
+//! state machines, resumption, KeyUpdate; libcrypto supplies only the
+//! constant-time primitives. Nothing here allocates, and nothing here
+//! draws randomness: buffers and entropy arrive from the embedder.
+//!
+//! `ServerHandshake` and `ClientHandshake` are the entry points, and
+//! README.md shows what driving them looks like. Scope and design live
+//! in docs/DESIGN.md; the style contract is docs/TIGER_STYLE.md
+//! (zoxy's, adopted verbatim).
 
 pub const ClientHandshake = @import("ClientHandshake.zig");
 pub const Credentials = @import("Credentials.zig");
@@ -40,4 +43,5 @@ test {
     _ = @import("resumption_test.zig");
     _ = @import("client_server_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("readme_test.zig");
 }

@@ -1,60 +1,244 @@
 # zssl
 
-A sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
-(`zoxy-io/openssl`, the pin zoxy links). Prototype for zoxy's TLS
-engine, with kTLS key export as a design input and TIGER_STYLE from the
-first line.
+A sans-I/O TLS 1.3 library in Zig, over libcrypto primitives.
 
-Read before writing code:
+zssl implements the protocol — records, the key schedule, both handshake
+state machines, resumption, KeyUpdate — in auditable Zig, and calls
+libcrypto only for the constant-time primitives (AEAD, X25519, ECDSA).
+It owns no sockets, no threads, and no memory: you feed it whole TLS
+records and transmit whatever it hands back.
 
-- [docs/DESIGN.md](docs/DESIGN.md) — scope, the trust split, the slice
-  ladder and what each slice's oracle proved, and the testing stance.
-- [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) — the enforced style
-  contract, a verbatim copy of zoxy's.
-- [docs/BOGO.md](docs/BOGO.md) — the one gate still outstanding, and why
-  it is staged rather than half-built. Everything below tests what zssl
-  *accepts*; BoGo is what tests the refusals.
+```zig
+switch (try server.handleRecord(wire_record, &out)) {
+    .send => |bytes| try socket.writeAll(bytes),
+    .application_data => |plaintext| try onRequest(plaintext),
+    .connected, .closed, .none => {},
+}
+```
 
-## Gates
+That shape is the whole interface, and it is what makes zssl usable from
+an `io_uring` event loop, a thread-per-connection server, or a
+deterministic simulator with a virtual clock — none of which it needs to
+know about.
 
-- `zig build test` — 62 tests across four oracle classes:
-  - **RFC 8448 replayed byte for byte** — §3's key ladder, every
-    protected record opened, the server flight and ServerHello re-encoded
-    to identical wire bytes; §4's binder chain, truncated-transcript
-    arithmetic, PSK ServerHello, and PSK-mixed ladder.
-  - **Interop with `std.crypto.tls.Client`** — an implementation sharing
-    no code with zssl completes a full in-memory handshake against
-    `ServerHandshake` (std's own X.509 and ECDSA verify our Certificate
-    and CertificateVerify), exchanges data both ways, and takes a clean
-    close_notify.
-  - **State-machine scenarios** — fragmented ClientHello, coalesced
-    flights, HelloRetryRequest with §4.4.1 transcript surgery, ALPN,
-    kTLS key-export agreement, RFC 6979 signature determinism,
-    resumption end-to-end (tickets issued after client Finished, PSK
-    session up with no certificate, client-side PSK derivation agreeing
-    with the server's), the production `ClientHandshake` against the
-    production server (leaf verification, ticket capture, resumption,
-    §4.6.3 KeyUpdate both ways with kTLS exports agreeing at every
-    generation, structural HelloRetryRequest refusal), and the failure
-    paths (tampering, corrupted binders, unknown tickets, no common
-    suite, ALPN mismatch, talking past the handshake) — plus AEAD
-    differentials against `std.crypto` for all three suites.
-  - **Fuzz targets** — nine of them, over every parser (record header,
-    alert, ClientHello, PEM, the handshake assembler, the record
-    buffer) and both state machines, asserting that arbitrary peer
-    bytes yield a value or an error and never a panic. `zig build test`
-    runs each once over its corpus; the coverage-guided `--fuzz` search
-    is blocked on a 0.16.0 toolchain bug (see DESIGN.md §6).
-- `zig build interop` — the real-OpenSSL gate, over loopback sockets:
-  `openssl s_client` against our `ServerHandshake`, with openssl's own
-  X.509 verifying our certificate, and our `ClientHandshake` against
-  `openssl s_server -rev`, opening the reversed echo openssl sealed
-  back. Exits 2 with a readable SKIP when no TLS 1.3-capable `openssl`
-  is on PATH, rather than failing.
-- `zig build test -Doptimize=ReleaseSafe` — the same suite in the mode
-  release builds ship (assertions stay on; libcrypto builds with
-  `sanitize_c = .off` in every mode — zoxy's #283).
-- `zig fmt --check src interop build.zig build.zig.zon` — format gate.
+**Status: prototype.** It is exercised hard (see [Testing](#testing)) and
+interoperates with OpenSSL and `std.crypto.tls` in both directions, but
+it has not been adversarially tested — see [docs/BOGO.md](docs/BOGO.md) —
+and has had no external audit. Don't put it in front of anything you
+care about yet.
 
-Test vectors are generated, not transcribed: `scripts/extract_rfc8448.py`
-parses the RFC text into `src/rfc8448_vectors.zig`.
+## Why
+
+Most TLS libraries hand you a socket-shaped object and own the loop. If
+you are writing a proxy, that costs you the two things you needed most:
+
+- **Nothing is hidden from the event loop.** No callbacks into a library
+  that might block, no internal buffering you cannot size.
+- **kTLS is a first-class hand-off, not a fight.** Traffic keys, IVs and
+  record sequence numbers are exportable state
+  (`exportKeyMaterial`), so moving the record layer into the kernel is a
+  read rather than an excavation.
+
+Two properties fall out of the design and are enforced by the tests:
+
+- **Zero allocation.** Not "after startup" — at all. Every buffer is
+  caller-owned or a fixed array. `std.mem.Allocator` appears nowhere in
+  the library.
+- **Zero randomness.** zssl never calls an RNG. Handshake randoms and
+  ephemeral keys arrive through `Config`, which is what lets a seeded
+  simulation replay a session byte for byte.
+
+## Install
+
+```sh
+zig fetch --save git+https://github.com/zoxy-io/zssl
+```
+
+```zig
+const zssl_dependency = b.dependency("zssl", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("zssl", zssl_dependency.module("zssl"));
+```
+
+libcrypto is built from source by Zig for your target — nothing is
+resolved from the host — so cross-compilation works out of the box.
+
+## Usage
+
+### Terminating TLS
+
+Load credentials once; everything after is per-connection.
+
+```zig
+const zssl = @import("zssl");
+
+var chain_storage: [zssl.Credentials.chain_bytes_max]u8 = undefined;
+var credentials = try zssl.Credentials.load(cert_pem, key_pem, &chain_storage, false);
+defer credentials.deinit();
+```
+
+Each connection gets a handshake, two caller-owned buffers, and 64 bytes
+of entropy you supply:
+
+```zig
+var reassembly: [16 * 1024]u8 = undefined;
+var flight: [zssl.Credentials.chain_bytes_max + 1024]u8 = undefined;
+
+var entropy: [64]u8 = undefined;
+io.random(&entropy); // your `std.Io` — zssl never calls an RNG itself
+
+var server = zssl.ServerHandshake.init(&.{
+    .credentials = &credentials,
+    .server_random = entropy[0..32].*,
+    .x25519_private = entropy[32..64].*,
+    .alpn = "http/1.1",
+    .reassembly = &reassembly,
+    .flight = &flight,
+});
+defer server.deinit();
+```
+
+Then drive it with whole records. `zssl.record_buffer.RecordBuffer` turns
+a byte stream into those, policing the RFC 8446 §5 length caps as bytes
+arrive:
+
+```zig
+var out: [zssl.ServerHandshake.out_bytes_min]u8 = undefined;
+
+while (try records.next()) |wire_record| {
+    switch (try server.handleRecord(wire_record, &out)) {
+        // Handshake bytes to put on the wire.
+        .send => |bytes| try socket.writeAll(bytes),
+        // The session is up; app data may now flow both ways.
+        .connected => {},
+        // Decrypted application bytes, valid until the next call.
+        .application_data => |plaintext| try onRequest(plaintext),
+        // The peer sent close_notify.
+        .closed => break,
+        // A record that advanced nothing — a fragment, or a CCS.
+        .none => {},
+    }
+}
+
+const reply = try server.sendApplicationData("HTTP/1.1 200 OK\r\n\r\n", &out);
+try socket.writeAll(reply);
+```
+
+On any error the machine is `failed` and must not be fed again — close
+the connection. That is the whole contract.
+
+### Originating TLS
+
+The client half has the same shape; `start` produces the ClientHello, and
+the `connected` event carries the flight to send:
+
+```zig
+var reassembly: [16 * 1024]u8 = undefined;
+var client = zssl.ClientHandshake.init(&.{
+    .client_random = entropy[0..32].*,
+    .x25519_private = entropy[32..64].*,
+    .server_name = "origin.internal",
+    .alpn = "http/1.1",
+    .certificate_policy = .ecdsa_leaf_signature,
+    .reassembly = &reassembly,
+});
+defer client.deinit();
+
+try socket.writeAll(client.start(&out));
+
+while (try records.next()) |wire_record| {
+    switch (try client.handleRecord(wire_record, &out)) {
+        .send, .connected => |bytes| try socket.writeAll(bytes),
+        .application_data => |plaintext| try onResponse(plaintext),
+        .ticket => |ticket| try store(ticket),
+        .closed => break,
+        .none => {},
+    }
+}
+```
+
+`certificate_policy` is an explicit seam. `.ecdsa_leaf_signature` proves
+the peer holds the key its certificate names; **chain building and RFC
+9525 name matching are yours to do**, deliberately, because a proxy's
+trust decisions belong to the proxy. `.insecure_no_verification` exists
+for pinned transports and tests, and says so in its name.
+
+### Resumption and kTLS
+
+After `connected`, a server can issue tickets and either side can rotate
+keys or hand the connection to the kernel:
+
+```zig
+// Derive the PSK first, seal your own ticket around it, then send.
+var psk_buffer: [zssl.cipher_suite.hash_bytes_max]u8 = undefined;
+const psk = server.resumptionPsk(&nonce, &psk_buffer);
+const sealed = try server.sendNewSessionTicket(&.{
+    .lifetime_s = 3600,
+    .age_add = age_add,
+    .ticket_nonce = &nonce,
+    .ticket = your_sealed_ticket,
+}, &out);
+
+// RFC 8446 §4.6.3 rekey, and the kTLS hand-off.
+const update = try server.sendKeyUpdate(true, &out);
+const keys = server.exportKeyMaterial(.transmit);
+```
+
+Ticket sealing, lifetime and age policy stay with you: zssl takes an
+opaque identity through `Config.psk_lookup` and answers with the PSK,
+then verifies the binder itself. A recognised identity with a bad binder
+aborts the handshake rather than falling back — a replayed ticket is
+refused, not downgraded.
+
+## Scope
+
+**In:** TLS 1.3 (RFC 8446), the three standard cipher suites, x25519,
+ECDSA P-256/P-384, SNI, ALPN, HelloRetryRequest, PSK resumption with
+server-side tickets, KeyUpdate, and kTLS key export.
+
+**Out, permanently:** TLS 1.2 and earlier, renegotiation, compression,
+RSA and DSA key exchange. A caller that needs these wants a different
+library.
+
+**Out, for now:** 0-RTT (a replay-analysis decision, not a convenience),
+X.509 chain validation, client certificates, and QUIC.
+
+Everything above is argued in [docs/DESIGN.md](docs/DESIGN.md) §1.
+
+## Testing
+
+`zig build test` runs 64 tests; `zig build interop` runs the real-OpenSSL
+gate. Four kinds of evidence, in rough order of how much they are worth:
+
+| Oracle | What it proves |
+| --- | --- |
+| **RFC 8448** replay | The key schedule, binder chain and record layer produce the RFC's traced bytes exactly — secrets, flights and ServerHello re-encoded byte for byte. |
+| **OpenSSL interop** | `openssl s_client` completes against our server with openssl's own X.509 verifying our certificate; our client completes against `openssl s_server -rev` and opens the echo it seals back. |
+| **`std.crypto.tls`** | A second independent implementation completes a full in-memory handshake, in both directions, and exchanges data. |
+| **Fuzzing** | Nine targets over every parser and both state machines: arbitrary peer bytes yield a value or an error, never a panic. |
+
+Plus directed tests for the things that only break under adversity —
+fragmented ClientHellos, tampered Finished messages, corrupted binders,
+inverted flights, sequence exhaustion.
+
+The one gap, stated plainly: none of this is *adversarial*. It all tests
+what zssl accepts. [docs/BOGO.md](docs/BOGO.md) is the plan for testing
+what it refuses, and why that is the highest-value work left.
+
+## Development
+
+```sh
+zig build test                          # the suite
+zig build test -Doptimize=ReleaseSafe   # the mode releases ship
+zig build interop                       # against a real openssl binary
+zig fmt --check src interop build.zig build.zig.zon
+```
+
+RFC 8448 vectors are generated, never transcribed:
+`scripts/extract_rfc8448.py` parses the RFC text into
+`src/rfc8448_vectors.zig`. Regenerate rather than hand-editing.
+
+[docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) is the style contract the tree
+is held to.
