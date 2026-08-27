@@ -145,9 +145,27 @@ wrap. zssl never writes padding; it strips peers' padding per §5.4.
    Oracle: both production machines end to end — handshake, resume,
    KeyUpdate both directions with kTLS exports agreeing across machines
    at every generation.
-5. **The assurance ladder**: BoGo shim, parser fuzz targets (record
-   header, ClientHello, extensions), differential against ztls, interop
-   against openssl s_client and s_server.
+5. **The assurance ladder** — partly done. Landed: nine coverage-guided
+   fuzz targets over every parser and both state machines, asserting the
+   one property that matters for a library whose assertions are claims
+   about *our* state — arbitrary peer bytes produce a value or an error,
+   never a panic; and `zig build interop`, which runs both directions
+   against the real `openssl` binary (genuine libssl, no shared code,
+   real sockets): `s_client` completes against `ServerHandshake` with
+   openssl's own X.509 verifying our Certificate, and `ClientHandshake`
+   completes against `s_server` with our policy verifying theirs.
+   Outstanding, and tracked honestly in `docs/BOGO.md` rather than
+   half-built: the **BoGo shim**, which is the only adversarial item on
+   this list and the one that asks what a terminator must *refuse*. The
+   ztls differential moves to zoxy's engine swap, where the two run side
+   by side and a disagreement is diagnosable against a live proxy.
+
+   Note on the fuzzer: `zig build test` runs every target once over its
+   corpus and is what CI gates on. The coverage-guided search
+   (`--fuzz`) is blocked on a toolchain bug — 0.16.0's own fuzzing test
+   runner fails to compile (`compiler/test_runner.zig:566`, two
+   `StackTrace` types crossed) — reproduced identically in the zoxy
+   tree, so it is the pinned compiler and not this library.
 
 ## §7 Testing stance
 

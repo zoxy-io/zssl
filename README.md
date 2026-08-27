@@ -14,7 +14,7 @@ Read before writing code:
 
 ## Gates
 
-- `zig build test` — 52 tests across three oracle classes:
+- `zig build test` — 62 tests across four oracle classes:
   - **RFC 8448 replayed byte for byte** — §3's key ladder, every
     protected record opened, the server flight and ServerHello re-encoded
     to identical wire bytes; §4's binder chain, truncated-transcript
@@ -36,17 +36,30 @@ Read before writing code:
     paths (tampering, corrupted binders, unknown tickets, no common
     suite, ALPN mismatch, talking past the handshake) — plus AEAD
     differentials against `std.crypto` for all three suites.
+  - **Fuzz targets** — nine of them, over every parser (record header,
+    alert, ClientHello, PEM, the handshake assembler, the record
+    buffer) and both state machines, asserting that arbitrary peer
+    bytes yield a value or an error and never a panic. `zig build test`
+    runs each once over its corpus; the coverage-guided `--fuzz` search
+    is blocked on a 0.16.0 toolchain bug (see DESIGN.md §6).
+- `zig build interop` — the real-OpenSSL gate: `openssl s_client`
+  against our `ServerHandshake` (openssl's X.509 verifying our
+  certificate) and our `ClientHandshake` against `openssl s_server`,
+  over loopback sockets. Exits 2 and says so when no TLS 1.3-capable
+  `openssl` is on PATH, rather than failing.
 - `zig build test -Doptimize=ReleaseSafe` — the same suite in the mode
   release builds ship (assertions stay on; libcrypto builds with
   `sanitize_c = .off` in every mode — zoxy's #283).
-- `zig fmt --check src build.zig build.zig.zon` — format gate.
+- `zig fmt --check src interop build.zig build.zig.zon` — format gate.
 
 Test vectors are generated, not transcribed: `scripts/extract_rfc8448.py`
 parses the RFC text into `src/rfc8448_vectors.zig`.
 
 ## Status
 
-Slices 1 (foundations), 2 (ServerHandshake), 3 (resumption), and 4
-(KeyUpdate, the kTLS switchover contract, ClientHandshake) — see
-DESIGN.md §6 for what each proved. Remaining: the BoGo/fuzz assurance
-ladder (5).
+Slices 1 (foundations), 2 (ServerHandshake), 3 (resumption), 4
+(KeyUpdate, the kTLS switchover contract, ClientHandshake), and most of
+5 (fuzzing and real-OpenSSL interop) — see DESIGN.md §6 for what each
+proved. The one item still outstanding is the **BoGo shim**, the only
+adversarial gate on the ladder; `docs/BOGO.md` states what it needs and
+why it is not claimed as done.

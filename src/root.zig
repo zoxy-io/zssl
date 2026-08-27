@@ -39,4 +39,5 @@ test {
     _ = @import("std_interop_test.zig");
     _ = @import("resumption_test.zig");
     _ = @import("client_server_test.zig");
+    _ = @import("fuzz_test.zig");
 }

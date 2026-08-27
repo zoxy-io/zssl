@@ -17,7 +17,13 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
   scenarios). Run it in **both** modes: plain and
   `-Doptimize=ReleaseSafe` — ReleaseSafe is what release builds ship,
   and assertions stay on there.
-- `zig fmt --check src scripts build.zig build.zig.zon` — format gate.
+- `zig build interop` — the real-OpenSSL gate (spawns `openssl
+  s_client`/`s_server` over loopback). Exits 2 as a readable SKIP when
+  no TLS 1.3-capable `openssl` is on PATH; macOS's `/usr/bin/openssl` is
+  LibreSSL and does not qualify, so Homebrew's `openssl@3` is what the
+  probe finds first.
+- `zig fmt --check src interop scripts build.zig build.zig.zon` — format
+  gate.
 - Run the `tiger-style-reviewer` agent on the working diff before
   committing a slice (same rule as zoxy). Point it at the
   security-critical paths of the diff by name; reachable assertions on
