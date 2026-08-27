@@ -11,7 +11,9 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const cipher_suite = @import("cipher_suite.zig");
+const wire = @import("wire.zig");
 const CipherSuite = cipher_suite.CipherSuite;
+const Cursor = wire.Cursor;
 
 pub const Error = error{
     Truncated,
@@ -32,19 +34,23 @@ pub const Error = error{
 pub const suites_count_max: u16 = 128;
 pub const extensions_count_max: u16 = 64;
 pub const key_share_entries_max: u16 = 16;
+pub const groups_count_max: u16 = 64;
+pub const schemes_count_max: u16 = 64;
 
 pub const handshake_header_bytes: u8 = 4;
 const client_hello_message_type: u8 = 0x01;
 
 const extension_server_name: u16 = 0;
+const extension_supported_groups: u16 = 10;
 const extension_signature_algorithms: u16 = 13;
 const extension_alpn: u16 = 16;
 const extension_pre_shared_key: u16 = 41;
 const extension_supported_versions: u16 = 43;
 const extension_psk_key_exchange_modes: u16 = 45;
 const extension_key_share: u16 = 51;
-const group_x25519: u16 = 0x001d;
 const tls13_wire_version: u16 = 0x0304;
+
+pub const group_x25519: u16 = 0x001d;
 
 pub const ClientHello = struct {
     random: *const [32]u8,
@@ -54,6 +60,8 @@ pub const ClientHello = struct {
     server_name: ?[]const u8 = null,
     key_share_x25519: ?*const [32]u8 = null,
     supports_tls13: bool = false,
+    /// The inner u16 group list, prefix stripped and validated even.
+    supported_groups_wire: ?[]const u8 = null,
     signature_algorithms_wire: ?[]const u8 = null,
     alpn_wire: ?[]const u8 = null,
     psk_modes_wire: ?[]const u8 = null,
@@ -65,52 +73,37 @@ pub const ClientHello = struct {
         assert(self.cipher_suites_wire.len <= 2 * @as(usize, suites_count_max));
         var index: usize = 0;
         while (index < self.cipher_suites_wire.len) : (index += 2) {
-            const wire = std.mem.readInt(u16, self.cipher_suites_wire[index..][0..2], .big);
-            if (CipherSuite.fromWire(wire) == suite) return true;
+            const code = std.mem.readInt(u16, self.cipher_suites_wire[index..][0..2], .big);
+            if (CipherSuite.fromWire(code) == suite) return true;
         }
         return false;
     }
-};
 
-const Cursor = struct {
-    bytes: []const u8,
-    index: usize,
-
-    fn init(bytes: []const u8) Cursor {
-        return .{ .bytes = bytes, .index = 0 };
+    /// Whether the client's supported_groups names `group` — the fact a
+    /// HelloRetryRequest decision rests on (§4.2.7).
+    pub fn supportsGroup(self: *const ClientHello, group: u16) bool {
+        const list = self.supported_groups_wire orelse return false;
+        assert(list.len % 2 == 0);
+        assert(list.len >= 2);
+        var index: usize = 0;
+        while (index < list.len) : (index += 2) {
+            if (std.mem.readInt(u16, list[index..][0..2], .big) == group) return true;
+        }
+        return false;
     }
 
-    fn remaining(self: *const Cursor) usize {
-        assert(self.index <= self.bytes.len);
-        return self.bytes.len - self.index;
-    }
-
-    fn takeByte(self: *Cursor) Error!u8 {
-        if (self.remaining() < 1) return error.Truncated;
-        const byte = self.bytes[self.index];
-        self.index += 1;
-        return byte;
-    }
-
-    fn takeU16(self: *Cursor) Error!u16 {
-        if (self.remaining() < 2) return error.Truncated;
-        const value = std.mem.readInt(u16, self.bytes[self.index..][0..2], .big);
-        self.index += 2;
-        return value;
-    }
-
-    fn takeU24(self: *Cursor) Error!u24 {
-        if (self.remaining() < 3) return error.Truncated;
-        const value = std.mem.readInt(u24, self.bytes[self.index..][0..3], .big);
-        self.index += 3;
-        return value;
-    }
-
-    fn takeSlice(self: *Cursor, count: usize) Error![]const u8 {
-        if (self.remaining() < count) return error.Truncated;
-        const slice = self.bytes[self.index..][0..count];
-        self.index += count;
-        return slice;
+    /// Whether signature_algorithms names `scheme` (§4.2.3). The list was
+    /// validated and prefix-stripped at parse, so this walk is over an
+    /// even list already bounded by `schemes_count_max`.
+    pub fn offersScheme(self: *const ClientHello, scheme: u16) bool {
+        const list = self.signature_algorithms_wire orelse return false;
+        assert(list.len % 2 == 0);
+        assert(list.len <= 2 * @as(usize, schemes_count_max));
+        var index: usize = 0;
+        while (index < list.len) : (index += 2) {
+            if (std.mem.readInt(u16, list[index..][0..2], .big) == scheme) return true;
+        }
+        return false;
     }
 };
 
@@ -165,8 +158,8 @@ fn parseBody(body: []const u8) Error!ClientHello {
     return hello;
 }
 
-fn parseExtensions(wire: []const u8, hello: *ClientHello) Error!void {
-    var cursor = Cursor.init(wire);
+fn parseExtensions(extensions_bytes: []const u8, hello: *ClientHello) Error!void {
+    var cursor = Cursor.init(extensions_bytes);
     var seen_types = std.StaticBitSet(64).initEmpty();
     var count: u16 = 0;
     while (cursor.remaining() > 0) : (count += 1) {
@@ -198,6 +191,7 @@ fn trackedBit(extension_type: u16) ?u6 {
         extension_supported_versions => 4,
         extension_psk_key_exchange_modes => 5,
         extension_key_share => 6,
+        extension_supported_groups => 7,
         else => null,
     };
 }
@@ -207,9 +201,11 @@ fn applyExtension(extension_type: u16, data: []const u8, hello: *ClientHello) Er
         extension_server_name => hello.server_name = try parseServerName(data),
         extension_key_share => hello.key_share_x25519 = try parseKeyShare(data),
         extension_supported_versions => hello.supports_tls13 = try parseSupportedVersions(data),
+        extension_supported_groups => {
+            hello.supported_groups_wire = try parseU16List(data, groups_count_max);
+        },
         extension_signature_algorithms => {
-            if (data.len < 4) return error.MalformedExtension;
-            hello.signature_algorithms_wire = data;
+            hello.signature_algorithms_wire = try parseU16List(data, schemes_count_max);
         },
         extension_alpn => {
             if (data.len < 4) return error.MalformedExtension;
@@ -225,6 +221,23 @@ fn applyExtension(extension_type: u16, data: []const u8, hello: *ClientHello) Er
         },
         else => {}, // Unknown: skipped whole, contents never inspected.
     }
+}
+
+/// A `<u16 length, u16 items>` list body, validated and prefix-stripped —
+/// the shape supported_groups and signature_algorithms share (§4.2.7,
+/// §4.2.3). The count cap is what makes every later walk's bound a true
+/// invariant instead of an assertion an attacker can reach.
+fn parseU16List(data: []const u8, count_max: u16) Error![]const u8 {
+    var cursor = Cursor.init(data);
+    const list_bytes = try cursor.takeU16();
+    if (list_bytes != cursor.remaining()) return error.MalformedExtension;
+    if (list_bytes < 2) return error.MalformedExtension;
+    if (list_bytes % 2 != 0) return error.MalformedExtension;
+    if (list_bytes > 2 * count_max) return error.ExtensionOverflow;
+    const list = try cursor.takeSlice(list_bytes);
+    assert(cursor.remaining() == 0);
+    assert(list.len >= 2);
+    return list;
 }
 
 /// §3 of RFC 6066: a ServerNameList; only host_name (0) entries exist.
@@ -299,7 +312,11 @@ test "parses RFC 8448's ClientHello field for field" {
     try std.testing.expect(hello.offersSuite(.aes_256_gcm_sha384));
     try std.testing.expect(hello.offersSuite(.chacha20_poly1305_sha256));
     try std.testing.expectEqual(@as(usize, 6), hello.cipher_suites_wire.len);
-    try std.testing.expect(hello.signature_algorithms_wire != null);
+    try std.testing.expect(hello.supportsGroup(group_x25519));
+    try std.testing.expect(!hello.supportsGroup(0x9999));
+    try std.testing.expect(hello.offersScheme(0x0403));
+    try std.testing.expect(hello.offersScheme(0x0503));
+    try std.testing.expect(!hello.offersScheme(0x0807)); // ed25519 is not in the trace's list.
     try std.testing.expect(hello.psk_modes_wire != null);
     // Negative space: nothing this trace does not offer appears offered.
     try std.testing.expectEqual(@as(?[]const u8, null), hello.alpn_wire);

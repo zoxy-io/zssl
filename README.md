@@ -14,11 +14,21 @@ Read before writing code:
 
 ## Gates
 
-- `zig build test` — 22 tests: the RFC 8448 §3 handshake replayed byte
-  for byte (key ladder, every protected record opened, the server flight
-  re-sealed to identical wire bytes), an AEAD differential against
-  `std.crypto` for all three suites, x25519 agreement, ClientHello
-  parsing with truncation at every prefix, and the kTLS payload layouts.
+- `zig build test` — 40 tests across three oracle classes:
+  - **RFC 8448 §3 replayed byte for byte** — the key ladder, every
+    protected record opened, the server flight and ServerHello re-encoded
+    to identical wire bytes.
+  - **Interop with `std.crypto.tls.Client`** — an implementation sharing
+    no code with zssl completes a full in-memory handshake against
+    `ServerHandshake` (std's own X.509 and ECDSA verify our Certificate
+    and CertificateVerify), exchanges data both ways, and takes a clean
+    close_notify.
+  - **State-machine scenarios** — fragmented ClientHello, coalesced
+    flights, HelloRetryRequest with §4.4.1 transcript surgery, ALPN,
+    kTLS key-export agreement, RFC 6979 signature determinism, and the
+    failure paths (tampering, no common suite, ALPN mismatch, talking
+    past the handshake) — plus AEAD differentials against `std.crypto`
+    for all three suites.
 - `zig build test -Doptimize=ReleaseSafe` — the same suite in the mode
   release builds ship (assertions stay on; libcrypto builds with
   `sanitize_c = .off` in every mode — zoxy's #283).
@@ -29,5 +39,6 @@ parses the RFC text into `src/rfc8448_vectors.zig`.
 
 ## Status
 
-Slice 1 (foundations) — see DESIGN.md §6 for the ladder to a working
-ServerHandshake, resumption, and the kTLS switchover.
+Slices 1 (foundations) and 2 (ServerHandshake) — see DESIGN.md §6 for
+what each proved and the ladder ahead: resumption (3), kTLS switchover +
+KeyUpdate + client handshake (4), BoGo and fuzzing (5).

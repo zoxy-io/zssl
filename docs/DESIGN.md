@@ -99,21 +99,28 @@ wrap. zssl never writes padding; it strips peers' padding per §5.4.
 
 ## §6 Slices
 
-1. **Foundations** (this tree): record framing + protection, HKDF/key
+1. **Foundations** — done: record framing + protection, HKDF/key
    schedule, transcript, ClientHello parse, AEAD/X25519 backend,
    mem-hooks seam, kTLS payloads. Oracle: RFC 8448 §3 byte-for-byte.
-2. **ServerHandshake**: the state machine (ServerHello through Finished),
-   ECDSA CertificateVerify via libcrypto, deterministic-nonce option for
-   seeded-simulation replay, HelloRetryRequest, fragmented-ClientHello
-   reassembly into a caller-owned buffer. Oracle: RFC 8448 continued +
-   differential handshakes against ztls (dev-dependency only).
+2. **ServerHandshake** — done: the state machine (ClientHello through
+   client Finished), negotiation, ECDSA CertificateVerify via libcrypto
+   with the opt-in RFC 6979 deterministic-nonce mode, ALPN,
+   HelloRetryRequest with §4.4.1 transcript surgery,
+   fragmented-ClientHello reassembly, compatibility-CCS tolerance
+   (bounded), and kTLS key export at `connected`. Oracles: the traced
+   ServerHello byte-exact against RFC 8448; a full in-memory handshake
+   against **`std.crypto.tls.Client`** — no shared code, std's own X.509
+   and ECDSA judging our Certificate/CertificateVerify — plus the
+   in-tree test client covering fragmentation, HRR, and every failure
+   path. Known-refused, on purpose: KeyUpdate and post-handshake
+   messages error loudly (`KeyUpdateUnsupported`) until slice 4.
 3. **Resumption**: NewSessionTicket issuance after client Finished (the
    delayed-ACK lesson), PSK binder verification, the embedder's
    `psk_lookup` seam. Oracle: RFC 8448 §4.
 4. **kTLS switchover + KeyUpdate**, client handshake for upstreams.
 5. **The assurance ladder**: BoGo shim, parser fuzz targets (record
-   header, ClientHello, extensions) differential against ztls, interop
-   against `std.crypto.tls.Client` and openssl s_client.
+   header, ClientHello, extensions), differential against ztls, interop
+   against openssl s_client.
 
 ## §7 Testing stance
 

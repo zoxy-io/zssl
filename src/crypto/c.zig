@@ -4,7 +4,12 @@
 //! tree is a review failure, not a style preference.
 
 pub const c = @cImport({
+    @cInclude("openssl/bio.h");
+    @cInclude("openssl/core.h");
+    @cInclude("openssl/core_names.h");
     @cInclude("openssl/crypto.h");
-    @cInclude("openssl/evp.h");
     @cInclude("openssl/err.h");
+    @cInclude("openssl/evp.h");
+    @cInclude("openssl/params.h");
+    @cInclude("openssl/pem.h");
 });

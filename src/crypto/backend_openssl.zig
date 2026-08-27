@@ -29,6 +29,18 @@ pub const Error = error{
     IdentityElement,
 };
 
+pub const SignError = Error || error{
+    /// The key is not an ECDSA P-256/P-384 key — a policy refusal at load,
+    /// so the handshake never discovers it mid-flight.
+    UnsupportedKey,
+    /// RFC 6979 nonces were requested and this libcrypto cannot honor the
+    /// "nonce-type" parameter (pre-3.2). A loud error, because the silent
+    /// alternative is a random nonce — exactly what the option forbids.
+    DeterministicNonceUnsupported,
+    /// The peer's (or our own round-tripped) signature does not verify.
+    SignatureInvalid,
+};
+
 pub const nonce_bytes = cipher_suite.nonce_bytes;
 pub const tag_bytes = cipher_suite.tag_bytes;
 
@@ -166,6 +178,124 @@ pub fn x25519Public(
     assert(!std.mem.allEqual(u8, out, 0));
 }
 
+/// The two signature schemes zssl will ever hold a private key for
+/// (RFC 8446 §4.2.3 code points). RSA is a policy exclusion, not a gap.
+pub const SignatureScheme = enum(u16) {
+    ecdsa_secp256r1_sha256 = 0x0403,
+    ecdsa_secp384r1_sha384 = 0x0503,
+
+    fn digest(scheme: SignatureScheme) *const c.EVP_MD {
+        return switch (scheme) {
+            .ecdsa_secp256r1_sha256 => c.EVP_sha256(),
+            .ecdsa_secp384r1_sha384 => c.EVP_sha384(),
+        } orelse unreachable; // Statically-linked digests always exist.
+    }
+};
+
+/// A DER ECDSA-Sig-Value is at most 72 bytes for P-256 and 104 for P-384;
+/// 112 leaves headroom without inviting nonsense.
+pub const signature_bytes_max: u16 = 112;
+
+/// An ECDSA signing key held as a libcrypto `EVP_PKEY`. Lives from
+/// credential load to shutdown; each `sign` call creates and frees one
+/// digest context through the hooked allocator — handshake-time cost,
+/// never per-record.
+pub const Signer = struct {
+    pkey: *c.EVP_PKEY,
+    scheme: SignatureScheme,
+    /// Opt-in RFC 6979 nonces make the signature — and through DER
+    /// integer trimming, the flight length — a pure function of key and
+    /// transcript, which is what seeded-simulation replay needs. Off in
+    /// production: hedged random nonces are the conservative default.
+    deterministic_nonces: bool,
+
+    /// Load a PEM private key and classify it. Anything but EC P-256 or
+    /// P-384 is refused here, at load, where the operator can read the
+    /// error.
+    pub fn fromPem(key_pem: []const u8, deterministic_nonces: bool) SignError!Signer {
+        assert(key_pem.len >= 1);
+        assert(key_pem.len <= 1 << 20);
+        const bio = c.BIO_new_mem_buf(key_pem.ptr, @intCast(key_pem.len)) orelse
+            return error.LibcryptoFailed;
+        defer _ = c.BIO_free(bio);
+        const pkey = c.PEM_read_bio_PrivateKey(bio, null, null, null) orelse
+            return error.UnsupportedKey;
+        errdefer c.EVP_PKEY_free(pkey);
+
+        if (c.EVP_PKEY_is_a(pkey, "EC") != 1) return error.UnsupportedKey;
+        const bits = c.EVP_PKEY_get_bits(pkey);
+        const scheme: SignatureScheme = switch (bits) {
+            256 => .ecdsa_secp256r1_sha256,
+            384 => .ecdsa_secp384r1_sha384,
+            else => return error.UnsupportedKey,
+        };
+        return .{ .pkey = pkey, .scheme = scheme, .deterministic_nonces = deterministic_nonces };
+    }
+
+    pub fn deinit(self: *Signer) void {
+        c.EVP_PKEY_free(self.pkey);
+        self.* = undefined;
+    }
+
+    /// Sign `content` (the full CertificateVerify content structure — the
+    /// digest happens inside). Returns the DER signature written into `out`.
+    pub fn sign(self: *const Signer, content: []const u8, out: []u8) SignError![]const u8 {
+        assert(content.len >= 1);
+        assert(out.len >= signature_bytes_max);
+        const ctx = c.EVP_MD_CTX_new() orelse return error.LibcryptoFailed;
+        defer c.EVP_MD_CTX_free(ctx);
+
+        var pkey_ctx: ?*c.EVP_PKEY_CTX = null;
+        if (c.EVP_DigestSignInit(ctx, &pkey_ctx, self.scheme.digest(), null, self.pkey) != 1)
+            return error.LibcryptoFailed;
+        if (self.deterministic_nonces) try requireDeterministicNonce(pkey_ctx);
+        if (c.EVP_DigestSignUpdate(ctx, content.ptr, content.len) != 1) return error.LibcryptoFailed;
+
+        var required: usize = 0;
+        if (c.EVP_DigestSignFinal(ctx, null, &required) != 1) return error.LibcryptoFailed;
+        if (required > out.len) return error.LibcryptoFailed;
+        var written: usize = out.len;
+        if (c.EVP_DigestSignFinal(ctx, out.ptr, &written) != 1) return error.LibcryptoFailed;
+        assert(written >= 8);
+        assert(written <= signature_bytes_max);
+        return out[0..written];
+    }
+
+    /// Verify a DER signature over `content` against this key's public
+    /// half. Test-side tooling: the independent verification paths are
+    /// `std.crypto` in the test client and real peers in interop.
+    pub fn verify(self: *const Signer, content: []const u8, signature: []const u8) SignError!void {
+        assert(content.len >= 1);
+        assert(signature.len >= 8);
+        const ctx = c.EVP_MD_CTX_new() orelse return error.LibcryptoFailed;
+        defer c.EVP_MD_CTX_free(ctx);
+        var pkey_ctx: ?*c.EVP_PKEY_CTX = null;
+        if (c.EVP_DigestVerifyInit(ctx, &pkey_ctx, self.scheme.digest(), null, self.pkey) != 1)
+            return error.LibcryptoFailed;
+        if (c.EVP_DigestVerifyUpdate(ctx, content.ptr, content.len) != 1) return error.LibcryptoFailed;
+        if (c.EVP_DigestVerifyFinal(ctx, signature.ptr, signature.len) != 1)
+            return error.SignatureInvalid;
+    }
+};
+
+/// The settable-params probe first: `EVP_PKEY_CTX_set_params` can succeed
+/// while the provider ignores an unknown key, and a silently random nonce
+/// is precisely the failure the option exists to prevent.
+fn requireDeterministicNonce(pkey_ctx: ?*c.EVP_PKEY_CTX) SignError!void {
+    // DigestSignInit populated this or failed; a null here would probe
+    // the provider's global params and "succeed" vacuously.
+    assert(pkey_ctx != null);
+    const settable = c.EVP_PKEY_CTX_settable_params(pkey_ctx);
+    if (c.OSSL_PARAM_locate_const(settable, c.OSSL_SIGNATURE_PARAM_NONCE_TYPE) == null)
+        return error.DeterministicNonceUnsupported;
+    var nonce_type: c_uint = 1; // 1 = deterministic-k (RFC 6979).
+    var params = [_]c.OSSL_PARAM{
+        c.OSSL_PARAM_construct_uint(c.OSSL_SIGNATURE_PARAM_NONCE_TYPE, &nonce_type),
+        c.OSSL_PARAM_construct_end(),
+    };
+    if (c.EVP_PKEY_CTX_set_params(pkey_ctx, &params) != 1) return error.LibcryptoFailed;
+}
+
 test "AEAD differential against std.crypto, all three suites" {
     // Two implementations sharing no code agreeing on the same bytes is
     // the cheapest strong oracle available offline. Lengths cover empty,
@@ -212,6 +342,48 @@ test "AEAD differential against std.crypto, all three suites" {
             );
         }
     }
+}
+
+test "signer: classification, round-trip, and RFC 6979 determinism" {
+    const key_pem = @embedFile("../testdata/key.pem");
+    const content = "TLS 1.3 test content, signed twice";
+
+    var deterministic = try Signer.fromPem(key_pem, true);
+    defer deterministic.deinit();
+    try std.testing.expectEqual(SignatureScheme.ecdsa_secp256r1_sha256, deterministic.scheme);
+
+    var first_buffer: [signature_bytes_max]u8 = undefined;
+    var second_buffer: [signature_bytes_max]u8 = undefined;
+    const first = try deterministic.sign(content, &first_buffer);
+    const second = try deterministic.sign(content, &second_buffer);
+    // RFC 6979: same key, same content — the same signature, bit for bit.
+    try std.testing.expectEqualSlices(u8, first, second);
+    try deterministic.verify(content, first);
+
+    // Negative space: a tampered signature and tampered content both fail.
+    var tampered_buffer: [signature_bytes_max]u8 = undefined;
+    @memcpy(tampered_buffer[0..first.len], first);
+    tampered_buffer[first.len - 1] ^= 1;
+    try std.testing.expectError(error.SignatureInvalid, deterministic.verify(content, tampered_buffer[0..first.len]));
+    try std.testing.expectError(error.SignatureInvalid, deterministic.verify("TLS 1.3 test content, signed 0nce", first));
+
+    // Hedged (default) nonces: two signatures over the same content differ.
+    var hedged = try Signer.fromPem(key_pem, false);
+    defer hedged.deinit();
+    const third = try hedged.sign(content, &first_buffer);
+    const fourth = try hedged.sign(content, &second_buffer);
+    try std.testing.expect(!std.mem.eql(u8, third, fourth));
+    try hedged.verify(content, third);
+    try hedged.verify(content, fourth);
+}
+
+test "signer refuses what policy excludes" {
+    // An Ed25519 key is a fine key for someone else's TLS library.
+    const ed25519_pem =
+        "-----BEGIN PRIVATE KEY-----\n" ++
+        "MC4CAQAwBQYDK2VwBCIEIFf+dQTz6cUdWa5TXBWSGCNjZfbWEUxTAKF+bmKlbYzR\n" ++
+        "-----END PRIVATE KEY-----\n";
+    try std.testing.expectError(error.UnsupportedKey, Signer.fromPem(ed25519_pem, false));
 }
 
 test "x25519 matches RFC 8448 and refuses the identity" {
