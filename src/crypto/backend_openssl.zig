@@ -29,6 +29,22 @@ pub const Error = error{
     IdentityElement,
 };
 
+/// libcrypto records every failure on a per-thread error queue, and
+/// nothing above this boundary ever reads it: zssl reports failures as
+/// Zig errors, and the queue's string data is a diagnostic for programs
+/// that call `ERR_print_errors`. Left alone, the entries sit in the
+/// embedder's fixed heap — bounded, because the queue is a ring of
+/// `ERR_NUM_ERRORS` (16) slots per thread, but never handed back, so a
+/// heap sized with no slack keeps them for the life of the process.
+///
+/// Every public entry point below clears the queue on the way out of a
+/// failure. An `errdefer` rather than a call per failing branch: the
+/// branches are many and each one is a chance to forget, while the
+/// function has exactly one error exit to guard.
+fn clearErrorQueue() void {
+    c.ERR_clear_error();
+}
+
 pub const SignError = Error || error{
     /// The key is not an ECDSA P-256/P-384 key — a policy refusal at load,
     /// so the handshake never discovers it mid-flight.
@@ -62,6 +78,7 @@ pub const AeadKey = struct {
     key_bytes: u8,
 
     pub fn init(suite: CipherSuite, key: []const u8) Error!AeadKey {
+        errdefer clearErrorQueue();
         assert(key.len == suite.keyBytes());
         assert(key.len == 16 or key.len == 32);
         const cipher = aeadCipher(suite);
@@ -99,6 +116,7 @@ pub const AeadKey = struct {
         ciphertext: []u8,
         tag: *[tag_bytes]u8,
     ) Error!void {
+        errdefer clearErrorQueue();
         assert(ciphertext.len == plaintext.len);
         assert(additional_data.len >= 1);
         var written: c_int = 0;
@@ -122,6 +140,7 @@ pub const AeadKey = struct {
         tag: *const [tag_bytes]u8,
         plaintext: []u8,
     ) Error!void {
+        errdefer clearErrorQueue();
         assert(plaintext.len == ciphertext.len);
         assert(additional_data.len >= 1);
         var written: c_int = 0;
@@ -145,6 +164,7 @@ pub fn x25519Shared(
     peer_public: *const [x25519_key_bytes]u8,
     out: *[x25519_key_bytes]u8,
 ) Error!void {
+    errdefer clearErrorQueue();
     const pkey = c.EVP_PKEY_new_raw_private_key(c.EVP_PKEY_X25519, null, private_key, x25519_key_bytes) orelse
         return error.LibcryptoFailed;
     defer c.EVP_PKEY_free(pkey);
@@ -169,6 +189,7 @@ pub fn x25519Public(
     private_key: *const [x25519_key_bytes]u8,
     out: *[x25519_key_bytes]u8,
 ) Error!void {
+    errdefer clearErrorQueue();
     const pkey = c.EVP_PKEY_new_raw_private_key(c.EVP_PKEY_X25519, null, private_key, x25519_key_bytes) orelse
         return error.LibcryptoFailed;
     defer c.EVP_PKEY_free(pkey);
@@ -213,6 +234,7 @@ pub const Signer = struct {
     /// P-384 is refused here, at load, where the operator can read the
     /// error.
     pub fn fromPem(key_pem: []const u8, deterministic_nonces: bool) SignError!Signer {
+        errdefer clearErrorQueue();
         assert(key_pem.len >= 1);
         assert(key_pem.len <= 1 << 20);
         const bio = c.BIO_new_mem_buf(key_pem.ptr, @intCast(key_pem.len)) orelse
@@ -240,6 +262,7 @@ pub const Signer = struct {
     /// Sign `content` (the full CertificateVerify content structure — the
     /// digest happens inside). Returns the DER signature written into `out`.
     pub fn sign(self: *const Signer, content: []const u8, out: []u8) SignError![]const u8 {
+        errdefer clearErrorQueue();
         assert(content.len >= 1);
         assert(out.len >= signature_bytes_max);
         const ctx = c.EVP_MD_CTX_new() orelse return error.LibcryptoFailed;
@@ -265,6 +288,7 @@ pub const Signer = struct {
     /// half. Test-side tooling: the independent verification paths are
     /// `std.crypto` in the test client and real peers in interop.
     pub fn verify(self: *const Signer, content: []const u8, signature: []const u8) SignError!void {
+        errdefer clearErrorQueue();
         assert(content.len >= 1);
         assert(signature.len >= 8);
         const ctx = c.EVP_MD_CTX_new() orelse return error.LibcryptoFailed;
@@ -404,4 +428,51 @@ test "x25519 matches RFC 8448 and refuses the identity" {
         error.IdentityElement,
         x25519Shared(&vectors.client_x25519_private, &zero_point, &shared),
     );
+}
+
+// The drain needs a gate or it is one refactor from being deleted as
+// dead code. `ERR_peek_error` answers 0 for an empty queue, so the
+// property is directly observable: force a failure through each entry
+// point that can fail without a live key, and the queue is empty after.
+test "libcrypto's error queue is empty after a failure" {
+    // Start from a known state: an earlier test in this process may have
+    // left entries, and what is under test is what *these* calls leave.
+    c.ERR_clear_error();
+    try std.testing.expectEqual(@as(c_ulong, 0), c.ERR_peek_error());
+
+    // A key that is not a key. `fromPem` fails inside PEM_read_bio_*,
+    // which is one of libcrypto's chattier error paths.
+    try std.testing.expectError(
+        error.UnsupportedKey,
+        Signer.fromPem("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n", false),
+    );
+    try std.testing.expectEqual(@as(c_ulong, 0), c.ERR_peek_error());
+
+    // The all-zero peer point: EVP_PKEY_derive refuses it, which is the
+    // §7.4.2 abort and also an error-queue entry.
+    const private_key = [_]u8{0x11} ** 31 ++ [_]u8{0x42};
+    const zero_point = [_]u8{0} ** 32;
+    var shared: [32]u8 = undefined;
+    try std.testing.expectError(
+        error.IdentityElement,
+        x25519Shared(&private_key, &zero_point, &shared),
+    );
+    try std.testing.expectEqual(@as(c_ulong, 0), c.ERR_peek_error());
+
+    // A tag that does not authenticate — the one failure a peer can
+    // cause at will, so the one whose residue would accumulate fastest.
+    const key = [_]u8{0x33} ** 16;
+    var aead = try AeadKey.init(.aes_128_gcm_sha256, &key);
+    defer aead.deinit();
+    const nonce = [_]u8{0x44} ** nonce_bytes;
+    var sealed: [8]u8 = undefined;
+    var tag: [tag_bytes]u8 = undefined;
+    try aead.seal(&nonce, "aad", "12345678", &sealed, &tag);
+    tag[0] ^= 1;
+    var opened: [8]u8 = undefined;
+    try std.testing.expectError(
+        error.AuthenticationFailed,
+        aead.open(&nonce, "aad", &sealed, &tag, &opened),
+    );
+    try std.testing.expectEqual(@as(c_ulong, 0), c.ERR_peek_error());
 }
