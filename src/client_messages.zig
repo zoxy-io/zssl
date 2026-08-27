@@ -140,18 +140,25 @@ fn helloExtensions(builder: *wire.Builder, params: *const HelloParams) void {
     builder.putSlice(params.x25519_public);
     builder.patchU16(share_list);
     builder.patchU16(shares);
-    if (params.psk) |psk| helloPskExtensions(builder, &psk);
-}
-
-fn helloPskExtensions(builder: *wire.Builder, psk: *const PskParams) void {
-    assert(psk.identity.len >= 1);
-    assert(psk.identity.len <= server_messages.ticket_bytes_max);
-    assert(psk.binder_bytes == 32 or psk.binder_bytes == 48);
-    builder.putU16(45); // psk_key_exchange_modes: psk_dhe_ke only.
+    // psk_key_exchange_modes (§4.2.9), sent on *every* hello and not only
+    // on the resuming one: §4.6.1 lets a server issue a NewSessionTicket
+    // only to a client that has advertised a mode it can resume under, so
+    // a hello without this can never be given a ticket to come back with.
+    // psk_dhe_ke alone — zssl never accepts psk_ke (slice 3).
+    builder.putU16(45);
     const modes = builder.markU16();
     builder.putByte(1);
     builder.putByte(0x01);
     builder.patchU16(modes);
+    if (params.psk) |psk| helloPreSharedKey(builder, &psk);
+}
+
+/// §4.2's one ordering rule: pre_shared_key is the last extension in the
+/// ClientHello, because the binder is computed over everything before it.
+fn helloPreSharedKey(builder: *wire.Builder, psk: *const PskParams) void {
+    assert(psk.identity.len >= 1);
+    assert(psk.identity.len <= server_messages.ticket_bytes_max);
+    assert(psk.binder_bytes == 32 or psk.binder_bytes == 48);
     builder.putU16(41); // pre_shared_key — last, per §4.2.
     const extension = builder.markU16();
     const identities = builder.markU16();
@@ -214,9 +221,12 @@ test "the production hello parses under our own strict parser" {
     try std.testing.expect(hello.offersSuite(.aes_128_gcm_sha256));
     try std.testing.expect(hello.offersSuite(.aes_256_gcm_sha384));
     try std.testing.expect(hello.offersSuite(.chacha20_poly1305_sha256));
-    // Negative space: no PSK material appears when none was configured.
+    // Negative space: no PSK *offer* appears when none was configured —
+    // but the mode does, because §4.6.1 lets a server issue a ticket only
+    // to a client that has said which mode it would resume under. A hello
+    // without this can never be given a ticket to come back with.
     try std.testing.expectEqual(@as(?[]const u8, null), hello.pre_shared_key_wire);
-    try std.testing.expect(!hello.offersPskDheKe());
+    try std.testing.expect(hello.offersPskDheKe());
 }
 
 test "a PSK hello carries a well-formed offer and a patchable binder" {

@@ -22,8 +22,15 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
   no TLS 1.3-capable `openssl` is on PATH; macOS's `/usr/bin/openssl` is
   LibreSSL and does not qualify, so Homebrew's `openssl@3` is what the
   probe finds first.
-- `zig fmt --check src interop scripts build.zig build.zig.zon` — format
-  gate.
+- `zig build bogo` — the adversarial gate: BoringSSL's BoGo runner, at
+  the commit pinned in `bogo/run.zig`, against `bogo/shim.zig`. Exits 2
+  as a readable SKIP with no Go toolchain (or no network on a cold run,
+  which fetches the checkout into `zig-out/bogo/`). It fails on any
+  case the runner ran and we did not satisfy, *and* on a passing count
+  below the floor in `bogo/run.zig` — that floor is what stops a
+  `config.json` suppression from being silent. See docs/BOGO.md.
+- `zig fmt --check src interop bogo scripts build.zig build.zig.zon` —
+  format gate.
 - Run the `tiger-style-reviewer` agent on the working diff before
   committing a slice (same rule as zoxy). Point it at the
   security-critical paths of the diff by name; reachable assertions on
@@ -55,5 +62,9 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
   family removed it. Do not add backends.
 - Test fixtures in `src/testdata/` are throwaway self-signed material
   shared with zoxy's `src/tls/testdata/`; never real credentials.
+- `bogo/config.json` is a **ledger**: every `DisabledTests` entry carries
+  a one-line reason, and one that reads "OPEN GAP" points at a numbered
+  finding in docs/BOGO.md. Never add an entry without a reason, and never
+  lower `passing_floor` to make a run green.
 - Workflow: one slice per commit, descriptive commit messages recording
   what the oracles proved. Push only when asked.

@@ -51,6 +51,12 @@ config: Config,
 assembler: handshake.Assembler,
 ladder: ?Ladder,
 ccs_seen: u8,
+/// Whether our own compatibility ChangeCipherSpec has gone out. D.4
+/// puts it before the client's first *protected* record, which is the
+/// Finished flight on a handshake that completes and the alert on one
+/// that does not — a peer in compatibility mode is waiting for it either
+/// way, and will not read a protected record that arrives ahead of it.
+ccs_sent: bool,
 hello_storage: [client_messages.hello_bytes_max]u8,
 hello_bytes: u16,
 /// Whether this session came up on our offered PSK.
@@ -196,6 +202,7 @@ pub fn init(config: *const Config) ClientHandshake {
         .assembler = handshake.Assembler.init(config.reassembly),
         .ladder = null,
         .ccs_seen = 0,
+        .ccs_sent = false,
         .hello_storage = undefined,
         .hello_bytes = 0,
         .resumed = false,
@@ -633,7 +640,9 @@ fn completeHandshake(self: *ClientHandshake, arm: anytype, message: handshake.Me
         }
     }
     if (!self.assembler.empty()) return error.UnexpectedMessage;
-    const flight = try arm.finishHandshake(message, self.config.send_change_cipher_spec, out);
+    const send_ccs = self.config.send_change_cipher_spec and !self.ccs_sent;
+    const flight = try arm.finishHandshake(message, send_ccs, out);
+    if (send_ccs) self.ccs_sent = true;
     self.state = .connected;
     // The invariant this function exists to enforce, stated where a
     // reader can check it: nothing reaches `connected` unauthenticated.
@@ -717,6 +726,54 @@ pub fn sendClose(self: *ClientHandshake, out: []u8) Error![]const u8 {
         },
     }
 }
+
+/// Encode one alert under whatever keys are live — application,
+/// handshake, or none yet — and retire the machine. The mirror of
+/// `ServerHandshake.sendAlert`, and there for the same reason: a peer we
+/// refuse should read a description rather than a reset. zssl still
+/// chooses no alerts of its own; it returns errors, and the embedder
+/// decides. Answers an empty slice when nothing can be sealed.
+pub fn sendAlert(self: *ClientHandshake, description: alert.Description, out: []u8) []const u8 {
+    assert(out.len >= alert_bytes_min);
+    // Callable in every state, `closed` included: §6.1 lets each side
+    // close its own direction, so an embedder answering a peer's
+    // close_notify with one of its own is doing the ordinary thing. The
+    // send protector outlives the peer's alert, so the seal still works.
+    const body = alert.encode(description);
+    self.state = if (description == .close_notify) .closed else .failed;
+    if (self.ladder) |*ladder| switch (ladder.*) {
+        inline else => |*arm| {
+            if (arm.session) |*session| {
+                return session.send.seal(.alert, &body, out) catch out[0..0];
+            }
+            if (arm.send) |*protector| {
+                // Mid-handshake: this alert is our first protected record,
+                // so D.4's dummy record has to lead it or a peer in
+                // compatibility mode reads the alert as the ChangeCipherSpec
+                // it was still waiting for.
+                var builder = wire.Builder.init(out);
+                if (self.config.send_change_cipher_spec and !self.ccs_sent) {
+                    builder.putSlice(&server_messages.change_cipher_spec_record);
+                    self.ccs_sent = true;
+                }
+                const sealed = protector.seal(.alert, &body, builder.bytes[builder.index..]) catch
+                    return out[0..0];
+                builder.index += sealed.len;
+                return builder.written();
+            }
+        },
+    };
+    // Before the ServerHello there are no keys, so §5.1 plaintext it is.
+    var builder = wire.Builder.init(out);
+    appendPlaintextRecord(&builder, .alert, &body);
+    return builder.written();
+}
+
+/// `out` for `sendAlert`: payload, inner content type, and AEAD tag over
+/// a record header — plus room for D.4's dummy ChangeCipherSpec, which a
+/// mid-handshake alert carries in front of it.
+pub const alert_bytes_min: u8 = @intCast(server_messages.change_cipher_spec_record.len +
+    record.header_bytes + alert.bytes + 1 + cipher_suite.tag_bytes);
 
 pub fn sendKeyUpdate(self: *ClientHandshake, request_update: bool, out: []u8) Error![]const u8 {
     assert(self.state == .connected);

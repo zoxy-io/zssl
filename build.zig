@@ -47,4 +47,35 @@ pub fn build(b: *std.Build) void {
     interop_run.has_side_effects = true;
     const interop_step = b.step("interop", "Interop gate: openssl s_client/s_server against zssl");
     interop_step.dependOn(&interop_run.step);
+
+    // The adversarial gate: BoringSSL's BoGo runner plays a hostile peer
+    // and asks what we *refuse*. `bogo/shim.zig` is the binary it drives;
+    // `bogo/run.zig` fetches the pinned runner, invokes it, and holds the
+    // result against the floor recorded in bogo/config.json. Like the
+    // interop gate it is an executable rather than a test: it clones,
+    // spawns `go`, and binds sockets, and a machine without Go should get
+    // a SKIP it can read rather than a red suite.
+    const shim_module = b.createModule(.{
+        .root_source_file = b.path("bogo/shim.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    shim_module.addImport("zssl", zssl_module);
+    const shim_exe = b.addExecutable(.{ .name = "zssl-bogo-shim", .root_module = shim_module });
+
+    const bogo_module = b.createModule(.{
+        .root_source_file = b.path("bogo/run.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bogo_exe = b.addExecutable(.{ .name = "zssl-bogo", .root_module = bogo_module });
+    const bogo_run = b.addRunArtifact(bogo_exe);
+    bogo_run.has_side_effects = true;
+    bogo_run.addArg("--shim");
+    bogo_run.addArtifactArg(shim_exe);
+    bogo_run.addArg("--config");
+    bogo_run.addFileArg(b.path("bogo/config.json"));
+    if (b.args) |forwarded| bogo_run.addArgs(forwarded);
+    const bogo_step = b.step("bogo", "Adversarial gate: BoringSSL's BoGo runner against zssl");
+    bogo_step.dependOn(&bogo_run.step);
 }

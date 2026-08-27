@@ -103,7 +103,9 @@ plaintext and the embedder compensated above the API.
 `Protector` is one direction under one traffic key: AEAD contexts,
 static IV, sequence. The §5.5 sequence bound (2^24 records, the
 AES-GCM-conservative figure applied to every suite) is an error, not a
-wrap. zssl never writes padding; it strips peers' padding per §5.4.
+wrap. zssl never writes padding; it strips peers' padding per §5.4 —
+though not, yet, the §5.4 length cap on what is left once the padding is
+gone, which is BoGo finding 3 in `docs/BOGO.md`.
 
 ## §6 Slices
 
@@ -154,20 +156,26 @@ wrap. zssl never writes padding; it strips peers' padding per §5.4.
    Oracle: both production machines end to end — handshake, resume,
    KeyUpdate both directions with kTLS exports agreeing across machines
    at every generation.
-5. **The assurance ladder** — partly done. Landed: nine coverage-guided
-   fuzz targets over every parser and both state machines, asserting the
-   one property that matters for a library whose assertions are claims
-   about *our* state — arbitrary peer bytes produce a value or an error,
-   never a panic; and `zig build interop`, which runs both directions
-   against the real `openssl` binary (genuine libssl, no shared code,
-   real sockets): `s_client` completes against `ServerHandshake` with
-   openssl's own X.509 verifying our Certificate, and `ClientHandshake`
-   completes against `s_server` with our policy verifying theirs.
-   Outstanding, and tracked honestly in `docs/BOGO.md` rather than
-   half-built: the **BoGo shim**, which is the only adversarial item on
-   this list and the one that asks what a terminator must *refuse*. The
-   ztls differential moves to zoxy's engine swap, where the two run side
-   by side and a disagreement is diagnosable against a live proxy.
+5. **The assurance ladder** — done, in the sense that every rung is
+   built; what it *found* is a queue. Landed: nine coverage-guided fuzz
+   targets over every parser and both state machines, asserting the one
+   property that matters for a library whose assertions are claims about
+   *our* state — arbitrary peer bytes produce a value or an error, never
+   a panic; `zig build interop`, which runs both directions against the
+   real `openssl` binary (genuine libssl, no shared code, real sockets):
+   `s_client` completes against `ServerHandshake` with openssl's own
+   X.509 verifying our Certificate, and `ClientHandshake` completes
+   against `s_server` with our policy verifying theirs; and `zig build
+   bogo`, the adversarial rung — BoringSSL's own hostile-peer runner, at
+   a pinned commit, asking what we *refuse*. It found three bugs on its
+   first run (a client that never advertised `psk_key_exchange_modes`
+   and so could never be given a ticket by a conforming server, a
+   mid-handshake alert that preceded D.4's compatibility record, and a
+   reachable assertion on flight size) and left eight open gaps, each
+   suppressed by name with a reason. `docs/BOGO.md` carries the numbers,
+   the ledger and the queue. The ztls differential stays out, and moves
+   to zoxy's engine swap, where the two run side by side and a
+   disagreement is diagnosable against a live proxy.
 
    Note on the fuzzer: `zig build test` runs every target once over its
    corpus and is what CI gates on. The coverage-guided search

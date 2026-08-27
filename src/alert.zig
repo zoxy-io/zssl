@@ -21,6 +21,9 @@ pub const Description = enum(u8) {
     bad_record_mac = 20,
     record_overflow = 22,
     handshake_failure = 40,
+    /// The peer's certificate could not be read, or its key is outside
+    /// `ClientHandshake`'s policy — §4.4.2's refusal, not §4.4.3's.
+    bad_certificate = 42,
     illegal_parameter = 47,
     decode_error = 50,
     decrypt_error = 51,

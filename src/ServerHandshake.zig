@@ -411,11 +411,13 @@ fn buildFlightPlaintext(
 
     // §4.1.1: a PSK authenticates the session, so a resumed flight is
     // EncryptedExtensions and Finished — no certificate, nothing signed.
+    var chain_bytes: usize = 0;
     if (!self.resumed) {
         const chain = server_messages.certificateChain(
             flight[builder.index..],
             self.config.credentials.chain(),
         );
+        chain_bytes = chain.len;
         builder.index += chain.len;
         arm.absorbMessage(chain);
 
@@ -439,9 +441,16 @@ fn buildFlightPlaintext(
 
     assert(builder.index <= flight.len);
     // A resumed flight is EncryptedExtensions + Finished; a full one adds
-    // the chain and the signature.
+    // the chain and the signature. The floor is measured against the
+    // chain we just encoded rather than against a guess at how big a
+    // certificate ought to be — a constant here once fired on a
+    // legitimately small ECDSA leaf, which is the embedder's choice to
+    // make and not ours to assert about.
     assert(builder.index >= 40);
-    if (!self.resumed) assert(builder.index >= 500);
+    if (self.resumed) assert(chain_bytes == 0);
+    // CertificateVerify and Finished both follow the chain, and neither
+    // is empty: a header, a scheme, a signature, a MAC.
+    if (!self.resumed) assert(builder.index > chain_bytes + 40);
     return flight[0..builder.index];
 }
 
@@ -566,6 +575,49 @@ pub fn sendClose(self: *ServerHandshake, out: []u8) Error![]const u8 {
         },
     }
 }
+
+/// Encode one alert under whatever keys are live — application,
+/// handshake, or none yet — and retire the machine. §6 wants a peer told
+/// *why* it was refused; every `handleRecord` error above is a refusal,
+/// and without this the peer reads a reset instead of a description.
+///
+/// zssl still does not decide *whether* to alert: it returns errors and
+/// the embedder chooses, as it chooses when to close. This is only the
+/// encoder that choice needs, and `alert_bytes_min` bounds `out`.
+///
+/// Answers an empty slice when the alert cannot be sealed at all (a §5.5
+/// exhausted sequence space); the embedder closes on either answer.
+pub fn sendAlert(self: *ServerHandshake, description: alert.Description, out: []u8) []const u8 {
+    assert(out.len >= alert_bytes_min);
+    // Callable in every state, `closed` included: §6.1 lets each side
+    // close its own direction, so an embedder answering a peer's
+    // close_notify with one of its own is doing the ordinary thing. The
+    // send protector outlives the peer's alert, so the seal still works.
+    const body = alert.encode(description);
+    self.state = if (description == .close_notify) .closed else .failed;
+    if (self.ladder) |*ladder| switch (ladder.*) {
+        inline else => |*arm| {
+            // Application keys first: once they exist the handshake
+            // protectors are gone, and §5's rule is that whatever the
+            // record layer is currently protecting, the alert is too.
+            if (arm.session) |*session| {
+                return session.send.seal(.alert, &body, out) catch out[0..0];
+            }
+            if (arm.send) |*protector| {
+                return protector.seal(.alert, &body, out) catch out[0..0];
+            }
+        },
+    };
+    // No keys yet — a ClientHello that never got as far as a suite. §5.1
+    // says plaintext, and that is what the peer will be expecting.
+    var builder = @import("wire.zig").Builder.init(out);
+    appendPlaintextRecord(&builder, .alert, &body);
+    return builder.written();
+}
+
+/// `out` for `sendAlert`: a two-byte payload, its inner content type,
+/// and an AEAD tag, over a record header.
+pub const alert_bytes_min: u8 = record.header_bytes + alert.bytes + 1 + cipher_suite.tag_bytes;
 
 /// §4.6.1: derive the PSK a ticket nonce will stand for. Separate from
 /// sending, because a stateless embedder needs the PSK *before* the

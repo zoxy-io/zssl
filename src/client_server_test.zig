@@ -555,3 +555,86 @@ test "insecure_no_verification completes against a server that sends a certifica
     try testing.expectEqual(ClientHandshake.State.connected, harness.client.state);
     try testing.expect(!harness.client.certificate_verified);
 }
+
+test "sendAlert: encrypted once keys exist, plaintext before, and the peer reads both" {
+    var buffers: Buffers = .{};
+
+    // Before any ServerHello there is no ladder, so §5.1 plaintext is
+    // the only thing the peer could open — and the server, still waiting
+    // on a ClientHello, must read it as the fatal alert it is.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        const bare = harness.client.sendAlert(.internal_error, &buffers.client_out);
+        try testing.expectEqual(ClientHandshake.State.failed, harness.client.state);
+        try testing.expectEqual(record.ContentType.alert, try contentTypeOf(bare));
+        try testing.expectError(
+            error.PeerAlert,
+            harness.server.handleRecord(bare, &buffers.server_out),
+        );
+    }
+
+    // Once the session keys exist the alert travels as application_data
+    // on the wire, which is the shape §5 requires and the only one the
+    // peer's record layer will open.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        try harness.connect(&buffers);
+        const sealed = harness.client.sendAlert(.illegal_parameter, &buffers.client_out);
+        try testing.expect(sealed.len <= ClientHandshake.alert_bytes_min);
+        try testing.expectEqual(record.ContentType.application_data, try contentTypeOf(sealed));
+        try testing.expectError(
+            error.PeerAlert,
+            harness.server.handleRecord(sealed, &buffers.server_out),
+        );
+    }
+
+    // close_notify is the one description that closes rather than fails,
+    // and the server half sends it the same way.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        try harness.connect(&buffers);
+        const sealed = harness.server.sendAlert(.close_notify, &buffers.server_out);
+        try testing.expectEqual(ServerHandshake.State.closed, harness.server.state);
+        const event = try harness.client.handleRecord(sealed, &buffers.scratch);
+        try testing.expectEqual(std.meta.activeTag(event), .closed);
+    }
+}
+
+test "sendAlert mid-handshake leads with D.4's dummy ChangeCipherSpec" {
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+
+    // Drive only as far as the ServerHello: handshake keys exist, our own
+    // Finished flight — and with it the compatibility record — has not
+    // gone out. A peer in compatibility mode is still waiting for it, and
+    // will not read a protected record that arrives first.
+    const hello = harness.client.start(&buffers.client_out);
+    const flight = try harness.server.handleRecord(hello, &buffers.server_out);
+    const server_hello = recordAt(flight.send, 0);
+    _ = try harness.client.handleRecord(server_hello, &buffers.scratch);
+    try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
+
+    const bytes = harness.client.sendAlert(.illegal_parameter, &buffers.client_out);
+    const leading = recordAt(bytes, 0);
+    try testing.expectEqual(record.ContentType.change_cipher_spec, try contentTypeOf(leading));
+    const sealed = recordAt(bytes, leading.len);
+    try testing.expectEqual(record.ContentType.application_data, try contentTypeOf(sealed));
+    try testing.expectEqual(bytes.len, leading.len + sealed.len);
+    try testing.expectError(
+        error.PeerAlert,
+        harness.server.handleRecord(sealed, &buffers.server_out),
+    );
+}
+
+fn contentTypeOf(wire_record: []const u8) !record.ContentType {
+    const header = try record.parseHeader(wire_record[0..record.header_bytes]);
+    return header.content_type;
+}

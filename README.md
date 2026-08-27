@@ -22,11 +22,13 @@ an `io_uring` event loop, a thread-per-connection server, or a
 deterministic simulator with a virtual clock — none of which it needs to
 know about.
 
-**Status: prototype.** It is exercised hard (see [Testing](#testing)) and
-interoperates with OpenSSL and `std.crypto.tls` in both directions, but
-it has not been adversarially tested — see [docs/BOGO.md](docs/BOGO.md) —
-and has had no external audit. Don't put it in front of anything you
-care about yet.
+**Status: prototype.** It is exercised hard (see [Testing](#testing)),
+interoperates with OpenSSL and `std.crypto.tls` in both directions, and
+its **client** half now runs under BoringSSL's adversarial BoGo runner —
+which found three bugs on its first pass and left eight open gaps, all
+recorded in [docs/BOGO.md](docs/BOGO.md). The server half is not yet
+covered there, and none of it has had an external audit. Don't put it in
+front of anything you care about yet.
 
 ## Why
 
@@ -229,11 +231,13 @@ Everything above is argued in [docs/DESIGN.md](docs/DESIGN.md) §1.
 
 ## Testing
 
-`zig build test` runs 74 tests; `zig build interop` runs the real-OpenSSL
-gate. Four kinds of evidence, in rough order of how much they are worth:
+`zig build test` runs the unit suite; `zig build interop` runs the
+real-OpenSSL gate; `zig build bogo` runs BoringSSL's adversarial one.
+Five kinds of evidence, in rough order of how much they are worth:
 
 | Oracle | What it proves |
 | --- | --- |
+| **BoGo** | BoringSSL's own hostile-peer runner, at a pinned commit, drives `bogo/shim.zig` through the corpus and checks not only that we refuse but *which alert we send*. 133 cases pass, 0 fail, 7310 are declined by the shim as out of scope, and 451 are suppressed by name with a one-line reason each. Read the split before the total: 127 of the 133 drive the **client**, and only 6 the server, because BoGo hands every server case an RSA leaf and zssl signs ECDSA only. The server half is not yet adversarially tested — [docs/BOGO.md](docs/BOGO.md) says why and what it would take. |
 | **RFC 8448** replay | The key schedule, binder chain and record layer produce the RFC's traced bytes exactly — secrets, flights and ServerHello re-encoded byte for byte. |
 | **OpenSSL interop** | Three legs. `openssl s_client` completes against our server, with openssl's own X.509 verifying our certificate. Our client completes against `openssl s_server -rev` and opens the echo it seals back — twice, once against an ECDSA certificate and once against an RSA-2048 one openssl mints on the spot, since those are different verification paths. Each client leg asserts the leaf key type it meant to exercise, so the RSA leg cannot quietly pass on an ECDSA certificate, and both drive the `chain_verifier` seam and assert it saw the chain. |
 | **`std.crypto.tls`** | A second independent implementation completes a full in-memory handshake, in both directions, and exchanges data. |
@@ -243,9 +247,9 @@ Plus directed tests for the things that only break under adversity —
 fragmented ClientHellos, tampered Finished messages, corrupted binders,
 inverted flights, sequence exhaustion.
 
-The one gap, stated plainly: none of this is *adversarial*. It all tests
-what zssl accepts. [docs/BOGO.md](docs/BOGO.md) is the plan for testing
-what it refuses, and why that is the highest-value work left.
+The gaps, stated plainly: BoGo's own count of what it never ran is
+larger than what it ran, and the eight laxities it did find are open.
+[docs/BOGO.md](docs/BOGO.md) has both, by name.
 
 ## Development
 
@@ -253,7 +257,8 @@ what it refuses, and why that is the highest-value work left.
 zig build test                          # the suite
 zig build test -Doptimize=ReleaseSafe   # the mode releases ship
 zig build interop                       # against a real openssl binary
-zig fmt --check src interop scripts build.zig build.zig.zon
+zig build bogo                          # against BoringSSL's BoGo runner
+zig fmt --check src interop bogo scripts build.zig build.zig.zon
 ```
 
 RFC 8448 vectors are generated, never transcribed:
@@ -267,7 +272,7 @@ is held to.
 
 zssl is [MIT](LICENSE) © 2026 Vsevolod Strukchinsky.
 
-Two things it carries that are not:
+Two things travel with it under other terms:
 
 - **OpenSSL** (Apache-2.0) is compiled into any binary that links zssl,
   so that binary has to carry Apache-2.0's notice and attribution. This
