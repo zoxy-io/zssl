@@ -56,7 +56,9 @@ pub const Header = struct {
 
 pub const HeaderError = error{
     UnknownContentType,
-    UnsupportedLegacyVersion,
+    /// The legacy version's major byte is not 0x03, so this is not a TLS
+    /// record at all — a framing check, not a version negotiation.
+    NotATlsRecord,
     RecordOverflow,
     EmptyFragment,
 };
@@ -68,13 +70,17 @@ pub const HeaderError = error{
 pub fn parseHeader(bytes: *const [header_bytes]u8) HeaderError!Header {
     const content_type = ContentType.fromWire(bytes[0]) orelse
         return error.UnknownContentType;
-    // legacy_record_version: 0x0303, with 0x0301 tolerated on a first
-    // ClientHello (§5.1). 0x0302 or anything else is a peer this library
-    // refuses to guess about.
-    const legacy_version = std.mem.readInt(u16, bytes[1..3], .big);
-    if (legacy_version != 0x0303 and legacy_version != 0x0301) {
-        return error.UnsupportedLegacyVersion;
-    }
+    // legacy_record_version, bytes[1..3]. §5.1 says it "MUST be ignored
+    // for all purposes", and zssl used to admit only 0x0303 and 0x0301 —
+    // stricter than the spec, about a field carrying no information, and
+    // enough to refuse real clients whose initial ClientHello says
+    // 0x0300 or 0x0302. The minor byte is now ignored outright.
+    //
+    // The major byte still has to be 0x03, which is not a version check
+    // but a framing one: 0xffff is not a TLS record, and a peer that
+    // sends one has not started a handshake we can continue. We still
+    // only ever *write* 0x0303.
+    if (bytes[1] != 0x03) return error.NotATlsRecord;
     const length = std.mem.readInt(u16, bytes[3..5], .big);
     const cap: u16 = switch (content_type) {
         .application_data => ciphertext_bytes_max,
@@ -123,7 +129,20 @@ test "parseHeader rejects what the spec forbids" {
     _ = try parseHeader(&.{ 0x17, 0x03, 0x03, 0x41, 0x00 });
     // Unknown content type, SSLv2-era version byte, empty alert.
     try std.testing.expectError(error.UnknownContentType, parseHeader(&.{ 0x18, 0x03, 0x03, 0x00, 0x10 }));
-    try std.testing.expectError(error.UnsupportedLegacyVersion, parseHeader(&.{ 0x16, 0x02, 0x00, 0x00, 0x10 }));
+    // §5.1's ignored field stays ignored across the 0x03xx range: a
+    // client whose initial ClientHello says 0x0301 or 0x03ff has told us
+    // nothing, and refusing it would break a handshake the spec expects
+    // to succeed.
+    for ([_]u8{ 0x00, 0x01, 0x03, 0x04, 0xff }) |minor| {
+        try std.testing.expectEqual(
+            @as(u16, 0x10),
+            (try parseHeader(&.{ 0x16, 0x03, minor, 0x00, 0x10 })).length,
+        );
+    }
+    // A major byte that is not 0x03 is not a TLS record; that is framing,
+    // not version negotiation, and it is the one part still enforced.
+    try std.testing.expectError(error.NotATlsRecord, parseHeader(&.{ 0x16, 0x02, 0x00, 0x00, 0x10 }));
+    try std.testing.expectError(error.NotATlsRecord, parseHeader(&.{ 0x16, 0xff, 0xff, 0x00, 0x10 }));
     try std.testing.expectError(error.EmptyFragment, parseHeader(&.{ 0x15, 0x03, 0x03, 0x00, 0x00 }));
 }
 

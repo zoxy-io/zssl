@@ -14,15 +14,23 @@ proxy needs instead of what a general TLS library carries.
   compatibility fields 1.3 froze.
 - Server-side handshake first; a client handshake exists for tests and,
   later, for upstream origination.
-- The three RFC 8446 suites. ECDSA P-256/P-384 **signing** only — RSA is
-  excluded by the embedder's policy (a ~1–2 ms RSA sign is the number
-  that once justified a worker pool; ECDSA's ~100–400 µs is why there
-  isn't one). That argument is about signing cost, which is a cost we
-  pay when *we* hold the key; it does not reach **verification**, where
-  the peer chose the algorithm. So `ClientHandshake` accepts RSA-PSS
-  leaves: an originating client meets whatever its upstreams present,
-  and most of the public web presents RSA. rsa_pkcs1_* stays out —
-  §4.4.3 forbids it in CertificateVerify.
+- The three RFC 8446 suites. ECDSA P-256/P-384 and RSA-PSS **signing**;
+  RSA-PSS, ECDSA P-256/P-384 **verification**. The latency argument that
+  once kept RSA out entirely still stands and is still the deployment
+  advice — a ~1–2 ms RSA sign is the number that once justified a worker
+  pool, and ECDSA's ~100–400 µs is why there isn't one — but it is
+  advice about which key an embedder *configures*, not a reason the
+  library should be unable to present a key the embedder already owns.
+  BoGo is what settled it: every server case it runs is handed an RSA
+  leaf unless the case says otherwise, so an ECDSA-only signer left the
+  entire server half adversarially untested (docs/BOGO.md). RSA keys are
+  bounded at load, 2048..4096 bits, and sign PSS with a digest-length
+  salt under whichever of sha256/384/512 the client offered — rsa_pkcs1_*
+  stays out on both sides, because §4.4.3 forbids it in CertificateVerify.
+  Deterministic nonces and RSA are mutually exclusive and refused
+  together at load: PSS draws a fresh salt per signature, so the
+  seeded-replay property cannot survive an RSA key and is not quietly
+  dropped.
 - x25519 key exchange; PSK resumption with server-side NewSessionTicket
   issuance; ALPN and SNI reads.
 - kTLS key export (§4).
@@ -96,7 +104,13 @@ the stream (slice 4).
 Framing caps are enforced at header parse (`record.parseHeader`), per
 content type: §5.1's 2^14 for plaintext records, §5.2's 2^14+256 for
 protected ones, §5.4's 2^14+1 for the decrypted inner plaintext. A
-record the spec forbids never reaches a buffer. This is a direct lesson
+record the spec forbids never reaches a buffer.
+
+What is *not* enforced there is `legacy_record_version`'s minor byte:
+§5.1 calls the field deprecated and says it "MUST be ignored for all
+purposes", and enforcing it refused real clients whose initial
+ClientHello says 0x0301 (BoGo finding 4). The major byte is still
+checked, as framing rather than version — `0xffff` is not a TLS record. This is a direct lesson
 from the ztls defect queue, where the record layer admitted oversized
 plaintext and the embedder compensated above the API.
 

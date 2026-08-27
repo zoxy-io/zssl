@@ -77,9 +77,10 @@ test "loads the fixture pair and refuses a keyless chain" {
     var credentials = try load(cert_pem, key_pem, &storage, true);
     defer credentials.deinit();
     try std.testing.expectEqual(@as(u8, 1), credentials.certificate_count);
-    try std.testing.expectEqual(
-        backend.SignatureScheme.ecdsa_secp256r1_sha256,
-        credentials.signer.scheme,
+    try std.testing.expectEqualSlices(
+        backend.SignatureScheme,
+        &.{.ecdsa_secp256r1_sha256},
+        credentials.signer.supported(),
     );
     try std.testing.expectEqual(@as(u8, 0x30), credentials.chain()[0][0]);
 

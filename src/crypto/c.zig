@@ -12,4 +12,5 @@ pub const c = @cImport({
     @cInclude("openssl/evp.h");
     @cInclude("openssl/params.h");
     @cInclude("openssl/pem.h");
+    @cInclude("openssl/rsa.h");
 });

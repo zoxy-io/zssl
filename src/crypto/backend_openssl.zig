@@ -204,35 +204,90 @@ pub fn x25519Public(
 pub const SignatureScheme = enum(u16) {
     ecdsa_secp256r1_sha256 = 0x0403,
     ecdsa_secp384r1_sha384 = 0x0503,
+    /// §4.4.3 forbids rsa_pkcs1_* in CertificateVerify, so an RSA leaf
+    /// signs PSS or not at all. All three digests, because the choice is
+    /// the *peer's*: a client that offers only rsa_pss_rsae_sha384 is a
+    /// client we can still answer, and refusing it would be a handshake
+    /// failure over a digest we hold.
+    rsa_pss_rsae_sha256 = 0x0804,
+    rsa_pss_rsae_sha384 = 0x0805,
+    rsa_pss_rsae_sha512 = 0x0806,
 
     fn digest(scheme: SignatureScheme) *const c.EVP_MD {
         return switch (scheme) {
-            .ecdsa_secp256r1_sha256 => c.EVP_sha256(),
-            .ecdsa_secp384r1_sha384 => c.EVP_sha384(),
+            .ecdsa_secp256r1_sha256, .rsa_pss_rsae_sha256 => c.EVP_sha256(),
+            .ecdsa_secp384r1_sha384, .rsa_pss_rsae_sha384 => c.EVP_sha384(),
+            .rsa_pss_rsae_sha512 => c.EVP_sha512(),
         } orelse unreachable; // Statically-linked digests always exist.
+    }
+
+    fn isRsaPss(scheme: SignatureScheme) bool {
+        return switch (scheme) {
+            .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => true,
+            .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384 => false,
+        };
     }
 };
 
-/// A DER ECDSA-Sig-Value is at most 72 bytes for P-256 and 104 for P-384;
-/// 112 leaves headroom without inviting nonsense.
-pub const signature_bytes_max: u16 = 112;
+/// The most schemes one key admits: an RSA modulus signs PSS under any of
+/// three digests, an EC key under exactly the one its curve names.
+pub const schemes_max: u8 = 3;
 
-/// An ECDSA signing key held as a libcrypto `EVP_PKEY`. Lives from
-/// credential load to shutdown; each `sign` call creates and frees one
-/// digest context through the hooked allocator — handshake-time cost,
-/// never per-record.
+/// A DER ECDSA-Sig-Value is at most 72 bytes for P-256 and 104 for P-384;
+/// an RSA-PSS signature is exactly the modulus, which `Signer.fromPem`
+/// bounds at 4096 bits. The larger of the two is the buffer everything
+/// downstream sizes against.
+pub const signature_bytes_max: u16 = 512;
+
+/// The RSA moduli we will sign with. The floor is what PSS-SHA256 with a
+/// digest-length salt needs before it is worth anything and what the
+/// public web has used for a decade; the ceiling is what
+/// `signature_bytes_max` reserves, refused at load rather than discovered
+/// mid-flight.
+pub const rsa_bits_min: u32 = 2048;
+pub const rsa_bits_max: u32 = 4096;
+
+/// A signing key held as a libcrypto `EVP_PKEY` — ECDSA P-256/P-384, or
+/// RSA under PSS. Lives from credential load to shutdown; each `sign`
+/// call creates and frees one digest context through the hooked
+/// allocator — handshake-time cost, never per-record.
+/// §4.4.3's PSS parameters, spelled out rather than left to libcrypto's
+/// default: an RSA `EVP_PKEY` signs PKCS#1 v1.5 unless told otherwise,
+/// and v1.5 is the one padding TLS 1.3 forbids in CertificateVerify. The
+/// salt is the digest's own length and MGF1 uses the same digest, which
+/// is what §4.4.3 requires and what a peer will check.
+fn configureRsaPss(scheme: SignatureScheme, pkey_ctx: ?*c.EVP_PKEY_CTX) SignError!void {
+    if (!scheme.isRsaPss()) return;
+    const ctx = pkey_ctx orelse return error.LibcryptoFailed;
+    if (c.EVP_PKEY_CTX_set_rsa_padding(ctx, c.RSA_PKCS1_PSS_PADDING) <= 0) {
+        return error.LibcryptoFailed;
+    }
+    if (c.EVP_PKEY_CTX_set_rsa_pss_saltlen(ctx, c.RSA_PSS_SALTLEN_DIGEST) <= 0) {
+        return error.LibcryptoFailed;
+    }
+    if (c.EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, scheme.digest()) <= 0) {
+        return error.LibcryptoFailed;
+    }
+}
+
 pub const Signer = struct {
     pkey: *c.EVP_PKEY,
-    scheme: SignatureScheme,
+    /// Every scheme this key can sign under, in our preference order.
+    /// The peer picks from it: §4.4.2 requires the CertificateVerify to
+    /// name a scheme the client offered, and an RSA key admits three.
+    schemes: [schemes_max]SignatureScheme,
+    scheme_count: u8,
     /// Opt-in RFC 6979 nonces make the signature — and through DER
     /// integer trimming, the flight length — a pure function of key and
     /// transcript, which is what seeded-simulation replay needs. Off in
     /// production: hedged random nonces are the conservative default.
     deterministic_nonces: bool,
 
-    /// Load a PEM private key and classify it. Anything but EC P-256 or
-    /// P-384 is refused here, at load, where the operator can read the
-    /// error.
+    /// Load a PEM private key and classify it. Everything outside the
+    /// policy — a curve we do not sign on, an RSA modulus outside
+    /// `rsa_bits_min`..`rsa_bits_max` — is refused here, at load, where
+    /// the operator can read the error rather than meeting it mid-flight
+    /// with a client already waiting on a flight.
     pub fn fromPem(key_pem: []const u8, deterministic_nonces: bool) SignError!Signer {
         errdefer clearErrorQueue();
         assert(key_pem.len >= 1);
@@ -244,33 +299,75 @@ pub const Signer = struct {
             return error.UnsupportedKey;
         errdefer c.EVP_PKEY_free(pkey);
 
-        if (c.EVP_PKEY_is_a(pkey, "EC") != 1) return error.UnsupportedKey;
         const bits = c.EVP_PKEY_get_bits(pkey);
-        const scheme: SignatureScheme = switch (bits) {
-            256 => .ecdsa_secp256r1_sha256,
-            384 => .ecdsa_secp384r1_sha384,
-            else => return error.UnsupportedKey,
+        var schemes: [schemes_max]SignatureScheme = undefined;
+        var count: u8 = 0;
+        if (c.EVP_PKEY_is_a(pkey, "EC") == 1) {
+            schemes[0] = switch (bits) {
+                256 => .ecdsa_secp256r1_sha256,
+                384 => .ecdsa_secp384r1_sha384,
+                else => return error.UnsupportedKey,
+            };
+            count = 1;
+        } else if (c.EVP_PKEY_is_a(pkey, "RSA") == 1) {
+            if (bits < rsa_bits_min or bits > rsa_bits_max) return error.UnsupportedKey;
+            // PSS draws a fresh salt per signature, so a signature over
+            // the same transcript is never the same bytes twice. An
+            // embedder that asked for replayable flights has to be told
+            // it cannot have them with this key, not quietly given random
+            // ones — the same loudness the ECDSA path gets from
+            // `requireDeterministicNonce`.
+            if (deterministic_nonces) return error.DeterministicNonceUnsupported;
+            schemes[0] = .rsa_pss_rsae_sha256;
+            schemes[1] = .rsa_pss_rsae_sha384;
+            schemes[2] = .rsa_pss_rsae_sha512;
+            count = 3;
+        } else return error.UnsupportedKey;
+        assert(count >= 1);
+        assert(count <= schemes_max);
+        return .{
+            .pkey = pkey,
+            .schemes = schemes,
+            .scheme_count = count,
+            .deterministic_nonces = deterministic_nonces,
         };
-        return .{ .pkey = pkey, .scheme = scheme, .deterministic_nonces = deterministic_nonces };
     }
 
     pub fn deinit(self: *Signer) void {
+        assert(self.scheme_count >= 1);
         c.EVP_PKEY_free(self.pkey);
         self.* = undefined;
     }
 
+    /// What this key can sign under, in our preference order — the list
+    /// a server intersects with the client's signature_algorithms.
+    pub fn supported(self: *const Signer) []const SignatureScheme {
+        assert(self.scheme_count >= 1);
+        assert(self.scheme_count <= schemes_max);
+        return self.schemes[0..self.scheme_count];
+    }
+
     /// Sign `content` (the full CertificateVerify content structure — the
     /// digest happens inside). Returns the DER signature written into `out`.
-    pub fn sign(self: *const Signer, content: []const u8, out: []u8) SignError![]const u8 {
+    pub fn sign(
+        self: *const Signer,
+        scheme: SignatureScheme,
+        content: []const u8,
+        out: []u8,
+    ) SignError![]const u8 {
         errdefer clearErrorQueue();
         assert(content.len >= 1);
         assert(out.len >= signature_bytes_max);
+        // The caller chose from `supported`; anything else would sign
+        // under a digest this key does not admit.
+        assert(std.mem.indexOfScalar(SignatureScheme, self.supported(), scheme) != null);
         const ctx = c.EVP_MD_CTX_new() orelse return error.LibcryptoFailed;
         defer c.EVP_MD_CTX_free(ctx);
 
         var pkey_ctx: ?*c.EVP_PKEY_CTX = null;
-        if (c.EVP_DigestSignInit(ctx, &pkey_ctx, self.scheme.digest(), null, self.pkey) != 1)
+        if (c.EVP_DigestSignInit(ctx, &pkey_ctx, scheme.digest(), null, self.pkey) != 1)
             return error.LibcryptoFailed;
+        try configureRsaPss(scheme, pkey_ctx);
         if (self.deterministic_nonces) try requireDeterministicNonce(pkey_ctx);
         if (c.EVP_DigestSignUpdate(ctx, content.ptr, content.len) != 1) return error.LibcryptoFailed;
 
@@ -287,15 +384,22 @@ pub const Signer = struct {
     /// Verify a DER signature over `content` against this key's public
     /// half. Test-side tooling: the independent verification paths are
     /// `std.crypto` in the test client and real peers in interop.
-    pub fn verify(self: *const Signer, content: []const u8, signature: []const u8) SignError!void {
+    pub fn verify(
+        self: *const Signer,
+        scheme: SignatureScheme,
+        content: []const u8,
+        signature: []const u8,
+    ) SignError!void {
         errdefer clearErrorQueue();
         assert(content.len >= 1);
         assert(signature.len >= 8);
+        assert(std.mem.indexOfScalar(SignatureScheme, self.supported(), scheme) != null);
         const ctx = c.EVP_MD_CTX_new() orelse return error.LibcryptoFailed;
         defer c.EVP_MD_CTX_free(ctx);
         var pkey_ctx: ?*c.EVP_PKEY_CTX = null;
-        if (c.EVP_DigestVerifyInit(ctx, &pkey_ctx, self.scheme.digest(), null, self.pkey) != 1)
+        if (c.EVP_DigestVerifyInit(ctx, &pkey_ctx, scheme.digest(), null, self.pkey) != 1)
             return error.LibcryptoFailed;
+        try configureRsaPss(scheme, pkey_ctx);
         if (c.EVP_DigestVerifyUpdate(ctx, content.ptr, content.len) != 1) return error.LibcryptoFailed;
         if (c.EVP_DigestVerifyFinal(ctx, signature.ptr, signature.len) != 1)
             return error.SignatureInvalid;
@@ -374,31 +478,68 @@ test "signer: classification, round-trip, and RFC 6979 determinism" {
 
     var deterministic = try Signer.fromPem(key_pem, true);
     defer deterministic.deinit();
-    try std.testing.expectEqual(SignatureScheme.ecdsa_secp256r1_sha256, deterministic.scheme);
+    const p256 = SignatureScheme.ecdsa_secp256r1_sha256;
+    try std.testing.expectEqualSlices(
+        SignatureScheme,
+        &.{p256},
+        deterministic.supported(),
+    );
 
     var first_buffer: [signature_bytes_max]u8 = undefined;
     var second_buffer: [signature_bytes_max]u8 = undefined;
-    const first = try deterministic.sign(content, &first_buffer);
-    const second = try deterministic.sign(content, &second_buffer);
+    const first = try deterministic.sign(p256, content, &first_buffer);
+    const second = try deterministic.sign(p256, content, &second_buffer);
     // RFC 6979: same key, same content — the same signature, bit for bit.
     try std.testing.expectEqualSlices(u8, first, second);
-    try deterministic.verify(content, first);
+    try deterministic.verify(p256, content, first);
 
     // Negative space: a tampered signature and tampered content both fail.
     var tampered_buffer: [signature_bytes_max]u8 = undefined;
     @memcpy(tampered_buffer[0..first.len], first);
     tampered_buffer[first.len - 1] ^= 1;
-    try std.testing.expectError(error.SignatureInvalid, deterministic.verify(content, tampered_buffer[0..first.len]));
-    try std.testing.expectError(error.SignatureInvalid, deterministic.verify("TLS 1.3 test content, signed 0nce", first));
+    try std.testing.expectError(error.SignatureInvalid, deterministic.verify(p256, content, tampered_buffer[0..first.len]));
+    try std.testing.expectError(error.SignatureInvalid, deterministic.verify(p256, "TLS 1.3 test content, signed 0nce", first));
 
     // Hedged (default) nonces: two signatures over the same content differ.
     var hedged = try Signer.fromPem(key_pem, false);
     defer hedged.deinit();
-    const third = try hedged.sign(content, &first_buffer);
-    const fourth = try hedged.sign(content, &second_buffer);
+    const third = try hedged.sign(p256, content, &first_buffer);
+    const fourth = try hedged.sign(p256, content, &second_buffer);
     try std.testing.expect(!std.mem.eql(u8, third, fourth));
-    try hedged.verify(content, third);
-    try hedged.verify(content, fourth);
+    try hedged.verify(p256, content, third);
+    try hedged.verify(p256, content, fourth);
+}
+
+test "an RSA key offers all three PSS digests and signs under each" {
+    const key_pem = @embedFile("../testdata/rsa2048-key.pem");
+    const content = "TLS 1.3 CertificateVerify content, PSS";
+
+    var signer = try Signer.fromPem(key_pem, false);
+    defer signer.deinit();
+    // The digest is the peer's choice among these, never ours alone.
+    try std.testing.expectEqualSlices(
+        SignatureScheme,
+        &.{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 },
+        signer.supported(),
+    );
+
+    var buffer: [signature_bytes_max]u8 = undefined;
+    for (signer.supported()) |scheme| {
+        const signature = try signer.sign(scheme, content, &buffer);
+        // PSS emits exactly the modulus, and a v1.5 signature would too —
+        // what separates them is that verification is configured for PSS
+        // on both sides, so a v1.5 signature would not round-trip here.
+        try std.testing.expectEqual(@as(usize, 256), signature.len);
+        try signer.verify(scheme, content, signature);
+    }
+
+    // Negative space: a fresh salt per signature means PSS is never
+    // reproducible, which is why deterministic nonces are refused at load.
+    var first: [signature_bytes_max]u8 = undefined;
+    var second: [signature_bytes_max]u8 = undefined;
+    const a = try signer.sign(.rsa_pss_rsae_sha256, content, &first);
+    const b = try signer.sign(.rsa_pss_rsae_sha256, content, &second);
+    try std.testing.expect(!std.mem.eql(u8, a, b));
 }
 
 test "signer refuses what policy excludes" {

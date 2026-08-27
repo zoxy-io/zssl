@@ -4,8 +4,8 @@ A sans-I/O TLS 1.3 library in Zig, over libcrypto primitives.
 
 zssl implements the protocol — records, the key schedule, both handshake
 state machines, resumption, KeyUpdate — in auditable Zig, and calls
-libcrypto only for the constant-time primitives (AEAD, X25519, ECDSA
-signing); checking a *peer's* signature is `std.crypto`'s. It owns no
+libcrypto only for the constant-time primitives (AEAD, X25519, ECDSA and
+RSA-PSS signing); checking a *peer's* signature is `std.crypto`'s. It owns no
 sockets, no threads, and no memory: you feed it whole TLS records and
 transmit whatever it hands back.
 
@@ -24,11 +24,10 @@ know about.
 
 **Status: prototype.** It is exercised hard (see [Testing](#testing)),
 interoperates with OpenSSL and `std.crypto.tls` in both directions, and
-its **client** half now runs under BoringSSL's adversarial BoGo runner —
-which found three bugs on its first pass and left eight open gaps, all
-recorded in [docs/BOGO.md](docs/BOGO.md). The server half is not yet
-covered there, and none of it has had an external audit. Don't put it in
-front of anything you care about yet.
+both halves now run under BoringSSL's adversarial BoGo runner — which
+found six bugs and left twelve open gaps, all recorded in
+[docs/BOGO.md](docs/BOGO.md). It has had no external audit. Don't put it
+in front of anything you care about yet.
 
 ## Why
 
@@ -214,13 +213,21 @@ refused, not downgraded.
 ## Scope
 
 **In:** TLS 1.3 (RFC 8446), the three standard cipher suites, x25519,
-ECDSA P-256/P-384 signing, RSA-PSS *verification* on the client side,
-SNI, ALPN, HelloRetryRequest (the server issues it; the client refuses it
+ECDSA P-256/P-384 and RSA-PSS signing and verification, SNI, ALPN,
+HelloRetryRequest (the server issues it; the client refuses it
 structurally, holding keys for one group), PSK resumption with
 server-side tickets, KeyUpdate, and kTLS key export.
 
+ECDSA is still the key to *deploy* — an RSA sign is a millisecond where
+ECDSA is a few hundred microseconds, and that gap is why zssl needs no
+worker pool. RSA is supported because a library should be able to
+present a key its embedder already owns, not because it is the one to
+choose. RSA keys are bounded at 2048..4096 bits and refused at load
+outside it.
+
 **Out, permanently:** TLS 1.2 and earlier, renegotiation, compression,
-RSA and DSA key exchange. A caller that needs these wants a different
+RSA and DSA *key exchange*, rsa_pkcs1_* signatures (§4.4.3 forbids them
+in CertificateVerify). A caller that needs these wants a different
 library.
 
 **Out, for now:** 0-RTT (a replay-analysis decision, not a convenience),
@@ -237,7 +244,7 @@ Five kinds of evidence, in rough order of how much they are worth:
 
 | Oracle | What it proves |
 | --- | --- |
-| **BoGo** | BoringSSL's own hostile-peer runner, at a pinned commit, drives `bogo/shim.zig` through the corpus and checks not only that we refuse but *which alert we send*. 133 cases pass, 0 fail, 7310 are declined by the shim as out of scope, and 451 are suppressed by name with a one-line reason each. Read the split before the total: 127 of the 133 drive the **client**, and only 6 the server, because BoGo hands every server case an RSA leaf and zssl signs ECDSA only. The server half is not yet adversarially tested — [docs/BOGO.md](docs/BOGO.md) says why and what it would take. |
+| **BoGo** | BoringSSL's own hostile-peer runner, at a pinned commit, drives `bogo/shim.zig` through the corpus and checks not only that we refuse but *which alert we send*. 221 cases pass (121 client, 100 server), 0 fail, 6965 are declined by the shim as out of scope, and 708 are suppressed by name with a one-line reason each. A floor on the passing count is what stops a suppression from being quiet. |
 | **RFC 8448** replay | The key schedule, binder chain and record layer produce the RFC's traced bytes exactly — secrets, flights and ServerHello re-encoded byte for byte. |
 | **OpenSSL interop** | Three legs. `openssl s_client` completes against our server, with openssl's own X.509 verifying our certificate. Our client completes against `openssl s_server -rev` and opens the echo it seals back — twice, once against an ECDSA certificate and once against an RSA-2048 one openssl mints on the spot, since those are different verification paths. Each client leg asserts the leaf key type it meant to exercise, so the RSA leg cannot quietly pass on an ECDSA certificate, and both drive the `chain_verifier` seam and assert it saw the chain. |
 | **`std.crypto.tls`** | A second independent implementation completes a full in-memory handshake, in both directions, and exchanges data. |
@@ -247,9 +254,10 @@ Plus directed tests for the things that only break under adversity —
 fragmented ClientHellos, tampered Finished messages, corrupted binders,
 inverted flights, sequence exhaustion.
 
-The gaps, stated plainly: BoGo's own count of what it never ran is
-larger than what it ran, and the eight laxities it did find are open.
-[docs/BOGO.md](docs/BOGO.md) has both, by name.
+The gaps, stated plainly: BoGo's own count of what it never ran is far
+larger than what it ran — 6965 cases against 221 — and the twelve
+laxities it did find are still open. [docs/BOGO.md](docs/BOGO.md) has
+both, by name.
 
 ## Development
 

@@ -20,7 +20,6 @@ pub const Error = error{
     TrailingBytes,
     MalformedMessage,
     MalformedExtension,
-    UnsupportedLegacyVersion,
     IllegalCompression,
     SuiteOverflow,
     ExtensionOverflow,
@@ -141,10 +140,13 @@ pub fn parse(message: []const u8) Error!ClientHello {
 
 fn parseBody(body: []const u8) Error!ClientHello {
     var cursor = Cursor.init(body);
-    // legacy_version is frozen at 0x0303 in TLS 1.3 (§4.1.2); the real
-    // version negotiation happens in supported_versions.
-    const legacy_version = try cursor.takeU16();
-    if (legacy_version != 0x0303) return error.UnsupportedLegacyVersion;
+    // legacy_version is read and dropped. §4.1.2 freezes it at 0x0303,
+    // but §4.2.1 is the rule that binds a *reader*: "servers MUST ignore
+    // the ClientHello.legacy_version value and MUST use only the
+    // 'supported_versions' extension to determine client preferences".
+    // zssl used to refuse anything else, which turned a field the spec
+    // says to ignore into a handshake failure.
+    _ = try cursor.takeU16();
 
     const random = (try cursor.takeSlice(32))[0..32];
     const session_id_bytes = try cursor.takeByte();

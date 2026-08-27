@@ -31,6 +31,10 @@ const CipherSuite = cipher_suite.CipherSuite;
 
 state: State,
 config: Config,
+/// The scheme the CertificateVerify will carry, fixed at negotiation:
+/// the first of our key's schemes the client offered. Meaningless on a
+/// resumed handshake, which signs nothing.
+signature_scheme: backend.SignatureScheme,
 assembler: handshake.Assembler,
 ladder: ?Ladder,
 /// Compatibility ChangeCipherSpec records seen; tolerated, but bounded.
@@ -134,6 +138,7 @@ pub fn init(config: *const Config) ServerHandshake {
     return .{
         .state = .awaiting_client_hello,
         .config = config.*,
+        .signature_scheme = config.credentials.signer.supported()[0],
         .assembler = handshake.Assembler.init(config.reassembly),
         .ladder = null,
         .ccs_seen = 0,
@@ -214,8 +219,11 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
     if (selected_psk == null) {
         // A full handshake signs a CertificateVerify; a resumed one
         // authenticates by PSK and needs no common signature scheme.
-        const scheme = self.config.credentials.signer.scheme;
-        if (!hello.offersScheme(@intFromEnum(scheme))) return error.HandshakeFailure;
+        // §4.4.2: the scheme we sign under must be one the client offered,
+        // and an RSA key admits three digests — so this is an
+        // intersection, not an equality.
+        self.signature_scheme = selectScheme(&hello, self.config.credentials) orelse
+            return error.HandshakeFailure;
     }
     self.captureSessionEcho(&hello);
 
@@ -305,6 +313,20 @@ fn binderMatches(suite: CipherSuite, psk: []const u8, truncated: []const u8, bin
 
 /// Our preference order: AES-128-GCM leads (hardware-everywhere), then
 /// ChaCha20 ahead of AES-256 — the §B.4 trio, no more.
+/// §4.4.2's intersection: our key's schemes against the client's offer,
+/// in our preference order so the choice is ours among what it allows.
+fn selectScheme(
+    hello: *const client_hello.ClientHello,
+    credentials: *const Credentials,
+) ?backend.SignatureScheme {
+    const supported = credentials.signer.supported();
+    assert(supported.len >= 1);
+    for (supported) |scheme| {
+        if (hello.offersScheme(@intFromEnum(scheme))) return scheme;
+    }
+    return null;
+}
+
 fn negotiateSuite(hello: *const client_hello.ClientHello) ?CipherSuite {
     const preference = [_]CipherSuite{
         .aes_128_gcm_sha256,
@@ -424,10 +446,14 @@ fn buildFlightPlaintext(
         var content_buffer: [server_messages.certificate_verify_content_bytes_max]u8 = undefined;
         const to_sign = server_messages.certificateVerifyContent(.server, &arm.transcriptHash(), &content_buffer);
         var signature_buffer: [backend.signature_bytes_max]u8 = undefined;
-        const signature = try self.config.credentials.signer.sign(to_sign, &signature_buffer);
+        const signature = try self.config.credentials.signer.sign(
+            self.signature_scheme,
+            to_sign,
+            &signature_buffer,
+        );
         const verify_message = server_messages.certificateVerify(
             flight[builder.index..],
-            @intFromEnum(self.config.credentials.signer.scheme),
+            @intFromEnum(self.signature_scheme),
             signature,
         );
         builder.index += verify_message.len;

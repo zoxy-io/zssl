@@ -72,17 +72,28 @@ const Harness = struct {
         client_alpn: []const []const u8 = &.{"http/1.1"},
         certificate_policy: ClientHandshake.CertificatePolicy = .leaf_signature,
         chain_verifier: ?ClientHandshake.ChainVerifier = null,
+        /// The leaf the server presents. RSA draws a fresh PSS salt per
+        /// signature, so it cannot run with deterministic nonces.
+        leaf: enum { ecdsa_p256, rsa_2048 } = .ecdsa_p256,
     };
 
     fn init(harness: *Harness, options: Options) !void {
         const store = options.store;
         const resume_session = options.resume_session;
-        harness.credentials = try Credentials.load(
-            @embedFile("testdata/cert.pem"),
-            @embedFile("testdata/key.pem"),
-            &harness.chain_storage,
-            true,
-        );
+        harness.credentials = switch (options.leaf) {
+            .ecdsa_p256 => try Credentials.load(
+                @embedFile("testdata/cert.pem"),
+                @embedFile("testdata/key.pem"),
+                &harness.chain_storage,
+                true,
+            ),
+            .rsa_2048 => try Credentials.load(
+                @embedFile("testdata/rsa2048-cert.pem"),
+                @embedFile("testdata/rsa2048-key.pem"),
+                &harness.chain_storage,
+                false,
+            ),
+        };
         harness.server = ServerHandshake.init(&.{
             .credentials = &harness.credentials,
             .server_random = .{0x6d} ** 32,
@@ -637,4 +648,51 @@ test "sendAlert mid-handshake leads with D.4's dummy ChangeCipherSpec" {
 fn contentTypeOf(wire_record: []const u8) !record.ContentType {
     const header = try record.parseHeader(wire_record[0..record.header_bytes]);
     return header.content_type;
+}
+
+test "an RSA leaf signs the server's CertificateVerify and our client accepts it" {
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{ .leaf = .rsa_2048 });
+    defer harness.deinit();
+
+    // §4.4.3 admits only rsa_pss_rsae_* for an RSA leaf: PKCS#1 v1.5 is
+    // what libcrypto would sign with by default and what 1.3 forbids, so
+    // the scheme on the wire is the assertion that matters here.
+    try testing.expectEqualSlices(
+        backend.SignatureScheme,
+        &.{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 },
+        harness.credentials.signer.supported(),
+    );
+    try harness.connect(&buffers);
+    try testing.expectEqual(ClientHandshake.State.connected, harness.client.state);
+    // The client verified through `std.crypto`'s RSA-PSS, not libcrypto's
+    // — the same no-shared-code split the ECDSA path draws.
+    try testing.expect(harness.client.certificate_verified);
+
+    const ping = try harness.client.sendApplicationData("rsa", &buffers.client_out);
+    const event = try harness.server.handleRecord(ping, &buffers.server_out);
+    try testing.expectEqualSlices(u8, "rsa", event.application_data);
+}
+
+test "the signing policy is a load-time refusal, not a mid-flight surprise" {
+    var storage: [Credentials.chain_bytes_max]u8 = undefined;
+    const rsa_cert = @embedFile("testdata/rsa2048-cert.pem");
+    const rsa_key = @embedFile("testdata/rsa2048-key.pem");
+
+    // Deterministic nonces and PSS cannot both be had: the salt is fresh
+    // per signature by §4.4.3's own rule. An embedder that asked for
+    // replayable flights is told so rather than quietly given random ones.
+    try testing.expectError(
+        error.DeterministicNonceUnsupported,
+        Credentials.load(rsa_cert, rsa_key, &storage, true),
+    );
+
+    // A modulus below `rsa_bits_min` never reaches the state machine: a
+    // 1024-bit key is refused at load, where the operator can read it,
+    // rather than mid-flight with a client already waiting.
+    try testing.expectError(
+        error.UnsupportedKey,
+        Credentials.load(rsa_cert, @embedFile("testdata/rsa1024-key.pem"), &storage, false),
+    );
 }

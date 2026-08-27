@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 133 passed, 0 failed, 7310 declined by the shim (89), floor 133
+bogo: 221 passed, 0 failed, 6965 declined by the shim (89), floor 221
 bogo: PASS
 ```
 
@@ -41,16 +41,16 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**133 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. 127 of them
-drive `ClientHandshake` and 6 drive `ServerHandshake`; see the caveat
-below, because that split is the most important fact on this page.
+**221 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. 121 drive
+`ClientHandshake` and 100 drive `ServerHandshake`. The server number was
+6 until RSA signing landed; see below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
 either gets fixed or gets an entry in `DisabledTests` with a one-line
 reason. There are no silent skips.
 
-**7310 declined** — 93% of the corpus. The shim exited 89, PORTING.md's
+**6965 declined** — 88% of the corpus. The shim exited 89, PORTING.md's
 "unimplemented", and the runner counted the case without running it.
 That number is large enough to be the first thing anyone asks about, so
 here is what it is made of. Counting each case by the *first* thing the
@@ -59,83 +59,44 @@ shim declined:
 | Cases | Declined because |
 | ---: | --- |
 | 2676 | DTLS or QUIC — no datagram record layer, and none planned. |
-| 357 | The case hands our server an RSA signing key. See the caveat below. |
 | 409 | `-new-x509-credential` — multiple credentials with selection between them. |
+| 378 | `-fips-202205`, `-cnsa1-202603`, `-cnsa2-202603`, `-wpa-202304` — compliance policies. |
+| 324 | `-verify-fail` / `-expect-verify-result` — X.509 validation, the embedder's by design. |
+| 281 | `-enable-ocsp-stapling` / `-ocsp-response`. |
+| 250 | `-signing-prefs` / `-expect-peer-signature-algorithm`. |
 | 248 | `-new-rpk-credential` — raw public keys. |
 | 208 | A group that is not x25519. |
 | 182 | `-accepted-peer-cert-types`. |
 | 167 | `-export-keying-material` — RFC 5705 exporters, which zssl has no API for. |
-| 324 | `-verify-fail` / `-expect-verify-result` — X.509 validation, the embedder's by design. |
-| 281 | `-enable-ocsp-stapling` / `-ocsp-response`. |
-| 378 | `-fips-202205`, `-cnsa1-202603`, `-cnsa2-202603`, `-wpa-202304` — compliance policies. |
-| 250 | `-signing-prefs` / `-expect-peer-signature-algorithm`. |
-| 167 | 0-RTT (`-expect-accept-early-data`, `-expect-reject-early-data`). |
-| 123 | Channel ID. |
-| 90 | A version cap that is not 1.3. |
-| 91 | `-async` — BoringSSL's asynchronous callbacks, which a sans-I/O library has no analogue for. |
-| ~1300 | The rest of the flag surface, one flag at a time. |
+| ~1800 | The rest of the flag surface, one flag at a time. |
 
 Roughly 3400 of those — DTLS, QUIC, client certificates, 0-RTT, ECH,
 compliance policies, X.509 validation — are scope decisions written down
 in DESIGN.md §1 and will never come back. The rest is headroom: the
-largest single win available is an RFC 5705 exporter (167 cases), then
-exposing the peer's negotiated signature algorithm (128), then honouring
+largest single wins available are an RFC 5705 exporter (167 cases),
+exposing the peer's negotiated signature algorithm (128), and honouring
 `-signing-prefs` (122).
 
 Each decline names its flag on stderr, so a case that later turns into a
 failure says which flag it stumbled on rather than leaving it to
 bisection.
 
-### The caveat that matters: the server half is barely covered
+### Both halves are covered, and one of them nearly was not
 
-Of the 133 passing cases, **127 drive `ClientHandshake` and 6 drive
-`ServerHandshake`**:
+The first wiring of this gate passed 133 cases, of which **6** drove the
+server. The cause was structural rather than an oversight in the shim:
+BoGo gives every server case an RSA leaf unless the case says otherwise,
+and zssl signed ECDSA only, so 357 server cases died inside
+`Credentials.load` before a byte reached the state machine. The gate
+adversarially tested the client half and almost nothing else — the
+opposite of where a terminating proxy's risk sits.
 
-```
-CheckECDSACurve-TLS12                     ECDSACurveMismatch-Sign-TLS13
-Server-SignDefault-ECDSA_P256_SHA256-TLS13   Server-SignDefault-ECDSA_P384_SHA384-TLS13
-Server-SignDefault-ECDSA_SHA1-TLS13       ServerCipherFilter-ECDSA
-```
-
-The cause is structural, not an oversight in the shim: BoGo gives every
-server case an RSA leaf unless the case explicitly says otherwise, and
-zssl signs ECDSA only — an embedder policy about signing latency
-(DESIGN.md §1), not a gap. 357 server cases die on `Credentials.load`
-before a byte reaches the state machine, and the runner has no flag that
-says "use ECDSA by default".
-
-So read the gate for what it is: **zssl's client half is now
-adversarially tested; its server half is not.** That is the opposite of
-where zoxy's risk lies, and it is the next thing to fix. The options are
-a shim that substitutes its own ECDSA leaf when handed an RSA one — which
-buys coverage at the cost of running a configuration the case did not
-describe, and would have to be reported separately rather than folded
-into this count — or a local patch to the runner's default credential.
-Neither is done, and until one is, the server-side numbers here are six.
-
-**The floor is the anti-rot mechanism.** `bogo/run.zig` fails the build
-if fewer than `passing_floor` cases pass. `config.json` can disable a
-case, but it cannot disable one quietly: the floor falls with it and the
-gate goes red. Raise the floor whenever a fix moves the number up.
-
-## The suppression ledger
-
-451 entries in `DisabledTests`, each carrying its reason. By count:
-
-| Entries | Why |
-| ---: | --- |
-| 341 | TLS 1.0/1.1/1.2 — 1.3-only by design (DESIGN.md §1). The version is declined, and BoGo scores that decline as a failure of a 1.2 case. |
-| 35 | Client certificates — out of scope permanently. |
-| **35** | **Open gaps BoGo found.** See below. |
-| 20 | HelloRetryRequest — the client holds one group, so both shapes are refused structurally (slice 4). |
-| 14 | Outcomes that differ by design: a 1.3-only client refuses a version before §4.1.3's downgrade sentinel can matter; a resumed leg offers 1.3 alone against a 1.2-only runner; the runner asserts an initial record version of 0x0301 where §5.1 permits the 0x0303 we send. |
-| 6 | Single absent features — X.509 key usage, renegotiation, 0-RTT, Ed25519, post-quantum key exchange — named individually rather than swept up by pattern. |
-
-Everything else zssl lacks — DTLS, QUIC, ECH, PAKE, delegated
-credentials, raw public keys, ALPS, Channel ID, NPN, compressed
-certificates, RSA signing — never reaches this ledger at all: the shim
-exits 89 on the flag that asks for it, and the case is counted among the
-7310 rather than suppressed.
+RSA-PSS signing (DESIGN.md §1) closed that, and the server count went
+from 6 to 100. It is worth being precise about what the fix bought:
+every server-side finding below — both version-tolerance bugs, the PSK
+binder counting, the ClientHello parse strictness — was invisible until
+the server half could run at all. A gate that covers one half of a
+library reads exactly like a gate that covers both.
 
 ## What BoGo found on its first run
 
@@ -187,7 +148,19 @@ suppressed cases between them:
    encoding.
 8. **A handful of alert choices differ from BoringSSL's** — trailing data
    after a Certificate answers `bad_certificate` where `decode_error` is
-   the better reading, among others.
+   the better reading, among others. The largest single group at 20
+   cases, and the least interesting: we refuse, for the right reason,
+   with the wrong description.
+9. **A duplicate extension in the peer's hello is accepted** rather than
+   refused, on both sides.
+10. **A PSK offer whose binder list does not match its identity list** is
+    refused late, as a malformed extension, rather than at the count
+    §4.2.11 specifies.
+11. **A resumed session is accepted under a suite the ClientHello did not
+    offer.**
+12. **`psk_key_exchange_modes` is not consulted before issuing a
+    NewSessionTicket**, which §4.6.1 requires — the mirror, on the server
+    side, of the client bug in the fixed list above.
 
 None of these are exploitable as far as the runner can show; they are
 laxity, and laxity is what BoGo exists to find.

@@ -785,10 +785,12 @@ fn alertFor(err: anyerror) ?alert.Description {
         error.BadInnerPlaintext,
         error.UnexpectedRecordType,
         => .unexpected_message,
+        // Not a TLS record at all — the same answer BoringSSL gives an
+        // HTTP request that arrived on the TLS port.
+        error.NotATlsRecord => .protocol_version,
         // §5.2: the tag is the one thing an attacker can break at will.
         error.AuthenticationFailed => .bad_record_mac,
         error.RecordOverflow => .record_overflow,
-        error.UnsupportedLegacyVersion => .protocol_version,
         error.HandshakeFailure => .handshake_failure,
         // Legal grammar, illegal content.
         error.IllegalRetry,
