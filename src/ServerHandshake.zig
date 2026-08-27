@@ -622,6 +622,14 @@ pub fn sendNewSessionTicket(
     }
 }
 
+/// The suite this handshake negotiated. Available from the moment the
+/// ladder exists, which is the ServerHello; an embedder sealing a
+/// resumption ticket needs it to record what the PSK is bound to.
+pub fn cipherSuite(self: *const ServerHandshake) CipherSuite {
+    assert(self.ladder != null);
+    return self.ladder.?;
+}
+
 pub const Direction = session_keys.Direction;
 
 /// The kTLS hand-over: one direction's application traffic key, IV, and
