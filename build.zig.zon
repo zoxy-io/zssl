@@ -1,0 +1,27 @@
+.{
+    .name = .zssl,
+    .version = "0.0.1",
+    .fingerprint = 0x33674eab883287e6, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // libcrypto, built by Zig for the target — the same pin zoxy carries
+        // in its own build.zig.zon (see the audit prose there: OpenSSL rather
+        // than the BoringSSL family because `CRYPTO_set_mem_functions` is
+        // load-bearing for the zero-allocation budget; 3.5 is the LTS line,
+        // supported to April 2030; the fork adds pre-generated aarch64
+        // perlasm). The two pins must move together: zssl and zoxy link one
+        // libcrypto, and the profile harness would otherwise carry two.
+        .openssl = .{
+            .url = "git+https://github.com/zoxy-io/openssl?ref=openssl-3.5.7#546ec9845fa43013021609a8590e03678cc0fb20",
+            .hash = "openssl-3.5.7-TC9C3eDHfwHNGqKQk63LrMZg6g-YSvctDN8wNP1uktMX",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+        "scripts",
+        "README.md",
+    },
+}
