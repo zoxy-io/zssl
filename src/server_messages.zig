@@ -218,6 +218,17 @@ pub fn newSessionTicket(
     return builder.written();
 }
 
+/// §4.6.3. One byte of body: whether the peer is asked to rotate too.
+pub fn keyUpdate(out: []u8, request_update: bool) []const u8 {
+    assert(out.len >= handshake.header_bytes + 1);
+    var builder = wire.Builder.init(out);
+    const message = handshake.beginMessage(&builder, .key_update);
+    builder.putByte(if (request_update) 1 else 0);
+    handshake.endMessage(&builder, message);
+    assert(builder.written().len == handshake.header_bytes + 1);
+    return builder.written();
+}
+
 pub const Side = enum { server, client };
 
 pub const certificate_verify_content_bytes_max: u16 = 64 + 34 + 1 + 48;

@@ -6,10 +6,10 @@
 //! is what makes a seeded simulation's replay exact and keeps the entropy
 //! policy where it belongs, with the embedder.
 //!
-//! Slice-2 shape: full 1-RTT with optional HelloRetryRequest, ALPN, and
-//! kTLS key export at `connected`. PSK resumption is slice 3; KeyUpdate
-//! and post-handshake messages are slice 4 and are refused loudly, never
-//! mishandled quietly.
+//! Full 1-RTT with optional HelloRetryRequest, ALPN, PSK resumption
+//! (`psk_lookup` + binder verification), NewSessionTicket issuance after
+//! the client's Finished, §4.6.3 KeyUpdate in both directions, and kTLS
+//! key export current as of the latest generation.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -25,6 +25,7 @@ const ktls = @import("ktls.zig");
 const protect = @import("protect.zig");
 const record = @import("record.zig");
 const server_messages = @import("server_messages.zig");
+const session_keys = @import("session_keys.zig");
 const transcript = @import("transcript.zig");
 const CipherSuite = cipher_suite.CipherSuite;
 
@@ -117,9 +118,9 @@ pub const Error = backend.SignError || protect.Error || handshake.Assembler.Erro
     DecryptError,
     /// The peer sent a fatal alert; the connection is over.
     PeerAlert,
-    /// KeyUpdate and post-handshake messages arrive in slice 4.
-    KeyUpdateUnsupported,
-};
+    /// A KeyUpdate whose body breaks §4.6.3's one-byte grammar.
+    IllegalKeyUpdate,
+} || session_keys.Error;
 
 /// `out` for `handleRecord` must hold a whole flight or a whole decrypted
 /// record, whichever is larger — one wire record's bound covers both.
@@ -476,11 +477,15 @@ fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: [
     assert(wire_record.len > record.header_bytes);
     switch (self.ladder.?) {
         inline else => |*arm| {
-            const opened = try arm.recv.?.open(wire_record, out);
+            const opened = switch (self.state) {
+                .awaiting_finished => try arm.recv.?.open(wire_record, out),
+                .connected => try arm.session.?.recv.open(wire_record, out),
+                else => unreachable, // The guard above admits only these two.
+            };
             const plaintext = out[0..opened.plaintext_bytes];
             switch (opened.content_type) {
                 .alert => return self.handlePlaintextAlert(plaintext),
-                .handshake => return self.handleProtectedHandshake(arm, plaintext),
+                .handshake => return self.handleProtectedHandshake(arm, plaintext, out),
                 .application_data => {
                     if (self.state != .connected) return error.UnexpectedMessage;
                     return .{ .application_data = plaintext };
@@ -493,14 +498,16 @@ fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: [
 
 /// `arm` is one `LadderOf(suite)` instance, always reached through the
 /// caller's `inline else` so the type is concrete at every call site.
-fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []const u8) Error!Event {
+fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []const u8, out: []u8) Error!Event {
     assert(plaintext.len >= 1);
     try self.assembler.push(plaintext);
     const message = (try self.assembler.next()) orelse return .none;
     if (self.state == .connected) {
-        // KeyUpdate and NewSessionTicket-era traffic: slice 4's work,
-        // refused loudly today.
-        return error.KeyUpdateUnsupported;
+        // §4.6.3 is the only post-handshake message a server hears; a
+        // client has no tickets to send and no certificates to update.
+        if (message.messageType() != .key_update) return error.UnexpectedMessage;
+        if (!self.assembler.empty()) return error.UnexpectedMessage;
+        return self.handleKeyUpdate(arm, message, out);
     }
     assert(self.state == .awaiting_finished);
     if (message.messageType() != .finished) return error.UnexpectedMessage;
@@ -511,6 +518,28 @@ fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []c
     return .connected;
 }
 
+/// §4.6.3, receive side, delegated to the shared session-keys logic. The
+/// decrypted plaintext was already copied into the assembler, so `out`
+/// is free to carry any response.
+fn handleKeyUpdate(self: *ServerHandshake, arm: anytype, message: handshake.Message, out: []u8) Error!Event {
+    assert(self.state == .connected);
+    assert(arm.session != null);
+    const response = try arm.session.?.processKeyUpdate(message.body(), out);
+    if (response) |sealed| return .{ .send = sealed };
+    return .none;
+}
+
+/// §4.6.3, send side. `request_update` asks the peer to rotate too — the
+/// lever for §5.5 sequence-budget hygiene.
+pub fn sendKeyUpdate(self: *ServerHandshake, request_update: bool, out: []u8) Error![]const u8 {
+    assert(self.state == .connected);
+    assert(out.len >= record.header_bytes + handshake.header_bytes + 1 + 256);
+    errdefer self.state = .failed;
+    switch (self.ladder.?) {
+        inline else => |*arm| return arm.session.?.initiateKeyUpdate(request_update, out),
+    }
+}
+
 /// Seal application bytes for the peer. Valid only while connected. The
 /// failed-on-error guarantee covers this entry point too: a seal failure
 /// (sequence exhaustion included) retires the machine.
@@ -519,7 +548,7 @@ pub fn sendApplicationData(self: *ServerHandshake, bytes: []const u8, out: []u8)
     assert(bytes.len <= record.plaintext_bytes_max);
     errdefer self.state = .failed;
     switch (self.ladder.?) {
-        inline else => |*arm| return arm.send.?.seal(.application_data, bytes, out),
+        inline else => |*arm| return arm.session.?.send.seal(.application_data, bytes, out),
     }
 }
 
@@ -531,7 +560,7 @@ pub fn sendClose(self: *ServerHandshake, out: []u8) Error![]const u8 {
     const bytes = alert.encode(.close_notify);
     switch (self.ladder.?) {
         inline else => |*arm| {
-            const sealed = try arm.send.?.seal(.alert, &bytes, out);
+            const sealed = try arm.session.?.send.seal(.alert, &bytes, out);
             self.state = .closed;
             return sealed;
         },
@@ -589,18 +618,20 @@ pub fn sendNewSessionTicket(
         params.ticket,
     );
     switch (self.ladder.?) {
-        inline else => |*arm| return arm.send.?.seal(.handshake, message, out),
+        inline else => |*arm| return arm.session.?.send.seal(.handshake, message, out),
     }
 }
 
-pub const Direction = enum { transmit, receive };
+pub const Direction = session_keys.Direction;
 
 /// The kTLS hand-over: one direction's application traffic key, IV, and
 /// next sequence number, in kernel-ready terms (§4 of docs/DESIGN.md).
+/// Reflects the current §4.6.3 generation — export after any KeyUpdate,
+/// never before.
 pub fn exportKeyMaterial(self: *const ServerHandshake, direction: Direction) ktls.KeyMaterial {
     assert(self.state == .connected);
     switch (self.ladder.?) {
-        inline else => |*arm| return arm.exportMaterial(direction),
+        inline else => |*arm| return arm.session.?.exportMaterial(direction),
     }
 }
 
@@ -654,15 +685,19 @@ fn LadderOf(comptime suite: CipherSuite) type {
         /// Transcript hash through the server Finished: what the client's
         /// Finished MACs, and what the application secrets derive from.
         finished_hash: [hash_bytes]u8,
-        /// Application traffic keys, staged at flight end, live in the
-        /// protectors from `connected` on.
-        transmit_keys: Schedule.TrafficKeys,
-        receive_keys: Schedule.TrafficKeys,
+        /// Application traffic secrets, staged at flight end; the live
+        /// session keys are built from them at `connected`.
+        client_application_traffic: [hash_bytes]u8,
+        server_application_traffic: [hash_bytes]u8,
         /// §7.1's last derivation, available from `connected`: what every
         /// ticket's PSK descends from.
         resumption_master: [hash_bytes]u8,
+        /// Handshake-phase protectors; retired at `connected`.
         recv: ?protect.Protector,
         send: ?protect.Protector,
+        /// The connection's keys from `connected` on: protectors, §4.6.3
+        /// rotation, kTLS export.
+        session: ?session_keys.SessionKeys(suite),
 
         const Self = @This();
 
@@ -672,22 +707,24 @@ fn LadderOf(comptime suite: CipherSuite) type {
             .client_handshake_traffic = undefined,
             .server_handshake_traffic = undefined,
             .finished_hash = undefined,
-            .transmit_keys = undefined,
-            .receive_keys = undefined,
+            .client_application_traffic = undefined,
+            .server_application_traffic = undefined,
             .resumption_master = undefined,
             .recv = null,
             .send = null,
+            .session = null,
         };
 
         fn deinit(self: *Self) void {
             if (self.recv) |*protector| protector.deinit();
             if (self.send) |*protector| protector.deinit();
+            if (self.session) |*session| session.deinit();
             if (self.schedule) |*schedule| schedule.wipe();
             std.crypto.secureZero(u8, &self.client_handshake_traffic);
             std.crypto.secureZero(u8, &self.server_handshake_traffic);
+            std.crypto.secureZero(u8, &self.client_application_traffic);
+            std.crypto.secureZero(u8, &self.server_application_traffic);
             std.crypto.secureZero(u8, &self.resumption_master);
-            std.crypto.secureZero(u8, std.mem.asBytes(&self.transmit_keys));
-            std.crypto.secureZero(u8, std.mem.asBytes(&self.receive_keys));
             self.* = undefined;
         }
 
@@ -761,10 +798,8 @@ fn LadderOf(comptime suite: CipherSuite) type {
             assert(self.schedule.?.stage == .handshake);
             self.finished_hash = self.transcriptHash();
             self.schedule.?.advanceToMaster();
-            const client_ap = self.schedule.?.deriveAt(.master, "c ap traffic", &self.finished_hash);
-            const server_ap = self.schedule.?.deriveAt(.master, "s ap traffic", &self.finished_hash);
-            self.receive_keys = Schedule.trafficKeys(&client_ap);
-            self.transmit_keys = Schedule.trafficKeys(&server_ap);
+            self.client_application_traffic = self.schedule.?.deriveAt(.master, "c ap traffic", &self.finished_hash);
+            self.server_application_traffic = self.schedule.?.deriveAt(.master, "s ap traffic", &self.finished_hash);
         }
 
         fn verifyClientFinished(self: *const Self, message: handshake.Message) bool {
@@ -781,46 +816,29 @@ fn LadderOf(comptime suite: CipherSuite) type {
         }
 
         /// Client Finished verified: absorb it (the resumption master
-        /// derives from it, slice 3), retire the handshake protectors,
-        /// bring up the application ones.
-        fn startApplicationKeys(self: *Self, finished_message: handshake.Message) protect.Error!void {
+        /// derives from it), retire the handshake protectors, bring up
+        /// the session keys.
+        fn startApplicationKeys(self: *Self, finished_message: handshake.Message) session_keys.Error!void {
             assert(self.schedule != null);
             assert(self.schedule.?.stage == .master);
+            assert(self.session == null);
             self.transcript.update(finished_message.bytes);
             // §7.1: resumption_master derives from the transcript through
             // the client Finished — this is the only window it exists in.
             self.resumption_master = self.schedule.?.deriveAt(.master, "res master", &self.transcript.currentHash());
+            self.session = try session_keys.SessionKeys(suite).init(
+                &self.server_application_traffic,
+                &self.client_application_traffic,
+            );
+            // The session owns rotation from here, so these staged copies
+            // are generation-0 material with no further use — wipe them
+            // now rather than at teardown.
+            std.crypto.secureZero(u8, &self.server_application_traffic);
+            std.crypto.secureZero(u8, &self.client_application_traffic);
             self.recv.?.deinit();
             self.send.?.deinit();
             self.recv = null;
             self.send = null;
-            self.recv = try protect.Protector.init(suite, &self.receive_keys.key, &self.receive_keys.iv);
-            errdefer {
-                self.recv.?.deinit();
-                self.recv = null;
-            }
-            self.send = try protect.Protector.init(suite, &self.transmit_keys.key, &self.transmit_keys.iv);
-        }
-
-        fn exportMaterial(self: *const Self, direction: Direction) ktls.KeyMaterial {
-            const keys = switch (direction) {
-                .transmit => &self.transmit_keys,
-                .receive => &self.receive_keys,
-            };
-            const protector = switch (direction) {
-                .transmit => &self.send.?,
-                .receive => &self.recv.?,
-            };
-            var material: ktls.KeyMaterial = .{
-                .suite = suite,
-                .key = undefined,
-                .key_bytes = comptime suite.keyBytes(),
-                .static_iv = keys.iv,
-                .next_sequence = protector.sequence,
-            };
-            @memset(&material.key, 0);
-            @memcpy(material.key[0..keys.key.len], &keys.key);
-            return material;
         }
     };
 }

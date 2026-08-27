@@ -1,0 +1,376 @@
+//! Slice 4's end-to-end: the production `ClientHandshake` against the
+//! production `ServerHandshake` — both real machines, no test client.
+//! Covers the full origination path zoxy needs for upstreams: SNI, ALPN,
+//! leaf verification, tickets captured through the client's event
+//! surface, resumption, §4.6.3 KeyUpdate in both directions with the
+//! kTLS export tracking generations, and the client's structural refusal
+//! of HelloRetryRequest.
+
+const std = @import("std");
+const testing = std.testing;
+
+const ClientHandshake = @import("ClientHandshake.zig");
+const Credentials = @import("Credentials.zig");
+const ServerHandshake = @import("ServerHandshake.zig");
+const cipher_suite = @import("cipher_suite.zig");
+const record = @import("record.zig");
+const backend = @import("crypto/backend_openssl.zig");
+const key_schedule = @import("key_schedule.zig");
+const protect = @import("protect.zig");
+const server_messages = @import("server_messages.zig");
+const transcript = @import("transcript.zig");
+
+const client_x25519_private = [_]u8{0x31} ** 31 ++ [_]u8{0x07};
+const server_x25519_private = [_]u8{0x93} ** 31 ++ [_]u8{0x0e};
+
+const Buffers = struct {
+    client_out: [2 * record.wire_record_bytes_max]u8 = undefined,
+    server_out: [2 * record.wire_record_bytes_max]u8 = undefined,
+    scratch: [2 * record.wire_record_bytes_max]u8 = undefined,
+};
+
+const TicketStore = struct {
+    identity: [64]u8,
+    identity_bytes: u8,
+    psk: [cipher_suite.hash_bytes_max]u8,
+
+    fn lookup(
+        context: *anyopaque,
+        identity: []const u8,
+        obfuscated_age: u32,
+        psk_out: *[cipher_suite.hash_bytes_max]u8,
+    ) ?u8 {
+        _ = obfuscated_age;
+        const store: *TicketStore = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, store.identity[0..store.identity_bytes], identity)) return null;
+        psk_out.* = store.psk;
+        return 32;
+    }
+};
+
+const Harness = struct {
+    chain_storage: [Credentials.chain_bytes_max]u8,
+    credentials: Credentials,
+    server_reassembly: [8192]u8,
+    flight: [Credentials.chain_bytes_max + 1024]u8,
+    client_reassembly: [16384]u8,
+    server: ServerHandshake,
+    client: ClientHandshake,
+
+    fn init(
+        harness: *Harness,
+        store: ?*TicketStore,
+        resume_session: ?ClientHandshake.Resumption,
+    ) !void {
+        harness.credentials = try Credentials.load(
+            @embedFile("testdata/cert.pem"),
+            @embedFile("testdata/key.pem"),
+            &harness.chain_storage,
+            true,
+        );
+        harness.server = ServerHandshake.init(&.{
+            .credentials = &harness.credentials,
+            .server_random = .{0x6d} ** 32,
+            .x25519_private = server_x25519_private,
+            .alpn = "http/1.1",
+            .reassembly = &harness.server_reassembly,
+            .flight = &harness.flight,
+            .psk_lookup = if (store) |context| .{
+                .context = context,
+                .lookup = TicketStore.lookup,
+            } else null,
+        });
+        harness.client = ClientHandshake.init(&.{
+            .client_random = .{0x1a} ** 32,
+            .x25519_private = client_x25519_private,
+            .session_id = &(.{0x44} ** 32),
+            .server_name = "spike.zoxy.test",
+            .alpn = "http/1.1",
+            .certificate_policy = .ecdsa_leaf_signature,
+            .resume_session = resume_session,
+            .reassembly = &harness.client_reassembly,
+        });
+    }
+
+    fn deinit(harness: *Harness) void {
+        harness.client.deinit();
+        harness.server.deinit();
+        harness.credentials.deinit();
+    }
+
+    /// Drive the handshake to `connected` on both machines.
+    fn connect(harness: *Harness, buffers: *Buffers) !void {
+        const hello = harness.client.start(&buffers.client_out);
+        const flight = try harness.server.handleRecord(hello, &buffers.server_out);
+        try testing.expectEqual(std.meta.activeTag(flight), .send);
+
+        var reply_storage: [2 * record.wire_record_bytes_max]u8 = undefined;
+        var reply_bytes: usize = 0;
+        var index: usize = 0;
+        var count: u8 = 0;
+        while (index < flight.send.len) : (count += 1) {
+            try testing.expect(count < 8);
+            const one = recordAt(flight.send, index);
+            const event = try harness.client.handleRecord(one, &buffers.scratch);
+            switch (event) {
+                .none => {},
+                .connected => |bytes| {
+                    @memcpy(reply_storage[0..bytes.len], bytes);
+                    reply_bytes = bytes.len;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            index += one.len;
+        }
+        try testing.expect(reply_bytes >= 1);
+        try testing.expectEqual(ClientHandshake.State.connected, harness.client.state);
+
+        index = 0;
+        count = 0;
+        var final: ServerHandshake.Event = .none;
+        while (index < reply_bytes) : (count += 1) {
+            try testing.expect(count < 8);
+            const one = recordAt(reply_storage[0..reply_bytes], index);
+            final = try harness.server.handleRecord(one, &buffers.server_out);
+            index += one.len;
+        }
+        try testing.expectEqual(std.meta.activeTag(final), .connected);
+        try testing.expectEqual(ServerHandshake.State.connected, harness.server.state);
+    }
+};
+
+fn recordAt(bytes: []const u8, index: usize) []const u8 {
+    const length = std.mem.readInt(u16, bytes[index + 3 ..][0..2], .big);
+    return bytes[index..][0 .. record.header_bytes + length];
+}
+
+fn expectExportAgreement(server: *const ServerHandshake, client: *const ClientHandshake) !void {
+    const server_transmit = server.exportKeyMaterial(.transmit);
+    const client_receive = client.exportKeyMaterial(.receive);
+    try testing.expectEqualSlices(u8, server_transmit.key[0..server_transmit.key_bytes], client_receive.key[0..client_receive.key_bytes]);
+    try testing.expectEqualSlices(u8, &server_transmit.static_iv, &client_receive.static_iv);
+    try testing.expectEqual(server_transmit.next_sequence, client_receive.next_sequence);
+    const server_receive = server.exportKeyMaterial(.receive);
+    const client_transmit = client.exportKeyMaterial(.transmit);
+    try testing.expectEqualSlices(u8, server_receive.key[0..server_receive.key_bytes], client_transmit.key[0..client_transmit.key_bytes]);
+    try testing.expectEqual(server_receive.next_sequence, client_transmit.next_sequence);
+}
+
+test "production client ↔ server: handshake, data, ticket capture, resumption" {
+    var buffers: Buffers = .{};
+
+    // Session one, full handshake with leaf verification and ALPN.
+    var first: Harness = undefined;
+    try first.init(null, null);
+    defer first.deinit();
+    try first.connect(&buffers);
+    try testing.expect(first.client.certificate_verified);
+    try testing.expect(first.client.alpn_confirmed);
+    try testing.expect(!first.client.resumed);
+    try testing.expect(!first.server.resumed);
+
+    // Application data in both directions.
+    const ping = try first.client.sendApplicationData("ping from origin client", &buffers.client_out);
+    const ping_event = try first.server.handleRecord(ping, &buffers.server_out);
+    try testing.expectEqualSlices(u8, "ping from origin client", ping_event.application_data);
+    const pong = try first.server.sendApplicationData("pong", &buffers.server_out);
+    const pong_event = try first.client.handleRecord(pong, &buffers.scratch);
+    try testing.expectEqualSlices(u8, "pong", pong_event.application_data);
+
+    // A ticket travels server → client through the event surface; the
+    // client derives the PSK for it from its own resumption_master.
+    var store: TicketStore = undefined;
+    var psk_buffer: [cipher_suite.hash_bytes_max]u8 = undefined;
+    const server_psk = first.server.resumptionPsk(&.{0x0a}, &psk_buffer);
+    @memset(&store.psk, 0);
+    @memcpy(store.psk[0..server_psk.len], server_psk);
+    @memcpy(store.identity[0..13], "sealed-by-us!");
+    store.identity_bytes = 13;
+    const sealed = try first.server.sendNewSessionTicket(&.{
+        .lifetime_s = 3600,
+        .age_add = 0x5eed,
+        .ticket_nonce = &.{0x0a},
+        .ticket = "sealed-by-us!",
+    }, &buffers.server_out);
+    const ticket_event = try first.client.handleRecord(sealed, &buffers.scratch);
+    try testing.expectEqual(std.meta.activeTag(ticket_event), .ticket);
+    try testing.expectEqual(@as(u32, 3600), ticket_event.ticket.lifetime_s);
+    var resumption: ClientHandshake.Resumption = .{
+        .identity = "sealed-by-us!",
+        .obfuscated_age = ticket_event.ticket.age_add,
+        .psk = undefined,
+        .psk_bytes = 32,
+    };
+    var client_psk_buffer: [cipher_suite.hash_bytes_max]u8 = undefined;
+    const client_psk = first.client.resumptionPsk(ticket_event.ticket.nonce, &client_psk_buffer);
+    @memset(&resumption.psk, 0);
+    @memcpy(resumption.psk[0..client_psk.len], client_psk);
+    // Both ends derived the same PSK from their own resumption_master.
+    try testing.expectEqualSlices(u8, server_psk, client_psk);
+
+    // Clean close, server first this time.
+    const close_record = try first.server.sendClose(&buffers.server_out);
+    const close_event = try first.client.handleRecord(close_record, &buffers.scratch);
+    try testing.expectEqual(std.meta.activeTag(close_event), .closed);
+
+    // Session two: resumed on the captured ticket, no certificate leg.
+    var second: Harness = undefined;
+    try second.init(&store, resumption);
+    defer second.deinit();
+    try second.connect(&buffers);
+    try testing.expect(second.server.resumed);
+    try testing.expect(second.client.resumed);
+    try testing.expect(!second.client.certificate_verified);
+    const echo = try second.client.sendApplicationData("resumed", &buffers.client_out);
+    const echo_event = try second.server.handleRecord(echo, &buffers.server_out);
+    try testing.expectEqualSlices(u8, "resumed", echo_event.application_data);
+}
+
+test "KeyUpdate both ways: generations rotate and the kTLS export tracks them" {
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(null, null);
+    defer harness.deinit();
+    try harness.connect(&buffers);
+    try expectExportAgreement(&harness.server, &harness.client);
+    const before = harness.client.exportKeyMaterial(.transmit);
+
+    // Client-initiated, with a rotation demanded of the server too.
+    const update = try harness.client.sendKeyUpdate(true, &buffers.client_out);
+    const update_event = try harness.server.handleRecord(update, &buffers.server_out);
+    try testing.expectEqual(std.meta.activeTag(update_event), .send);
+    const ack_event = try harness.client.handleRecord(update_event.send, &buffers.scratch);
+    try testing.expectEqual(std.meta.activeTag(ack_event), .none);
+
+    // Every direction moved to generation 1 and both sides agree.
+    const after = harness.client.exportKeyMaterial(.transmit);
+    try testing.expect(!std.mem.eql(u8, before.key[0..before.key_bytes], after.key[0..after.key_bytes]));
+    try expectExportAgreement(&harness.server, &harness.client);
+
+    // Traffic still flows under the new generation, both ways.
+    const ping = try harness.client.sendApplicationData("post-update ping", &buffers.client_out);
+    const ping_event = try harness.server.handleRecord(ping, &buffers.server_out);
+    try testing.expectEqualSlices(u8, "post-update ping", ping_event.application_data);
+    const pong = try harness.server.sendApplicationData("post-update pong", &buffers.server_out);
+    const pong_event = try harness.client.handleRecord(pong, &buffers.scratch);
+    try testing.expectEqualSlices(u8, "post-update pong", pong_event.application_data);
+
+    // Server-initiated, no rotation requested back: only its transmit
+    // side and the client's receive side move.
+    const quiet_update = try harness.server.sendKeyUpdate(false, &buffers.server_out);
+    const quiet_event = try harness.client.handleRecord(quiet_update, &buffers.scratch);
+    try testing.expectEqual(std.meta.activeTag(quiet_event), .none);
+    try expectExportAgreement(&harness.server, &harness.client);
+    const again = try harness.server.sendApplicationData("gen2", &buffers.server_out);
+    const again_event = try harness.client.handleRecord(again, &buffers.scratch);
+    try testing.expectEqualSlices(u8, "gen2", again_event.application_data);
+}
+
+/// Re-derive the server→client handshake protector from public wire
+/// bytes plus the client's own private key — independently of either
+/// machine's internals, which is what lets a test forge a server flight.
+fn serverFlightProtector(
+    client_private: *const [32]u8,
+    client_hello_record: []const u8,
+    server_hello_record: []const u8,
+) !protect.Protector {
+    const Schedule = key_schedule.KeySchedule(.aes_128_gcm_sha256);
+    const server_hello = server_hello_record[record.header_bytes..];
+    // The ServerHello's key_share sits at a fixed offset for our own
+    // encoder: 4 header + 2 version + 32 random + 1 echo length + echo +
+    // 2 suite + 1 compression + 2 extensions length + 2 type + 2 length
+    // + 2 group + 2 key length.
+    const echo_bytes = server_hello[38];
+    const share_at = 39 + @as(usize, echo_bytes) + 3 + 2 + 2 + 2 + 2 + 2;
+    const server_public = server_hello[share_at..][0..32];
+    var shared: [32]u8 = undefined;
+    try backend.x25519Shared(client_private, server_public, &shared);
+
+    var script: transcript.Transcript(std.crypto.hash.sha2.Sha256) = .empty;
+    script.update(client_hello_record[record.header_bytes..]);
+    script.update(server_hello);
+    var schedule = Schedule.initEarly(null);
+    schedule.advanceToHandshake(&shared);
+    const secret = schedule.deriveAt(.handshake, "s hs traffic", &script.currentHash());
+    const keys = Schedule.trafficKeys(&secret);
+    return protect.Protector.init(.aes_128_gcm_sha256, &keys.key, &keys.iv);
+}
+
+test "a hostile server flight errors rather than panicking" {
+    // Both shapes below used to reach an assertion on attacker-shaped
+    // input: CertificateVerify with no Certificate yet, and a second
+    // Certificate overwriting the first. They must be protocol errors.
+    const shapes = [_]enum { verify_without_certificate, duplicate_certificate }{
+        .verify_without_certificate,
+        .duplicate_certificate,
+    };
+    for (shapes) |shape| {
+        var buffers: Buffers = .{};
+        var harness: Harness = undefined;
+        try harness.init(null, null);
+        defer harness.deinit();
+
+        // Drive the real handshake far enough that the client holds the
+        // server's handshake keys, stopping before the protected flight.
+        const hello = harness.client.start(&buffers.client_out);
+        const flight = try harness.server.handleRecord(hello, &buffers.server_out);
+        const server_hello_record = recordAt(flight.send, 0);
+        _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
+        try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
+
+        // Forge a flight under the genuine handshake keys.
+        var forger = try serverFlightProtector(
+            &client_x25519_private,
+            hello,
+            server_hello_record,
+        );
+        defer forger.deinit();
+        var plaintext: [4096]u8 = undefined;
+        var used: usize = 0;
+        const extensions = server_messages.encryptedExtensions(plaintext[used..], "http/1.1");
+        used += extensions.len;
+        switch (shape) {
+            .verify_without_certificate => {
+                // CertificateVerify with nothing to verify against.
+                const forged = server_messages.certificateVerify(plaintext[used..], 0x0403, &(.{0x30} ** 70));
+                used += forged.len;
+            },
+            .duplicate_certificate => {
+                const chain = harness.credentials.chain();
+                const first = server_messages.certificateChain(plaintext[used..], chain);
+                used += first.len;
+                const second = server_messages.certificateChain(plaintext[used..], chain);
+                used += second.len;
+            },
+        }
+        var forged_record: [record.wire_record_bytes_max]u8 = undefined;
+        const sealed = try forger.seal(.handshake, plaintext[0..used], &forged_record);
+        try testing.expectError(
+            error.UnexpectedMessage,
+            harness.client.handleRecord(sealed, &buffers.scratch),
+        );
+        try testing.expectEqual(ClientHandshake.State.failed, harness.client.state);
+    }
+}
+
+test "the client refuses HelloRetryRequest, structurally" {
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(null, null);
+    defer harness.deinit();
+    _ = harness.client.start(&buffers.client_out);
+
+    var message_buffer: [server_messages.server_hello_bytes_max]u8 = undefined;
+    const retry = server_messages.helloRetryRequest(&message_buffer, &(.{0x44} ** 32), .aes_128_gcm_sha256);
+    var wire_buffer: [record.header_bytes + server_messages.server_hello_bytes_max]u8 = undefined;
+    record.writeHeader(
+        .{ .content_type = .handshake, .length = @intCast(retry.len) },
+        wire_buffer[0..record.header_bytes],
+    );
+    @memcpy(wire_buffer[record.header_bytes..][0..retry.len], retry);
+    try testing.expectError(
+        error.HandshakeFailure,
+        harness.client.handleRecord(wire_buffer[0 .. record.header_bytes + retry.len], &buffers.scratch),
+    );
+    try testing.expectEqual(ClientHandshake.State.failed, harness.client.state);
+}

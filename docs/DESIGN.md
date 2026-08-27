@@ -129,10 +129,25 @@ wrap. zssl never writes padding; it strips peers' padding per §5.4.
    scope cuts: PSK offers on a retry ClientHello are ignored (the §4.4.1
    surgery binder stays out until BoGo can pressure it), and psk_ke
    without (EC)DHE is never accepted.
-4. **kTLS switchover + KeyUpdate**, client handshake for upstreams.
+4. **KeyUpdate, the kTLS switchover contract, and the client handshake**
+   — done. §4.6.3 lives once, in `session_keys.zig`, shared by both
+   machines: rotation resets the sequence space, a rotation ceiling turns
+   a request loop into an error, and `exportKeyMaterial` reflects the
+   current generation — the switchover contract is *tickets first, then
+   export both directions after any KeyUpdate, then stop feeding the
+   machine*. `ClientHandshake` is the origination half: SNI, ALPN with
+   RFC 7301 selection checks, the certificate-policy seam
+   (`.ecdsa_leaf_signature` proves key possession via std.crypto against
+   the presented leaf; chain/name stay deferred per §1), ticket capture
+   through the event surface, resumption, and a *structural* refusal of
+   HelloRetryRequest — a single-group client has no second offer to
+   make, so both HRR shapes (illegal repeat, unsatisfiable demand) abort.
+   Oracle: both production machines end to end — handshake, resume,
+   KeyUpdate both directions with kTLS exports agreeing across machines
+   at every generation.
 5. **The assurance ladder**: BoGo shim, parser fuzz targets (record
    header, ClientHello, extensions), differential against ztls, interop
-   against openssl s_client.
+   against openssl s_client and s_server.
 
 ## §7 Testing stance
 

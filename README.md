@@ -14,7 +14,7 @@ Read before writing code:
 
 ## Gates
 
-- `zig build test` — 45 tests across three oracle classes:
+- `zig build test` — 52 tests across three oracle classes:
   - **RFC 8448 replayed byte for byte** — §3's key ladder, every
     protected record opened, the server flight and ServerHello re-encoded
     to identical wire bytes; §4's binder chain, truncated-transcript
@@ -29,10 +29,13 @@ Read before writing code:
     kTLS key-export agreement, RFC 6979 signature determinism,
     resumption end-to-end (tickets issued after client Finished, PSK
     session up with no certificate, client-side PSK derivation agreeing
-    with the server's), and the failure paths (tampering, corrupted
-    binders, unknown tickets, no common suite, ALPN mismatch, talking
-    past the handshake) — plus AEAD differentials against `std.crypto`
-    for all three suites.
+    with the server's), the production `ClientHandshake` against the
+    production server (leaf verification, ticket capture, resumption,
+    §4.6.3 KeyUpdate both ways with kTLS exports agreeing at every
+    generation, structural HelloRetryRequest refusal), and the failure
+    paths (tampering, corrupted binders, unknown tickets, no common
+    suite, ALPN mismatch, talking past the handshake) — plus AEAD
+    differentials against `std.crypto` for all three suites.
 - `zig build test -Doptimize=ReleaseSafe` — the same suite in the mode
   release builds ship (assertions stay on; libcrypto builds with
   `sanitize_c = .off` in every mode — zoxy's #283).
@@ -43,6 +46,7 @@ parses the RFC text into `src/rfc8448_vectors.zig`.
 
 ## Status
 
-Slices 1 (foundations), 2 (ServerHandshake), and 3 (resumption) — see
-DESIGN.md §6 for what each proved and the ladder ahead: kTLS switchover +
-KeyUpdate + client handshake (4), BoGo and fuzzing (5).
+Slices 1 (foundations), 2 (ServerHandshake), 3 (resumption), and 4
+(KeyUpdate, the kTLS switchover contract, ClientHandshake) — see
+DESIGN.md §6 for what each proved. Remaining: the BoGo/fuzz assurance
+ladder (5).
