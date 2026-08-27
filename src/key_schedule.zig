@@ -118,6 +118,23 @@ pub fn KeySchedule(comptime suite: CipherSuite) type {
             return out;
         }
 
+        /// §4.2.11.2: the PSK binder — binder_key off the early secret,
+        /// its finished key, and the HMAC over the truncated-ClientHello
+        /// transcript hash. Only meaningful while the schedule stands at
+        /// early, before the (EC)DHE mix.
+        pub fn resumptionBinder(
+            self: *const Self,
+            truncated_hash: *const [hash_bytes]u8,
+        ) [hash_bytes]u8 {
+            assert(self.stage == .early);
+            assert(!std.mem.allEqual(u8, &self.secret, 0));
+            var empty_hash: [hash_bytes]u8 = undefined;
+            Hash.hash(&.{}, &empty_hash, .{});
+            const binder_key = self.deriveSecret("res binder", &empty_hash);
+            const binder_finished_key = finishedKey(&binder_key);
+            return verifyData(&binder_finished_key, truncated_hash);
+        }
+
         /// resumption_master_secret + ticket_nonce → the PSK a ticket
         /// stands for (§4.6.1).
         pub fn resumptionPsk(

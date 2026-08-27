@@ -114,9 +114,21 @@ wrap. zssl never writes padding; it strips peers' padding per §5.4.
    in-tree test client covering fragmentation, HRR, and every failure
    path. Known-refused, on purpose: KeyUpdate and post-handshake
    messages error loudly (`KeyUpdateUnsupported`) until slice 4.
-3. **Resumption**: NewSessionTicket issuance after client Finished (the
-   delayed-ACK lesson), PSK binder verification, the embedder's
-   `psk_lookup` seam. Oracle: RFC 8448 §4.
+3. **Resumption** — done: `psk_lookup` is the embedder seam (opaque
+   identity in, PSK out; ticket sealing, lifetime, and age policy stay
+   the embedder's), binder verification aborts on a recognized identity
+   with a bad binder (a replayed identity is refused, never downgraded),
+   an unknown identity falls back to a full handshake, and the resumed
+   flight drops Certificate/CertificateVerify. `resumptionPsk` derives
+   before `sendNewSessionTicket` seals — the stateless-server ordering —
+   and issuance happens strictly after `connected`, i.e. after the
+   client's Finished (the delayed-ACK lesson). Oracles: RFC 8448 §4's
+   binder chain, truncation arithmetic, PSK ServerHello, and PSK-mixed
+   ladder, all byte-exact; end-to-end ticket → resumed session with the
+   client deriving every PSK from its own resumption_master. Deliberate
+   scope cuts: PSK offers on a retry ClientHello are ignored (the §4.4.1
+   surgery binder stays out until BoGo can pressure it), and psk_ke
+   without (EC)DHE is never accepted.
 4. **kTLS switchover + KeyUpdate**, client handshake for upstreams.
 5. **The assurance ladder**: BoGo shim, parser fuzz targets (record
    header, ClientHello, extensions), differential against ztls, interop

@@ -36,6 +36,7 @@ pub const extensions_count_max: u16 = 64;
 pub const key_share_entries_max: u16 = 16;
 pub const groups_count_max: u16 = 64;
 pub const schemes_count_max: u16 = 64;
+pub const psk_identities_max: u8 = 4;
 
 pub const handshake_header_bytes: u8 = 4;
 const client_hello_message_type: u8 = 0x01;
@@ -88,6 +89,23 @@ pub const ClientHello = struct {
         var index: usize = 0;
         while (index < list.len) : (index += 2) {
             if (std.mem.readInt(u16, list[index..][0..2], .big) == group) return true;
+        }
+        return false;
+    }
+
+    /// §4.2.9: whether the client accepts PSK-with-(EC)DHE — the only
+    /// mode zssl speaks (pure psk_ke would skip the forward secrecy the
+    /// design insists on).
+    pub fn offersPskDheKe(self: *const ClientHello) bool {
+        const data = self.psk_modes_wire orelse return false;
+        var cursor = Cursor.init(data);
+        const list_bytes = cursor.takeByte() catch return false;
+        if (list_bytes != cursor.remaining()) return false;
+        var index: u16 = 0;
+        while (cursor.remaining() > 0) : (index += 1) {
+            assert(index < 256); // A u8 list length bounds this structurally.
+            const mode = cursor.takeByte() catch return false;
+            if (mode == 0x01) return true;
         }
         return false;
     }
@@ -221,6 +239,67 @@ fn applyExtension(extension_type: u16, data: []const u8, hello: *ClientHello) Er
         },
         else => {}, // Unknown: skipped whole, contents never inspected.
     }
+}
+
+/// §4.2.11: the offered PSKs, parsed on demand by the server once it has
+/// decided it can use them. Views into the message, no copies.
+pub const PskOffer = struct {
+    identities: [psk_identities_max][]const u8,
+    obfuscated_ages: [psk_identities_max]u32,
+    binders: [psk_identities_max][]const u8,
+    count: u8,
+    /// Bytes the binders section occupies at the message's tail — what
+    /// §4.2.11.2's truncated-transcript arithmetic removes.
+    binders_section_bytes: u16,
+};
+
+/// Parse the pre_shared_key extension captured at `parse` time. Answers
+/// null when the client offered none; malformed offers are errors, not
+/// ignored — a client that speaks the extension badly is not a client to
+/// guess about.
+pub fn parsePskOffer(hello: *const ClientHello) Error!?PskOffer {
+    const data = hello.pre_shared_key_wire orelse return null;
+    var cursor = Cursor.init(data);
+    var offer: PskOffer = .{
+        .identities = undefined,
+        .obfuscated_ages = undefined,
+        .binders = undefined,
+        .count = 0,
+        .binders_section_bytes = 0,
+    };
+    const identities_bytes = try cursor.takeU16();
+    // §4.2.11's floor: one entry is at least a 2-byte identity length,
+    // one identity byte, and the 4-byte obfuscated age.
+    if (identities_bytes < 7) return error.MalformedExtension;
+    if (identities_bytes > cursor.remaining()) return error.Truncated;
+    const identities_end = cursor.index + identities_bytes;
+    while (cursor.index < identities_end) {
+        if (offer.count == psk_identities_max) return error.ExtensionOverflow;
+        assert(offer.count < psk_identities_max);
+        const identity_bytes = try cursor.takeU16();
+        if (identity_bytes == 0) return error.MalformedExtension;
+        offer.identities[offer.count] = try cursor.takeSlice(identity_bytes);
+        offer.obfuscated_ages[offer.count] = try cursor.takeU32();
+        offer.count += 1;
+    }
+    if (cursor.index != identities_end) return error.MalformedExtension;
+
+    const binders_bytes = try cursor.takeU16();
+    if (binders_bytes != cursor.remaining()) return error.MalformedExtension;
+    offer.binders_section_bytes = binders_bytes + 2;
+    var binders_seen: u8 = 0;
+    while (cursor.remaining() > 0) : (binders_seen += 1) {
+        if (binders_seen == offer.count) return error.MalformedExtension;
+        assert(binders_seen < offer.count);
+        const binder_bytes = try cursor.takeByte();
+        // §4.2.11.2: a binder is an HMAC output — 32 or 48 here.
+        if (binder_bytes != 32 and binder_bytes != 48) return error.MalformedExtension;
+        offer.binders[binders_seen] = try cursor.takeSlice(binder_bytes);
+    }
+    // §4.2.11: one binder per identity, exactly.
+    if (binders_seen != offer.count) return error.MalformedExtension;
+    assert(offer.count >= 1);
+    return offer;
 }
 
 /// A `<u16 length, u16 items>` list body, validated and prefix-stripped —

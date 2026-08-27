@@ -100,6 +100,31 @@ WANT = [
     ("server_app_record", 825, "complete record"),
     ("client_alert_plaintext", 836, "payload"),
     ("client_alert_record", 836, "complete record"),
+    # §4 "Resumed 0-RTT Handshake" — the PSK/binder side of resumption.
+    # zssl does not implement 0-RTT, so the early-data vectors stay out;
+    # what these pin is the binder chain, the PSK-mixed key ladder, and
+    # the pre_shared_key ServerHello.
+    ("resumed_client_x25519_private", 866, "private key"),
+    ("resumed_client_x25519_public", 866, "public key"),
+    ("resumed_psk", 874, "IKM"),
+    ("resumed_early_secret", 874, "secret"),
+    # Block 884's "ClientHello" is the message *without* its binders
+    # section (the trace prints it pre-binder); the full 512-byte message
+    # is the send-record payload.
+    ("resumed_client_hello", 970, "payload"),
+    ("resumed_client_hello_truncated", 884, "ClientHello"),
+    ("resumed_binder_hash", 919, "binder hash"),
+    ("resumed_binder_key", 919, "PRK"),
+    ("resumed_binder_finished_key", 919, "expanded"),
+    ("resumed_binder_value", 919, "finished"),
+    ("resumed_server_x25519_private", 1096, "private key"),
+    ("resumed_server_x25519_public", 1096, "public key"),
+    ("resumed_server_hello", 1108, "ServerHello"),
+    ("resumed_ecdhe_shared", 1142, "IKM"),
+    ("resumed_handshake_secret", 1142, "secret"),
+    ("resumed_client_hs_traffic_secret", 1153, "expanded"),
+    ("resumed_server_hs_traffic_secret", 1168, "expanded"),
+    ("resumed_master_secret", 1205, "secret"),
 ]
 
 lines = [

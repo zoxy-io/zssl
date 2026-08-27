@@ -14,10 +14,11 @@ Read before writing code:
 
 ## Gates
 
-- `zig build test` — 40 tests across three oracle classes:
-  - **RFC 8448 §3 replayed byte for byte** — the key ladder, every
+- `zig build test` — 45 tests across three oracle classes:
+  - **RFC 8448 replayed byte for byte** — §3's key ladder, every
     protected record opened, the server flight and ServerHello re-encoded
-    to identical wire bytes.
+    to identical wire bytes; §4's binder chain, truncated-transcript
+    arithmetic, PSK ServerHello, and PSK-mixed ladder.
   - **Interop with `std.crypto.tls.Client`** — an implementation sharing
     no code with zssl completes a full in-memory handshake against
     `ServerHandshake` (std's own X.509 and ECDSA verify our Certificate
@@ -25,8 +26,11 @@ Read before writing code:
     close_notify.
   - **State-machine scenarios** — fragmented ClientHello, coalesced
     flights, HelloRetryRequest with §4.4.1 transcript surgery, ALPN,
-    kTLS key-export agreement, RFC 6979 signature determinism, and the
-    failure paths (tampering, no common suite, ALPN mismatch, talking
+    kTLS key-export agreement, RFC 6979 signature determinism,
+    resumption end-to-end (tickets issued after client Finished, PSK
+    session up with no certificate, client-side PSK derivation agreeing
+    with the server's), and the failure paths (tampering, corrupted
+    binders, unknown tickets, no common suite, ALPN mismatch, talking
     past the handshake) — plus AEAD differentials against `std.crypto`
     for all three suites.
 - `zig build test -Doptimize=ReleaseSafe` — the same suite in the mode
@@ -39,6 +43,6 @@ parses the RFC text into `src/rfc8448_vectors.zig`.
 
 ## Status
 
-Slices 1 (foundations) and 2 (ServerHandshake) — see DESIGN.md §6 for
-what each proved and the ladder ahead: resumption (3), kTLS switchover +
+Slices 1 (foundations), 2 (ServerHandshake), and 3 (resumption) — see
+DESIGN.md §6 for what each proved and the ladder ahead: kTLS switchover +
 KeyUpdate + client handshake (4), BoGo and fuzzing (5).

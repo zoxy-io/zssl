@@ -37,6 +37,9 @@ ccs_seen: u8,
 /// The session id to echo, captured from the (first) ClientHello.
 session_echo_bytes: u8,
 session_echo: [32]u8,
+/// Whether this session came up on an accepted PSK — the fact behind
+/// zoxy's `tls_resumed` counter.
+resumed: bool,
 
 const ServerHandshake = @This();
 
@@ -63,6 +66,29 @@ pub const Config = struct {
     /// Caller-owned space for flight plaintext assembly; must hold the
     /// certificate chain plus ~1 KiB.
     flight: []u8,
+    /// The resumption seam: given an offered ticket identity, answer the
+    /// PSK it stands for, or null to fall back to a full handshake. The
+    /// embedder owns ticket sealing, lifetime, and age policy — this
+    /// machine owns only the binder check that follows.
+    psk_lookup: ?PskLookup = null,
+};
+
+pub const PskLookup = struct {
+    context: *anyopaque,
+    /// Writes the PSK into `psk_out` and returns its length (one hash
+    /// length), or null when the identity is not ours to accept.
+    lookup: *const fn (
+        context: *anyopaque,
+        identity: []const u8,
+        obfuscated_age: u32,
+        psk_out: *[cipher_suite.hash_bytes_max]u8,
+    ) ?u8,
+};
+
+const SelectedPsk = struct {
+    psk: [cipher_suite.hash_bytes_max]u8,
+    psk_bytes: u8,
+    index: u16,
 };
 
 pub const Event = union(enum) {
@@ -112,6 +138,7 @@ pub fn init(config: *const Config) ServerHandshake {
         .ccs_seen = 0,
         .session_echo_bytes = 0,
         .session_echo = undefined,
+        .resumed = false,
     };
 }
 
@@ -182,8 +209,13 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
     const suite = negotiateSuite(&hello) orelse return error.HandshakeFailure;
     assert(hello.offersSuite(suite));
     assert(hello.cipher_suites_wire.len >= 2);
-    const scheme = self.config.credentials.signer.scheme;
-    if (!hello.offersScheme(@intFromEnum(scheme))) return error.HandshakeFailure;
+    const selected_psk = try self.selectPsk(&hello, message, suite);
+    if (selected_psk == null) {
+        // A full handshake signs a CertificateVerify; a resumed one
+        // authenticates by PSK and needs no common signature scheme.
+        const scheme = self.config.credentials.signer.scheme;
+        if (!hello.offersScheme(@intFromEnum(scheme))) return error.HandshakeFailure;
+    }
     self.captureSessionEcho(&hello);
 
     if (self.state == .awaiting_retry_client_hello) {
@@ -191,7 +223,7 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
         const ladder_suite: CipherSuite = self.ladder.?;
         if (suite != ladder_suite) return error.IllegalRetry;
         if (hello.key_share_x25519 == null) return error.IllegalRetry;
-        return self.acceptClientHello(&hello, message, suite, out);
+        return self.acceptClientHello(&hello, message, suite, selected_psk, out);
     }
 
     assert(self.state == .awaiting_client_hello);
@@ -201,7 +233,73 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
         if (!hello.supportsGroup(client_hello.group_x25519)) return error.HandshakeFailure;
         return self.sendHelloRetry(message, suite, out);
     }
-    return self.acceptClientHello(&hello, message, suite, out);
+    return self.acceptClientHello(&hello, message, suite, selected_psk, out);
+}
+
+/// §4.2.11: walk the offered identities through the embedder's lookup;
+/// the first one the embedder recognizes must carry a valid binder or
+/// the handshake aborts — an attacker replaying a stolen identity does
+/// not get downgraded to a full handshake, it gets refused.
+///
+/// PSK offers on a retry ClientHello are deliberately ignored (full
+/// handshake instead): the binder there hashes the §4.4.1 surgery
+/// transcript, and zssl does not carry that path untested — BoGo in
+/// slice 5 is where it earns its way in.
+fn selectPsk(
+    self: *ServerHandshake,
+    hello: *const client_hello.ClientHello,
+    message: []const u8,
+    suite: CipherSuite,
+) Error!?SelectedPsk {
+    const lookup = self.config.psk_lookup orelse return null;
+    if (self.state != .awaiting_client_hello) return null;
+    if (hello.key_share_x25519 == null) return null; // psk_dhe_ke needs the share.
+    if (!hello.offersPskDheKe()) return null;
+    const offer = (try client_hello.parsePskOffer(hello)) orelse return null;
+    assert(offer.count >= 1);
+    assert(offer.binders_section_bytes < message.len);
+    const truncated = message[0 .. message.len - offer.binders_section_bytes];
+
+    var index: u8 = 0;
+    while (index < offer.count) : (index += 1) {
+        assert(index < client_hello.psk_identities_max);
+        var selected: SelectedPsk = .{ .psk = undefined, .psk_bytes = 0, .index = index };
+        const psk_bytes = lookup.lookup(
+            lookup.context,
+            offer.identities[index],
+            offer.obfuscated_ages[index],
+            &selected.psk,
+        ) orelse continue;
+        if (psk_bytes != suite.hashBytes()) continue; // A PSK is bound to its hash.
+        selected.psk_bytes = psk_bytes;
+        if (!binderMatches(suite, selected.psk[0..psk_bytes], truncated, offer.binders[index])) {
+            return error.DecryptError;
+        }
+        return selected;
+    }
+    return null;
+}
+
+fn binderMatches(suite: CipherSuite, psk: []const u8, truncated: []const u8, binder: []const u8) bool {
+    assert(psk.len == suite.hashBytes());
+    assert(truncated.len >= handshake.header_bytes);
+    switch (suite) {
+        inline else => |comptime_suite| {
+            const Hash = CipherSuite.HashType(comptime_suite);
+            const Schedule = key_schedule.KeySchedule(comptime_suite);
+            if (binder.len != Hash.digest_length) return false;
+            var truncated_hash: [Hash.digest_length]u8 = undefined;
+            Hash.hash(truncated, &truncated_hash, .{});
+            var schedule = Schedule.initEarly(psk);
+            defer schedule.wipe();
+            const expected = schedule.resumptionBinder(&truncated_hash);
+            return std.crypto.timing_safe.eql(
+                [Hash.digest_length]u8,
+                binder[0..Hash.digest_length].*,
+                expected,
+            );
+        },
+    }
 }
 
 /// Our preference order: AES-128-GCM leads (hardware-everywhere), then
@@ -247,6 +345,7 @@ fn acceptClientHello(
     hello: *const client_hello.ClientHello,
     message: []const u8,
     suite: CipherSuite,
+    selected_psk: ?SelectedPsk,
     out: []u8,
 ) Error!Event {
     assert(hello.key_share_x25519 != null);
@@ -269,14 +368,17 @@ fn acceptClientHello(
         echo,
         suite,
         &x25519_public,
+        if (selected_psk) |psk| psk.index else null,
     );
+    self.resumed = selected_psk != null;
 
     const selected_alpn = try self.selectAlpn(hello);
     switch (self.ladder.?) {
         inline else => |*arm| {
             arm.absorbMessage(message);
             arm.absorbMessage(hello_bytes);
-            try arm.startHandshakeKeys(&shared);
+            const psk_slice: ?[]const u8 = if (selected_psk) |*psk| psk.psk[0..psk.psk_bytes] else null;
+            try arm.startHandshakeKeys(&shared, psk_slice);
             const flight = try self.buildFlightPlaintext(arm, selected_alpn);
             var builder = @import("wire.zig").Builder.init(out);
             appendPlaintextRecord(&builder, .handshake, hello_bytes);
@@ -306,24 +408,28 @@ fn buildFlightPlaintext(
     builder.index += extensions.len;
     arm.absorbMessage(extensions);
 
-    const chain = server_messages.certificateChain(
-        flight[builder.index..],
-        self.config.credentials.chain(),
-    );
-    builder.index += chain.len;
-    arm.absorbMessage(chain);
+    // §4.1.1: a PSK authenticates the session, so a resumed flight is
+    // EncryptedExtensions and Finished — no certificate, nothing signed.
+    if (!self.resumed) {
+        const chain = server_messages.certificateChain(
+            flight[builder.index..],
+            self.config.credentials.chain(),
+        );
+        builder.index += chain.len;
+        arm.absorbMessage(chain);
 
-    var content_buffer: [server_messages.certificate_verify_content_bytes_max]u8 = undefined;
-    const to_sign = server_messages.certificateVerifyContent(.server, &arm.transcriptHash(), &content_buffer);
-    var signature_buffer: [backend.signature_bytes_max]u8 = undefined;
-    const signature = try self.config.credentials.signer.sign(to_sign, &signature_buffer);
-    const verify_message = server_messages.certificateVerify(
-        flight[builder.index..],
-        @intFromEnum(self.config.credentials.signer.scheme),
-        signature,
-    );
-    builder.index += verify_message.len;
-    arm.absorbMessage(verify_message);
+        var content_buffer: [server_messages.certificate_verify_content_bytes_max]u8 = undefined;
+        const to_sign = server_messages.certificateVerifyContent(.server, &arm.transcriptHash(), &content_buffer);
+        var signature_buffer: [backend.signature_bytes_max]u8 = undefined;
+        const signature = try self.config.credentials.signer.sign(to_sign, &signature_buffer);
+        const verify_message = server_messages.certificateVerify(
+            flight[builder.index..],
+            @intFromEnum(self.config.credentials.signer.scheme),
+            signature,
+        );
+        builder.index += verify_message.len;
+        arm.absorbMessage(verify_message);
+    }
 
     const verify_data = arm.serverFinishedVerifyData();
     const finished_message = server_messages.finished(flight[builder.index..], &verify_data);
@@ -331,7 +437,10 @@ fn buildFlightPlaintext(
     arm.absorbMessage(finished_message);
 
     assert(builder.index <= flight.len);
-    assert(builder.index >= 64);
+    // A resumed flight is EncryptedExtensions + Finished; a full one adds
+    // the chain and the signature.
+    assert(builder.index >= 40);
+    if (!self.resumed) assert(builder.index >= 500);
     return flight[0..builder.index];
 }
 
@@ -429,6 +538,61 @@ pub fn sendClose(self: *ServerHandshake, out: []u8) Error![]const u8 {
     }
 }
 
+/// §4.6.1: derive the PSK a ticket nonce will stand for. Separate from
+/// sending, because a stateless embedder needs the PSK *before* the
+/// ticket that seals it exists — zoxy's `Tickets.seal` order.
+pub fn resumptionPsk(
+    self: *const ServerHandshake,
+    ticket_nonce: []const u8,
+    out: *[cipher_suite.hash_bytes_max]u8,
+) []const u8 {
+    assert(self.state == .connected);
+    assert(ticket_nonce.len >= 1);
+    assert(ticket_nonce.len <= 255);
+    switch (self.ladder.?) {
+        inline else => |*arm, comptime_suite| {
+            const Schedule = key_schedule.KeySchedule(comptime_suite);
+            const psk = Schedule.resumptionPsk(&arm.resumption_master, ticket_nonce);
+            @memcpy(out[0..psk.len], &psk);
+            return out[0..psk.len];
+        },
+    }
+}
+
+pub const NewSessionTicketParams = struct {
+    lifetime_s: u32,
+    age_add: u32,
+    ticket_nonce: []const u8,
+    /// The sealed ticket, opaque here — sealing is the embedder's.
+    ticket: []const u8,
+};
+
+/// Encode and seal one NewSessionTicket onto the application stream. The
+/// embedder calls this after `connected` — which is after the client's
+/// Finished was processed, the ordering the ~45 ms delayed-ACK stall
+/// analysis demands — once per ticket it wants to issue.
+pub fn sendNewSessionTicket(
+    self: *ServerHandshake,
+    params: *const NewSessionTicketParams,
+    out: []u8,
+) Error![]const u8 {
+    assert(self.state == .connected);
+    assert(params.ticket.len >= 1);
+    assert(params.ticket.len <= server_messages.ticket_bytes_max);
+    errdefer self.state = .failed;
+    var message_buffer: [server_messages.new_session_ticket_bytes_max]u8 = undefined;
+    const message = server_messages.newSessionTicket(
+        &message_buffer,
+        params.lifetime_s,
+        params.age_add,
+        params.ticket_nonce,
+        params.ticket,
+    );
+    switch (self.ladder.?) {
+        inline else => |*arm| return arm.send.?.seal(.handshake, message, out),
+    }
+}
+
 pub const Direction = enum { transmit, receive };
 
 /// The kTLS hand-over: one direction's application traffic key, IV, and
@@ -494,6 +658,9 @@ fn LadderOf(comptime suite: CipherSuite) type {
         /// protectors from `connected` on.
         transmit_keys: Schedule.TrafficKeys,
         receive_keys: Schedule.TrafficKeys,
+        /// §7.1's last derivation, available from `connected`: what every
+        /// ticket's PSK descends from.
+        resumption_master: [hash_bytes]u8,
         recv: ?protect.Protector,
         send: ?protect.Protector,
 
@@ -507,6 +674,7 @@ fn LadderOf(comptime suite: CipherSuite) type {
             .finished_hash = undefined,
             .transmit_keys = undefined,
             .receive_keys = undefined,
+            .resumption_master = undefined,
             .recv = null,
             .send = null,
         };
@@ -517,6 +685,7 @@ fn LadderOf(comptime suite: CipherSuite) type {
             if (self.schedule) |*schedule| schedule.wipe();
             std.crypto.secureZero(u8, &self.client_handshake_traffic);
             std.crypto.secureZero(u8, &self.server_handshake_traffic);
+            std.crypto.secureZero(u8, &self.resumption_master);
             std.crypto.secureZero(u8, std.mem.asBytes(&self.transmit_keys));
             std.crypto.secureZero(u8, std.mem.asBytes(&self.receive_keys));
             self.* = undefined;
@@ -551,10 +720,14 @@ fn LadderOf(comptime suite: CipherSuite) type {
 
         /// ClientHello..ServerHello are in the transcript: derive the
         /// handshake secrets and bring up the handshake-key protectors.
-        fn startHandshakeKeys(self: *Self, shared: *const [32]u8) protect.Error!void {
+        /// `psk` is the accepted resumption secret, or null for a full
+        /// handshake — either way the (EC)DHE share is mixed (psk_dhe_ke
+        /// is the only mode this library speaks).
+        fn startHandshakeKeys(self: *Self, shared: *const [32]u8, psk: ?[]const u8) protect.Error!void {
             assert(self.schedule == null);
             assert(self.recv == null);
-            var schedule = Schedule.initEarly(null);
+            if (psk) |bytes| assert(bytes.len == hash_bytes);
+            var schedule = Schedule.initEarly(psk);
             schedule.advanceToHandshake(shared);
             const hello_hash = self.transcriptHash();
             self.client_handshake_traffic = schedule.deriveAt(.handshake, "c hs traffic", &hello_hash);
@@ -614,6 +787,9 @@ fn LadderOf(comptime suite: CipherSuite) type {
             assert(self.schedule != null);
             assert(self.schedule.?.stage == .master);
             self.transcript.update(finished_message.bytes);
+            // §7.1: resumption_master derives from the transcript through
+            // the client Finished — this is the only window it exists in.
+            self.resumption_master = self.schedule.?.deriveAt(.master, "res master", &self.transcript.currentHash());
             self.recv.?.deinit();
             self.send.?.deinit();
             self.recv = null;

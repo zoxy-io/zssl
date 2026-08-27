@@ -36,6 +36,26 @@ pub const Options = struct {
     alpn: ?[]const u8 = null,
     server_name: ?[]const u8 = null,
     send_change_cipher_spec: bool = true,
+    /// Offer this ticket's PSK for resumption (§4.2.11).
+    resume_with: ?*const Ticket = null,
+    /// The psk_key_exchange_modes byte sent when resuming; 0x01 is
+    /// psk_dhe_ke, anything else makes the server ignore the offer.
+    psk_mode_byte: u8 = 0x01,
+    /// Flip a binder bit — the offer must then be fatally refused.
+    corrupt_binder: bool = false,
+};
+
+/// A captured NewSessionTicket plus the PSK the client derived for it
+/// from its own resumption_master — independently of the server's copy.
+pub const Ticket = struct {
+    lifetime_s: u32,
+    age_add: u32,
+    nonce: [16]u8,
+    nonce_bytes: u8,
+    ticket: [256]u8,
+    ticket_bytes: u16,
+    psk: [cipher_suite.hash_bytes_max]u8,
+    psk_bytes: u8,
 };
 
 pub fn TestClient(comptime suite: CipherSuite) type {
@@ -65,10 +85,14 @@ pub fn TestClient(comptime suite: CipherSuite) type {
         assembler_storage: [16384]u8,
         hello_storage: [1024]u8,
         hello_bytes: usize,
+        resumption_master: [hash_bytes]u8,
+        tickets: [4]Ticket,
+        ticket_count: u8,
         /// Facts the tests assert on afterwards.
         saw_retry: bool,
         certificate_verified: bool,
         alpn_selected: bool,
+        psk_accepted: bool,
 
         const Self = @This();
 
@@ -111,9 +135,13 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                 .assembler_storage = undefined,
                 .hello_storage = undefined,
                 .hello_bytes = 0,
+                .resumption_master = undefined,
+                .tickets = undefined,
+                .ticket_count = 0,
                 .saw_retry = false,
                 .certificate_verified = false,
                 .alpn_selected = false,
+                .psk_accepted = false,
             };
             client.records = record_buffer.RecordBuffer.init(&client.records_storage);
             client.assembler = handshake.Assembler.init(&client.assembler_storage);
@@ -168,7 +196,27 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             builder.patchU16(extensions);
             handshake.endMessage(&builder, message);
             self.hello_bytes = builder.written().len;
+            if (self.options.resume_with != null) self.patchBinder();
             return builder.written();
+        }
+
+        /// §4.2.11.2: the binder MACs the hash of the ClientHello minus
+        /// its own binders section, so it can only be computed — and
+        /// patched in — after the rest of the message is final.
+        fn patchBinder(self: *Self) void {
+            const ticket = self.options.resume_with.?;
+            assert(ticket.psk_bytes == hash_bytes);
+            const message = self.hello_storage[0..self.hello_bytes];
+            const binders_section_bytes = 2 + 1 + hash_bytes;
+            assert(message.len > binders_section_bytes);
+            const truncated = message[0 .. message.len - binders_section_bytes];
+            var truncated_hash: [hash_bytes]u8 = undefined;
+            Hash.hash(truncated, &truncated_hash, .{});
+            var schedule = Schedule.initEarly(ticket.psk[0..hash_bytes]);
+            var binder = schedule.resumptionBinder(&truncated_hash);
+            schedule.wipe();
+            if (self.options.corrupt_binder) binder[0] ^= 0x01;
+            @memcpy(message[message.len - hash_bytes ..], &binder);
         }
 
         fn buildHelloExtensions(self: *Self, builder: *wire.Builder, with_x25519: bool, with_decoy: bool) void {
@@ -234,6 +282,34 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             }
             builder.patchU16(share_list);
             builder.patchU16(shares);
+            if (self.options.resume_with != null) self.buildPskExtensions(builder);
+        }
+
+        /// psk_key_exchange_modes plus the pre_shared_key offer, which
+        /// §4.2 requires to be the last extension. The binder is written
+        /// as zeros here and patched by `buildHello` once the message is
+        /// complete — §4.2.11.2's truncated-transcript dance.
+        fn buildPskExtensions(self: *Self, builder: *wire.Builder) void {
+            const ticket = self.options.resume_with.?;
+            assert(ticket.psk_bytes == hash_bytes);
+            assert(ticket.ticket_bytes >= 1);
+            builder.putU16(45); // psk_key_exchange_modes
+            const modes = builder.markU16();
+            builder.putByte(1);
+            builder.putByte(self.options.psk_mode_byte);
+            builder.patchU16(modes);
+            builder.putU16(41); // pre_shared_key
+            const extension = builder.markU16();
+            const identities = builder.markU16();
+            builder.putU16(ticket.ticket_bytes);
+            builder.putSlice(ticket.ticket[0..ticket.ticket_bytes]);
+            builder.putU32(ticket.age_add); // Obfuscated age; policy is the server's.
+            builder.patchU16(identities);
+            const binders = builder.markU16();
+            builder.putByte(hash_bytes);
+            builder.putSlice(&(.{0} ** hash_bytes));
+            builder.patchU16(binders);
+            builder.patchU16(extension);
         }
 
         /// Feed server bytes (any chunking); act on what comes back.
@@ -296,6 +372,13 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                     if (try share.takeU16() != 32) return error.BadServerHello;
                     server_share = (try share.takeSlice(32))[0..32].*;
                 }
+                if (extension_type == 41) {
+                    // The server accepted our PSK; we only ever offer one.
+                    if (self.options.resume_with == null) return error.BadServerHello;
+                    var selected = wire.Cursor.init(data);
+                    if (try selected.takeU16() != 0) return error.BadServerHello;
+                    self.psk_accepted = true;
+                }
             }
             if (is_retry) return self.handleRetry(message, out);
             self.transcript.update(message);
@@ -308,6 +391,10 @@ pub fn TestClient(comptime suite: CipherSuite) type {
         /// and answer with a ClientHello that carries the demanded share.
         fn handleRetry(self: *Self, hrr: []const u8, out: []u8) Error!Event {
             if (self.saw_retry) return error.BadServerHello;
+            // Retry-with-PSK would need the binder recomputed over the
+            // §4.4.1 surgery transcript; the server ignores that combo
+            // and this client never exercises it.
+            assert(self.options.resume_with == null);
             self.saw_retry = true;
             assert(self.transcript.messages_seen == 1);
             var ch1_hash: [hash_bytes]u8 = undefined;
@@ -330,7 +417,11 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             var shared: [32]u8 = undefined;
             try backend.x25519Shared(&self.x25519_private, server_share, &shared);
             defer std.crypto.secureZero(u8, &shared);
-            var schedule = Schedule.initEarly(null);
+            const psk: ?[]const u8 = if (self.psk_accepted)
+                self.options.resume_with.?.psk[0..hash_bytes]
+            else
+                null;
+            var schedule = Schedule.initEarly(psk);
             schedule.advanceToHandshake(&shared);
             const hello_hash = self.transcript.currentHash();
             self.client_handshake_traffic = schedule.deriveAt(.handshake, "c hs traffic", &hello_hash);
@@ -357,8 +448,9 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                     return .closed;
                 },
                 .handshake => {
-                    if (self.state != .awaiting_flight) return error.UnexpectedMessage;
                     try self.assembler.push(plaintext);
+                    if (self.state == .connected) return self.drainTickets();
+                    if (self.state != .awaiting_flight) return error.UnexpectedMessage;
                     return self.drainFlight(out);
                 },
                 .application_data => {
@@ -431,8 +523,53 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             self.transcript.update(message.bytes);
         }
 
+        /// §4.6.1 client side: capture tickets and derive each one's PSK
+        /// from our own resumption_master — independently of the server's
+        /// copy, which is what makes the next session's success a check.
+        fn drainTickets(self: *Self) Error!Event {
+            assert(self.state == .connected);
+            var messages_seen: u8 = 0;
+            while (try self.assembler.next()) |message| : (messages_seen += 1) {
+                // Slack over tickets.len is deliberate: storeTicket errors
+                // on capacity before this bound can fire.
+                assert(messages_seen < 2 * self.tickets.len);
+                if (message.messageType() != .new_session_ticket) return error.UnexpectedMessage;
+                try self.storeTicket(message.body());
+            }
+            return .none;
+        }
+
+        fn storeTicket(self: *Self, body: []const u8) Error!void {
+            assert(self.state == .connected);
+            if (self.ticket_count == self.tickets.len) return error.UnexpectedMessage;
+            var cursor = wire.Cursor.init(body);
+            var entry: Ticket = undefined;
+            entry.lifetime_s = try cursor.takeU32();
+            entry.age_add = try cursor.takeU32();
+            const nonce_bytes = try cursor.takeByte();
+            if (nonce_bytes == 0 or nonce_bytes > entry.nonce.len) return error.UnexpectedMessage;
+            const nonce = try cursor.takeSlice(nonce_bytes);
+            @memcpy(entry.nonce[0..nonce_bytes], nonce);
+            entry.nonce_bytes = @intCast(nonce_bytes);
+            const ticket_bytes = try cursor.takeU16();
+            if (ticket_bytes == 0 or ticket_bytes > entry.ticket.len) return error.UnexpectedMessage;
+            const ticket = try cursor.takeSlice(ticket_bytes);
+            @memcpy(entry.ticket[0..ticket_bytes], ticket);
+            entry.ticket_bytes = ticket_bytes;
+            const extensions_bytes = try cursor.takeU16();
+            _ = try cursor.takeSlice(extensions_bytes);
+            if (cursor.remaining() != 0) return error.UnexpectedMessage;
+            const psk = Schedule.resumptionPsk(&self.resumption_master, nonce);
+            @memset(&entry.psk, 0);
+            @memcpy(entry.psk[0..hash_bytes], &psk);
+            entry.psk_bytes = hash_bytes;
+            self.tickets[self.ticket_count] = entry;
+            self.ticket_count += 1;
+            assert(self.ticket_count <= self.tickets.len);
+        }
+
         fn finishHandshake(self: *Self, message: handshake.Message, out: []u8) Error!Event {
-            assert(self.certificate_verified);
+            assert(self.certificate_verified or self.psk_accepted);
             assert(self.schedule.?.stage == .handshake);
             if (message.body().len != hash_bytes) return error.BadFinished;
             const server_key = Schedule.finishedKey(&self.server_handshake_traffic);
@@ -453,6 +590,7 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             var message_buffer: [handshake.header_bytes + hash_bytes]u8 = undefined;
             const finished_message = server_messages.finished(&message_buffer, &verify_data);
             self.transcript.update(finished_message);
+            self.resumption_master = self.schedule.?.deriveAt(.master, "res master", &self.transcript.currentHash());
             var builder = wire.Builder.init(out);
             if (self.options.send_change_cipher_spec) {
                 builder.putSlice(&server_messages.change_cipher_spec_record);

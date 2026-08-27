@@ -14,6 +14,7 @@ const CipherSuite = cipher_suite.CipherSuite;
 const extension_key_share: u16 = 51;
 const extension_supported_versions: u16 = 43;
 const extension_alpn: u16 = 16;
+const extension_pre_shared_key: u16 = 41;
 const tls13_wire_version: u16 = 0x0304;
 
 /// §4.1.3: the fixed random value that marks a ServerHello as a
@@ -38,9 +39,11 @@ pub fn serverHello(
     session_echo: []const u8,
     suite: CipherSuite,
     x25519_public: *const [32]u8,
+    selected_psk: ?u16,
 ) []const u8 {
     assert(out.len >= server_hello_bytes_max);
     assert(session_echo.len <= 32);
+    if (selected_psk) |index| assert(index < client_hello.psk_identities_max);
     var builder = wire.Builder.init(out);
     const message = handshake.beginMessage(&builder, .server_hello);
     builder.putU16(0x0303);
@@ -50,8 +53,14 @@ pub fn serverHello(
     builder.putU16(@intFromEnum(suite));
     builder.putByte(0); // legacy_compression_method
     const extensions = builder.markU16();
-    // key_share first, then supported_versions — the order RFC 8448's
-    // trace uses, which the byte-exact test below leans on.
+    // pre_shared_key, key_share, supported_versions — the order both of
+    // RFC 8448's traces use, which the byte-exact tests lean on.
+    if (selected_psk) |index| {
+        builder.putU16(extension_pre_shared_key);
+        const psk = builder.markU16();
+        builder.putU16(index);
+        builder.patchU16(psk);
+    }
     builder.putU16(extension_key_share);
     const key_share = builder.markU16();
     builder.putU16(client_hello.group_x25519);
@@ -170,6 +179,45 @@ pub fn finished(out: []u8, verify_data: []const u8) []const u8 {
     return builder.written();
 }
 
+/// The sealed-ticket size budget shared by every encoder and buffer that
+/// touches one. zoxy's tickets are ≤ 256 bytes; 512 leaves headroom.
+pub const ticket_bytes_max: u16 = 512;
+
+/// A NewSessionTicket message never exceeds this (§4.6.1's fields at
+/// their caps), which is what sizes the sealing buffers above.
+pub const new_session_ticket_bytes_max: u16 =
+    @as(u16, handshake.header_bytes) + 4 + 4 + 1 + 255 + 2 + ticket_bytes_max + 2;
+
+/// §4.6.1. Extensions are always empty: no `early_data` offer means
+/// 0-RTT stays a separate decision with its own replay analysis.
+pub fn newSessionTicket(
+    out: []u8,
+    lifetime_s: u32,
+    age_add: u32,
+    ticket_nonce: []const u8,
+    ticket: []const u8,
+) []const u8 {
+    assert(lifetime_s >= 1);
+    assert(lifetime_s <= 604800); // §4.6.1 caps the lifetime at seven days.
+    assert(ticket_nonce.len >= 1);
+    assert(ticket_nonce.len <= 255);
+    assert(ticket.len >= 1);
+    assert(ticket.len <= ticket_bytes_max);
+    assert(out.len >= handshake.header_bytes + 4 + 4 + 1 + ticket_nonce.len + 2 + ticket.len + 2);
+    var builder = wire.Builder.init(out);
+    const message = handshake.beginMessage(&builder, .new_session_ticket);
+    builder.putU32(lifetime_s);
+    builder.putU32(age_add);
+    builder.putByte(@intCast(ticket_nonce.len));
+    builder.putSlice(ticket_nonce);
+    const body = builder.markU16();
+    builder.putSlice(ticket);
+    builder.patchU16(body);
+    builder.putU16(0); // extensions
+    handshake.endMessage(&builder, message);
+    return builder.written();
+}
+
 pub const Side = enum { server, client };
 
 pub const certificate_verify_content_bytes_max: u16 = 64 + 34 + 1 + 48;
@@ -204,8 +252,24 @@ test "serverHello reproduces RFC 8448's traced bytes exactly" {
         &.{},
         .aes_128_gcm_sha256,
         &vectors.server_x25519_public,
+        null,
     );
     try std.testing.expectEqualSlices(u8, &vectors.server_hello, encoded);
+}
+
+test "serverHello with a selected PSK reproduces the §4 traced bytes" {
+    const vectors = @import("rfc8448_vectors.zig");
+    const traced_random = vectors.resumed_server_hello[6..38];
+    var out: [server_hello_bytes_max]u8 = undefined;
+    const encoded = serverHello(
+        &out,
+        traced_random,
+        &.{},
+        .aes_128_gcm_sha256,
+        &vectors.resumed_server_x25519_public,
+        0,
+    );
+    try std.testing.expectEqualSlices(u8, &vectors.resumed_server_hello, encoded);
 }
 
 test "helloRetryRequest carries the §4.1.3 magic and the demanded group" {

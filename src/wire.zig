@@ -38,6 +38,13 @@ pub const Cursor = struct {
         return value;
     }
 
+    pub fn takeU32(self: *Cursor) Error!u32 {
+        if (self.remaining() < 4) return error.Truncated;
+        const value = std.mem.readInt(u32, self.bytes[self.index..][0..4], .big);
+        self.index += 4;
+        return value;
+    }
+
     pub fn takeU24(self: *Cursor) Error!u24 {
         if (self.remaining() < 3) return error.Truncated;
         const value = std.mem.readInt(u24, self.bytes[self.index..][0..3], .big);
@@ -77,6 +84,12 @@ pub const Builder = struct {
         assert(self.index + 2 <= self.bytes.len);
         std.mem.writeInt(u16, self.bytes[self.index..][0..2], value, .big);
         self.index += 2;
+    }
+
+    pub fn putU32(self: *Builder, value: u32) void {
+        assert(self.index + 4 <= self.bytes.len);
+        std.mem.writeInt(u32, self.bytes[self.index..][0..4], value, .big);
+        self.index += 4;
     }
 
     pub fn putU24(self: *Builder, value: u24) void {

@@ -34,4 +34,5 @@ test {
     _ = @import("rfc8448_test.zig");
     _ = @import("handshake_test.zig");
     _ = @import("std_interop_test.zig");
+    _ = @import("resumption_test.zig");
 }
