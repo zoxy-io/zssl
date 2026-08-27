@@ -4,9 +4,10 @@ A sans-I/O TLS 1.3 library in Zig, over libcrypto primitives.
 
 zssl implements the protocol — records, the key schedule, both handshake
 state machines, resumption, KeyUpdate — in auditable Zig, and calls
-libcrypto only for the constant-time primitives (AEAD, X25519, ECDSA).
-It owns no sockets, no threads, and no memory: you feed it whole TLS
-records and transmit whatever it hands back.
+libcrypto only for the constant-time primitives (AEAD, X25519, ECDSA
+signing); checking a *peer's* signature is `std.crypto`'s. It owns no
+sockets, no threads, and no memory: you feed it whole TLS records and
+transmit whatever it hands back.
 
 ```zig
 switch (try server.handleRecord(wire_record, &out)) {
@@ -212,8 +213,9 @@ refused, not downgraded.
 
 **In:** TLS 1.3 (RFC 8446), the three standard cipher suites, x25519,
 ECDSA P-256/P-384 signing, RSA-PSS *verification* on the client side,
-SNI, ALPN, HelloRetryRequest, PSK resumption with server-side tickets,
-KeyUpdate, and kTLS key export.
+SNI, ALPN, HelloRetryRequest (the server issues it; the client refuses it
+structurally, holding keys for one group), PSK resumption with
+server-side tickets, KeyUpdate, and kTLS key export.
 
 **Out, permanently:** TLS 1.2 and earlier, renegotiation, compression,
 RSA and DSA key exchange. A caller that needs these wants a different
@@ -227,13 +229,13 @@ Everything above is argued in [docs/DESIGN.md](docs/DESIGN.md) §1.
 
 ## Testing
 
-`zig build test` runs 64 tests; `zig build interop` runs the real-OpenSSL
+`zig build test` runs 74 tests; `zig build interop` runs the real-OpenSSL
 gate. Four kinds of evidence, in rough order of how much they are worth:
 
 | Oracle | What it proves |
 | --- | --- |
 | **RFC 8448** replay | The key schedule, binder chain and record layer produce the RFC's traced bytes exactly — secrets, flights and ServerHello re-encoded byte for byte. |
-| **OpenSSL interop** | `openssl s_client` completes against our server with openssl's own X.509 verifying our certificate; our client completes against `openssl s_server -rev` and opens the echo it seals back. |
+| **OpenSSL interop** | Three legs. `openssl s_client` completes against our server, with openssl's own X.509 verifying our certificate. Our client completes against `openssl s_server -rev` and opens the echo it seals back — twice, once against an ECDSA certificate and once against an RSA-2048 one openssl mints on the spot, since those are different verification paths. Each client leg asserts the leaf key type it meant to exercise, so the RSA leg cannot quietly pass on an ECDSA certificate, and both drive the `chain_verifier` seam and assert it saw the chain. |
 | **`std.crypto.tls`** | A second independent implementation completes a full in-memory handshake, in both directions, and exchanges data. |
 | **Fuzzing** | Nine targets over every parser and both state machines: arbitrary peer bytes yield a value or an error, never a panic. |
 
@@ -251,7 +253,7 @@ what it refuses, and why that is the highest-value work left.
 zig build test                          # the suite
 zig build test -Doptimize=ReleaseSafe   # the mode releases ship
 zig build interop                       # against a real openssl binary
-zig fmt --check src interop build.zig build.zig.zon
+zig fmt --check src interop scripts build.zig build.zig.zon
 ```
 
 RFC 8448 vectors are generated, never transcribed:
