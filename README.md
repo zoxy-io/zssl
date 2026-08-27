@@ -242,3 +242,16 @@ RFC 8448 vectors are generated, never transcribed:
 
 [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) is the style contract the tree
 is held to.
+
+## License
+
+zssl is [MIT](LICENSE) © 2026 Vsevolod Strukchinsky.
+
+Two things it carries that are not:
+
+- **OpenSSL** (Apache-2.0) is compiled into any binary that links zssl,
+  so that binary has to carry Apache-2.0's notice and attribution. This
+  is an obligation on whoever ships the binary, not on zssl's source.
+- **`src/rfc8448_vectors.zig`** is generated from the text of RFC 8448,
+  which is IETF Trust material. The generator is in `scripts/`, so the
+  provenance of every byte is reproducible rather than asserted.

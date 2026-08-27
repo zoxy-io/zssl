@@ -21,7 +21,11 @@
             .hash = "openssl-3.5.7-TC9C3eDUfwH9TWFR4TWTjcA8oCo_VrNIqg20l63i8uZF",
         },
     },
+    // LICENSE ships with the package: MIT asks that the notice travel
+    // with copies, and a consumer's `zig fetch` gets only what is listed
+    // here.
     .paths = .{
+        "LICENSE",
         "build.zig",
         "build.zig.zon",
         "src",
