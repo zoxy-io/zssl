@@ -44,20 +44,26 @@ const http_response =
 /// it is a peer that has stopped making progress.
 const records_per_phase_max: u32 = 4096;
 
-/// How long one connection may go without sending anything. Generous for
-/// a loopback conversation, short enough that a deliberately abandoned
-/// one does not hold the listener.
-const read_timeout_s: i32 = 5;
+/// How long one conversation may take. Generous for a loopback
+/// exchange, short enough that a deliberately abandoned one does not
+/// hold the listener.
+const connection_budget_ns: u64 = 5 * std.time.ns_per_s;
 
-fn setReceiveTimeout(stream: Io.net.Stream, seconds: i32) !void {
-    assert(seconds >= 1);
-    const timeout: std.posix.timeval = .{ .sec = seconds, .usec = 0 };
-    try std.posix.setsockopt(
-        stream.socket.handle,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVTIMEO,
-        std.mem.asBytes(&timeout),
-    );
+/// Bound a connection by shutting its socket down from a concurrent
+/// task, not with `SO_RCVTIMEO`.
+///
+/// The socket option is the obvious answer and it is wrong here: it
+/// makes `read` return EAGAIN, and `std.Io.Threaded` treats EAGAIN on a
+/// socket it believes is blocking as a programmer bug and panics. This
+/// harness did exactly that, and took the listener down mid-sweep.
+///
+/// Shutting the socket down instead makes the blocked read return
+/// end-of-stream, which is a case every path here already handles — a
+/// peer that stopped talking and a peer that hung up look the same, and
+/// for a test harness they should.
+fn connectionWatchdog(io: Io, stream: Io.net.Stream) void {
+    io.sleep(Io.Duration.fromNanoseconds(connection_budget_ns), .awake) catch return;
+    stream.shutdown(io, .both) catch {};
 }
 
 /// The identity we issue tickets under. Opaque to the protocol; sealing
@@ -101,16 +107,19 @@ pub fn main(init: std.process.Init) !u8 {
     var served: u64 = 0;
     while (true) : (served += 1) {
         const stream = listener.accept(io) catch continue;
-        // A receive deadline, because this listener is sequential and a
-        // client that stops talking without closing would otherwise hold
-        // the accept loop forever — starving every later script rather
-        // than failing one conversation. tlsfuzzer's abort cases do
-        // exactly that on purpose, so this is a requirement and not a
-        // precaution.
-        setReceiveTimeout(stream, read_timeout_s) catch {};
+        // A deadline, because this listener is sequential and a client
+        // that stops talking without closing would otherwise hold the
+        // accept loop forever — starving every later script rather than
+        // failing one conversation. tlsfuzzer's abort cases do that on
+        // purpose, so this is a requirement and not a precaution.
+        var guard: Io.Group = .init;
+        guard.concurrent(io, connectionWatchdog, .{ io, stream }) catch {};
         // Every outcome is per-connection. A conversation the peer meant
         // to fail is the common case here, not the exception.
         serve(io, stream, &credentials, &options, &store) catch {};
+        // Cancel before closing: the watchdog holds the same socket, and
+        // a shutdown racing a close is a use-after-close.
+        guard.cancel(io);
         stream.close(io);
     }
 }

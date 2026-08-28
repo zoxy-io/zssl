@@ -29,13 +29,13 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
   case the runner ran and we did not satisfy, *and* on a passing count
   below the floor in `bogo/run.zig` — that floor is what stops a
   `config.json` suppression from being silent. See docs/BOGO.md.
+- `zig build tlsfuzzer` — the second adversarial gate: tlsfuzzer's
+  scripts against `tlsfuzzer/server.zig`, at the commit pinned in
+  `tlsfuzzer/run.zig`. Exits 2 as a readable SKIP with no python3 (or no
+  network on a cold run). Fails on any script it ran and did not satisfy,
+  and on a passing count below the floor. See docs/TLSFUZZER.md.
 - `zig fmt --check src interop bogo tlsfuzzer scripts build.zig
   build.zig.zon` — format gate.
-`zig build tlsfuzzer-server` is **not** a gate — it is the server under
-test for tlsfuzzer, driven by hand. docs/TLSFUZZER.md records why there
-is no gate yet and what unlocks one; do not add a badge or a CI job for
-it before that lands.
-
 - Run the `tiger-style-reviewer` agent on the working diff before
   committing a slice (same rule as zoxy). Point it at the
   security-critical paths of the diff by name; reachable assertions on
@@ -78,7 +78,12 @@ it before that lands.
   that this only renders while the repository is public — a private repo
   needs `raw.githubusercontent.com` auth, and the badge would have to go
   static like the BoGo pair.
-- The two BoGo badges in README.md are static and carry the same numbers
+- `tlsfuzzer/scripts.json` is the same kind of ledger as
+  `bogo/config.json`, with one difference that matters: 31 of its entries
+  say "not yet triaged", and the gate counts and prints them. That number
+  should go *down*. Never add a new untriaged entry when the cause is
+  known, and never let the count grow to make a pin bump green.
+- The BoGo and tlsfuzzer badges in README.md are static and carry the same numbers
   as `passing_floor` and the decline count. They move in the same commit
   the floor does; a badge that disagrees with the gate is worse than no
   badge. They are a pair on purpose — the passing figure alone reads as

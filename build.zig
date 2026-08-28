@@ -122,6 +122,24 @@ pub fn build(b: *std.Build) void {
         .name = "zssl-tlsfuzzer-server",
         .root_module = tlsfuzzer_server_module,
     });
+    const tlsfuzzer_module = b.createModule(.{
+        .root_source_file = b.path("tlsfuzzer/run.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const tlsfuzzer_exe = b.addExecutable(.{
+        .name = "zssl-tlsfuzzer",
+        .root_module = tlsfuzzer_module,
+    });
+    const tlsfuzzer_run = b.addRunArtifact(tlsfuzzer_exe);
+    tlsfuzzer_run.has_side_effects = true;
+    tlsfuzzer_run.addArg("--server");
+    tlsfuzzer_run.addArtifactArg(tlsfuzzer_server);
+    tlsfuzzer_run.addArg("--config");
+    tlsfuzzer_run.addFileArg(b.path("tlsfuzzer/scripts.json"));
+    const tlsfuzzer_step = b.step("tlsfuzzer", "Adversarial gate: tlsfuzzer's scripts against our server");
+    tlsfuzzer_step.dependOn(&tlsfuzzer_run.step);
+
     const tlsfuzzer_server_step = b.step(
         "tlsfuzzer-server",
         "Run the tlsfuzzer server harness on its own (for manual scripts)",

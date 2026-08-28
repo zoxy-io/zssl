@@ -1,0 +1,71 @@
+{
+  "Run": [
+    {
+      "name": "test-tls13-connection-abort.py"
+    },
+    {
+      "name": "test-tls13-conversation.py"
+    },
+    {
+      "name": "test-tls13-minerva.py"
+    },
+    {
+      "name": "test-tls13-unencrypted-alert.py"
+    }
+  ],
+  "Disabled": {
+    "test-tls13-0rtt-garbage.py": "0-RTT: deferred pending a replay analysis (DESIGN.md §1).",
+    "test-tls13-ccs.py": "Runs against the harness and fails 5 of 5 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-certificate-compression.py": "Compressed certificates: not implemented.",
+    "test-tls13-certificate-request.py": "Client certificates: out of scope permanently (DESIGN.md §1).",
+    "test-tls13-certificate-verify.py": "Client certificates: out of scope permanently (DESIGN.md §1).",
+    "test-tls13-client-certificate-compression.py": "Client certificates: out of scope permanently (DESIGN.md §1).",
+    "test-tls13-count-tickets.py": "Runs against the harness and fails 3 of 3 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-crfg-curves.py": "Groups outside x25519/secp256r1/secp384r1 (DESIGN.md §1).",
+    "test-tls13-dhe-shared-secret-padding.py": "Finite-field DHE: zssl does elliptic-curve key exchange only (DESIGN.md §1).",
+    "test-tls13-ecdhe-brainpool-curves.py": "Brainpool curves: outside the group policy (DESIGN.md §1).",
+    "test-tls13-ecdhe-curves.py": "Runs against the harness and fails 12 of 33 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-ecdsa-brainpool-in-certificate-verify.py": "Client certificates: out of scope permanently (DESIGN.md §1).",
+    "test-tls13-ecdsa-in-certificate-verify.py": "Client certificates: out of scope permanently (DESIGN.md §1).",
+    "test-tls13-ecdsa-support.py": "Runs against the harness and fails 5 of 10 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-eddsa-in-certificate-verify.py": "Client certificates: out of scope permanently (DESIGN.md §1).",
+    "test-tls13-eddsa.py": "Ed25519/Ed448: outside the signature policy (DESIGN.md §1).",
+    "test-tls13-empty-alert.py": "Runs against the harness and fails 10 of 10 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-ffdhe-groups.py": "Finite-field DHE: zssl does elliptic-curve key exchange only (DESIGN.md §1).",
+    "test-tls13-ffdhe-sanity.py": "Finite-field DHE: zssl does elliptic-curve key exchange only (DESIGN.md §1).",
+    "test-tls13-finished-plaintext.py": "Runs against the harness and fails 3 of 3 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-finished.py": "Runs against the harness and fails 42 of 42 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-hrr.py": "HelloRetryRequest: the server only ever asks for a group it holds (DESIGN.md §6).",
+    "test-tls13-invalid-ciphers.py": "Runs against the harness and fails 23 of 52 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-keyshare-omitted.py": "Runs against the harness and fails 3 of 5 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-keyupdate-from-server.py": "Runs against the harness and fails 3 of 3 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-keyupdate.py": "Runs against the harness and fails 62 of 62 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-large-number-of-extensions.py": "Runs against the harness and fails 22 of 22 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-legacy-version.py": "Runs against the harness and fails 10 of 10 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-lengths.py": "Runs against the harness and fails 1000 of 1002 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-mldsa-in-certificate-verify.py": "Client certificates: out of scope permanently (DESIGN.md §1).",
+    "test-tls13-mlkem.py": "ML-KEM: post-quantum key exchange, not implemented (DESIGN.md §1).",
+    "test-tls13-multiple-ccs-messages.py": "Runs against the harness and fails 4 of 7 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-no-unknown-groups.py": "Groups outside x25519/secp256r1/secp384r1 (DESIGN.md §1).",
+    "test-tls13-nociphers.py": "Runs against the harness and fails 2 of 3 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-non-support.py": "Runs against the harness and fails 53 of 53 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-obsolete-curves.py": "Groups outside x25519/secp256r1/secp384r1 (DESIGN.md §1).",
+    "test-tls13-pkcs-signature.py": "Runs against the harness and fails 2 of 8 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-post-handshake-auth.py": "Client certificates: out of scope permanently (DESIGN.md §1).",
+    "test-tls13-psk_dhe_ke.py": "Runs against the harness and fails 4 of 4 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-psk_ke.py": "psk_ke without (EC)DHE is never accepted (DESIGN.md §6, slice 3).",
+    "test-tls13-record-layer-limits.py": "Runs against the harness and fails 67 of 68 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-record-padding.py": "Runs against the harness and fails 4 of 4 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-rsa-signatures.py": "Runs against the harness and fails 5 of 8 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-rsapss-signatures.py": "Runs against the harness and fails 5 of 8 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-serverhello-random.py": "Runs against the harness and fails 256 of 256 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-session-resumption.py": "Runs against the harness and fails 7 of 7 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-shuffled-extentions.py": "Runs against the harness and fails 19 of 19 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-signature-algorithms.py": "Runs against the harness and fails 12 of 102 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-symetric-ciphers.py": "Runs against the harness and fails 102 of 102 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-unrecognised-groups.py": "Groups outside x25519/secp256r1/secp384r1 (DESIGN.md §1).",
+    "test-tls13-version-negotiation.py": "Runs against the harness and fails 201 of 202 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-zero-content-type.py": "Runs against the harness and fails 4 of 8 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-zero-length-data.py": "Runs against the harness and fails 8 of 11 conversations; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md"
+  }
+}

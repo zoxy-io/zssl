@@ -245,22 +245,26 @@ Everything above is argued in [docs/DESIGN.md](docs/DESIGN.md) §1.
 ## Testing
 
 `zig build test` runs the unit suite; `zig build interop` runs the
-real-OpenSSL gate; `zig build bogo` runs BoringSSL's adversarial one.
-Five kinds of evidence, in rough order of how much they are worth:
+real-OpenSSL gate; `zig build bogo` and `zig build tlsfuzzer` run the two
+adversarial ones. Six kinds of evidence, in rough order of how much they
+are worth:
 
 [![bogo passing](https://img.shields.io/badge/bogo-231%20passing-brightgreen)](docs/BOGO.md)
 [![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers)
+[![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-4%2F57%20scripts-yellow)](docs/TLSFUZZER.md)
 
-Those two badges are deliberately a pair, and they live here rather than
-in the header because they need this table beside them. A single "221
-passing" would read as a coverage claim, and 6965 cases were never run at
-all — the second badge is there so the first cannot be quoted alone. Both
-are static, and move in the same commit as `passing_floor` in
-`bogo/run.zig`.
+The BoGo badges are deliberately a pair, and they live here rather than
+in the header because they need this table beside them. A single "231
+passing" would read as a coverage claim, and 6918 cases were never run at
+all — the second badge is there so the first cannot be quoted alone. The
+tlsfuzzer badge carries its denominator for the same reason: 4 of 57
+scripts is the honest shape of that gate today. All three are static, and
+move in the same commit as the floors they report.
 
 | Oracle | What it proves |
 | --- | --- |
 | **BoGo** | BoringSSL's own hostile-peer runner, at a pinned commit, drives `bogo/shim.zig` through the corpus and checks not only that we refuse but *which alert we send*. 231 cases pass (121 client, 110 server), 0 fail, 6918 are declined by the shim as out of scope, and 745 are suppressed by name with a one-line reason each. A floor on the passing count is what stops a suppression from being quiet. |
+| **tlsfuzzer** | A third implementation — Python over tlslite-ng — driving our *server* through scripted conversations, at a pinned commit. 4 of 57 TLS 1.3 scripts run and pass, 160 conversations between them, 150 of those aborting the connection at every point in the handshake. 53 scripts are disabled and 31 of those are not yet triaged: a debt the gate prints on every run rather than burying. |
 | **RFC 8448** replay | The key schedule, binder chain and record layer produce the RFC's traced bytes exactly — secrets, flights and ServerHello re-encoded byte for byte. |
 | **OpenSSL interop** | Three legs. `openssl s_client` completes against our server, with openssl's own X.509 verifying our certificate. Our client completes against `openssl s_server -rev` and opens the echo it seals back — twice, once against an ECDSA certificate and once against an RSA-2048 one openssl mints on the spot, since those are different verification paths. Each client leg asserts the leaf key type it meant to exercise, so the RSA leg cannot quietly pass on an ECDSA certificate, and both drive the `chain_verifier` seam and assert it saw the chain. |
 | **`std.crypto.tls`** | A second independent implementation completes a full in-memory handshake, in both directions, and exchanges data. |
@@ -275,12 +279,10 @@ larger than what it ran — 6918 cases against 231 — and the twelve
 laxities it did find are still open. [docs/BOGO.md](docs/BOGO.md) has
 both, by name.
 
-A second adversarial client, [tlsfuzzer](https://github.com/tlsfuzzer/tlsfuzzer),
-has a working server harness (`zig build tlsfuzzer-server`) but **no
-gate**: 48 of its 57 TLS 1.3 scripts hardcode secp256r1, which zssl does
-not offer, so a gate today would cover one script.
-[docs/TLSFUZZER.md](docs/TLSFUZZER.md) measures that and says what
-unlocks it.
+tlsfuzzer's gate is thinner still and says so: 4 of 57 scripts run, and
+31 of the 53 disabled ones are not yet triaged into a scope decision or a
+defect. [docs/TLSFUZZER.md](docs/TLSFUZZER.md) carries that debt in the
+open, and the gate prints it on every run.
 
 ## Development
 
@@ -289,7 +291,8 @@ zig build test                          # the suite
 zig build test -Doptimize=ReleaseSafe   # the mode releases ship
 zig build interop                       # against a real openssl binary
 zig build bogo                          # against BoringSSL's BoGo runner
-zig build tlsfuzzer-server -- --port 4433   # server under test for tlsfuzzer
+zig build tlsfuzzer                     # against tlsfuzzer's scripts
+zig build tlsfuzzer-server -- --port 4433   # that server alone, to hand-drive
 zig build coverage                      # line coverage, needs kcov (Linux)
 zig fmt --check src interop bogo tlsfuzzer scripts build.zig build.zig.zon
 ```
