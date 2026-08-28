@@ -40,7 +40,7 @@ const records_per_phase_max: u32 = 4096;
 /// How long one conversation may take. Generous for a loopback
 /// exchange, short enough that a deliberately abandoned one does not
 /// hold the listener.
-const connection_budget_ns: u64 = 5 * std.time.ns_per_s;
+const connection_budget_default_s: u64 = 5;
 
 /// Bound a connection by shutting its socket down from a concurrent
 /// task, not with `SO_RCVTIMEO`.
@@ -54,8 +54,9 @@ const connection_budget_ns: u64 = 5 * std.time.ns_per_s;
 /// end-of-stream, which is a case every path here already handles — a
 /// peer that stopped talking and a peer that hung up look the same, and
 /// for a test harness they should.
-fn connectionWatchdog(io: Io, stream: Io.net.Stream) void {
-    io.sleep(Io.Duration.fromNanoseconds(connection_budget_ns), .awake) catch return;
+fn connectionWatchdog(io: Io, stream: Io.net.Stream, budget_ns: u64) void {
+    assert(budget_ns >= std.time.ns_per_s);
+    io.sleep(Io.Duration.fromNanoseconds(budget_ns), .awake) catch return;
     stream.shutdown(io, .both) catch {};
 }
 
@@ -77,6 +78,14 @@ const Options = struct {
     /// NewSessionTickets to issue per connection. Zero is a legitimate
     /// configuration and some scripts ask for exactly that.
     tickets: u8 = 1,
+    /// Seconds one conversation may take. Five is right for tlsfuzzer,
+    /// whose scripts are fast and whose abort cases *need* a short
+    /// deadline to keep a sequential listener from starving. TLS-Anvil
+    /// needs longer: it is a JVM driving combinatorial cases, and under
+    /// amd64 emulation a single KeyUpdate conversation can outlast five
+    /// seconds — which arrives as "Socket was closed" and reads exactly
+    /// like a protocol failure.
+    connection_budget_s: u64 = connection_budget_default_s,
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -89,6 +98,10 @@ pub fn main(init: std.process.Init) !u8 {
     var credentials = try Credentials.load(cert_pem, key_pem, &chain_storage, false);
     defer credentials.deinit();
 
+    // Computed once and handed to each watchdog, rather than parked in
+    // a global: the task already takes arguments, so it does not need
+    // one.
+    const budget_ns = options.connection_budget_s * std.time.ns_per_s;
     var address: Io.net.IpAddress = .{ .ip4 = .loopback(options.port) };
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
@@ -106,7 +119,7 @@ pub fn main(init: std.process.Init) !u8 {
         // failing one conversation. tlsfuzzer's abort cases do that on
         // purpose, so this is a requirement and not a precaution.
         var guard: Io.Group = .init;
-        guard.concurrent(io, connectionWatchdog, .{ io, stream }) catch {};
+        guard.concurrent(io, connectionWatchdog, .{ io, stream, budget_ns }) catch {};
         // Every outcome is per-connection. A conversation the peer meant
         // to fail is the common case here, not the exception.
         serve(io, stream, &credentials, &options, &store) catch {};
@@ -132,6 +145,9 @@ fn parseArguments(init: std.process.Init, arena: std.mem.Allocator) !Options {
             options.key_path = value;
         } else if (std.mem.eql(u8, argument, "--alpn")) {
             options.alpn = value;
+        } else if (std.mem.eql(u8, argument, "--connection-budget-s")) {
+            options.connection_budget_s = std.fmt.parseInt(u64, value, 10) catch return error.BadFlagValue;
+            if (options.connection_budget_s == 0) return error.BadFlagValue;
         } else if (std.mem.eql(u8, argument, "--tickets")) {
             options.tickets = std.fmt.parseInt(u8, value, 10) catch return error.BadFlagValue;
         } else {

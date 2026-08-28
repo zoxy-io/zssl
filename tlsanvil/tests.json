@@ -1,0 +1,5 @@
+{
+  "Disabled": {
+    "de.rub.nds.tlstest.suite.tests.server.tls13.rfc8446.ClientHello.invalidLegacyVersion_ssl30": "Stricter than §4.2.1, deliberately: with supported_versions present a server 'MUST NOT use the ClientHello.legacy_version value' and MUST use only that extension. Aborting is a MAY, and only for legacy_version 0x0304 or later. zssl enforced a legacy version field once already and it refused real clients sending 0x0300 — docs/BOGO.md, finding 4."
+  }
+}

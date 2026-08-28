@@ -1,0 +1,48 @@
+name: tlsanvil
+
+# TLS-Anvil's RFC-derived corpus against our server, in a container.
+#
+# `paths-ignore` where the other gates have none: this is the slowest of
+# them by a wide margin, and a README edit has no way to change what a
+# TLS corpus finds. If this ever becomes a required status check, note
+# that a skipped job reports as pending rather than passing and will
+# block a merge — a no-op companion job is the usual answer.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - 'CLAUDE.md'
+  pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - 'CLAUDE.md'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tlsanvil:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/zig
+      # Deliberately not `|| [ $? -eq 2 ]`: exit 2 means no reachable
+      # Docker daemon, and ubuntu-latest has one. A 2 here is
+      # infrastructure failing, and swallowing it would turn the gate off
+      # silently.
+      - name: tlsanvil
+        run: zig build tlsanvil
+      - name: upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlsanvil-report
+          path: |
+            zig-out/tlsanvil/tlsanvil.log
+            zig-out/tlsanvil/results/report.json
+            zig-out/tlsanvil/results/result_map.json
+          if-no-files-found: ignore

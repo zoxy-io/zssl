@@ -200,8 +200,29 @@ pub fn handleRecord(self: *ServerHandshake, wire_record: []const u8, out: []u8) 
     }
     switch (header.content_type) {
         .change_cipher_spec => {
-            // §5, D.4: a compatibility CCS is ignored wherever it lands —
-            // but "ignored" is not "unbounded".
+            // §5 bounds the window, and the comment here used to say
+            // "ignored wherever it lands", which is not what it says:
+            //
+            //   An implementation may receive an unencrypted record of
+            //   type change_cipher_spec ... at any time after the first
+            //   ClientHello message has been sent or received and before
+            //   the peer's Finished message has been received and MUST
+            //   simply drop it ... If an implementation detects a
+            //   change_cipher_spec record received before the first
+            //   ClientHello message or after the peer's Finished
+            //   message, it MUST be treated as an unexpected record type.
+            //
+            // Outside that window it is unexpected_message, and the
+            // count still bounds it inside. TLS-Anvil found this, and
+            // only after a harness deadline stopped hiding it: the
+            // connection used to close on its own before the corpus
+            // could see that we had accepted the record.
+            if (self.state == .awaiting_client_hello) return error.UnexpectedMessage;
+            // `.closed` counts as after it too: the only way to reach
+            // that state from a protected close_notify is with the
+            // peer's Finished already behind us, and a machine in it
+            // may still be fed records.
+            if (self.state == .connected or self.state == .closed) return error.UnexpectedMessage;
             if (self.ccs_seen == ccs_seen_max) return error.UnexpectedMessage;
             self.ccs_seen += 1;
             return .none;

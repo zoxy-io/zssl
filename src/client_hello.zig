@@ -172,7 +172,12 @@ pub const ClientHello = struct {
         const data = self.psk_modes_wire orelse return false;
         var cursor = Cursor.init(data);
         const list_bytes = cursor.takeByte() catch return false;
-        if (list_bytes != cursor.remaining()) return false;
+        // Guaranteed by the framing check at parse: `psk_modes_wire` is
+        // only set for a body whose length byte accounts for exactly the
+        // bytes after it. Silently answering "no mode offered" for a
+        // mismatch is the bug that check exists to fix, so this states
+        // the invariant instead of re-tolerating it.
+        assert(list_bytes == cursor.remaining());
         var index: u16 = 0;
         while (cursor.remaining() > 0) : (index += 1) {
             assert(index < 256); // A u8 list length bounds this structurally.
@@ -336,6 +341,13 @@ fn applyExtension(extension_type: u16, data: []const u8, hello: *ClientHello) Er
         },
         extension_psk_key_exchange_modes => {
             if (data.len < 2) return error.MalformedExtension;
+            // §4.2.9's grammar is `psk_key_exchange_modes<1..255>`: one
+            // length byte, accounting for exactly the bytes after it.
+            // Checked here rather than left to `offersPskDheKe`, which
+            // read a disagreeing length as "no mode offered" and let a
+            // malformed hello through as an ordinary handshake. TLS-Anvil
+            // sends the length one short of its contents.
+            if (data[0] != data.len - 1) return error.MalformedExtension;
             hello.psk_modes_wire = data;
         },
         extension_pre_shared_key => {

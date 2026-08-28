@@ -986,3 +986,90 @@ test "an empty application_data record is refused, not asserted away" {
         harness.server.handleRecord(&empty, &buffers.server_out),
     );
 }
+
+test "§5: a ChangeCipherSpec outside its window is unexpected_message" {
+    // "An implementation may receive an unencrypted record of type
+    // change_cipher_spec ... at any time after the first ClientHello
+    // message has been sent or received and before the peer's Finished
+    // message has been received and MUST simply drop it ... If an
+    // implementation detects a change_cipher_spec record received before
+    // the first ClientHello message or after the peer's Finished
+    // message, it MUST be treated as an unexpected record type."
+    //
+    // zssl dropped it wherever it landed. TLS-Anvil's
+    // `sendLegacyChangeCipherSpecAfterFinished` is the case, and it only
+    // became visible once the harness stopped closing the connection on
+    // a deadline before the corpus could tell.
+    var buffers: Buffers = .{};
+    var ccs: [record.header_bytes + 1]u8 = undefined;
+    record.writeHeader(
+        .{ .content_type = .change_cipher_spec, .length = 1 },
+        ccs[0..record.header_bytes],
+    );
+    ccs[record.header_bytes] = 0x01;
+
+    // After the peer's Finished, on both machines.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        try harness.connect(&buffers);
+        try testing.expectError(
+            error.UnexpectedMessage,
+            harness.server.handleRecord(&ccs, &buffers.server_out),
+        );
+    }
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        try harness.connect(&buffers);
+        try testing.expectError(
+            error.UnexpectedMessage,
+            harness.client.handleRecord(&ccs, &buffers.scratch),
+        );
+    }
+
+    // And after a close_notify that itself arrived post-Finished: the
+    // machine is `closed` rather than `connected`, may still be fed, and
+    // is unambiguously past the peer's Finished. The first version of
+    // this fix checked only `connected` and let this through.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        try harness.connect(&buffers);
+        const bye = harness.client.sendAlert(.close_notify, &buffers.client_out);
+        const event = try harness.server.handleRecord(bye, &buffers.server_out);
+        try testing.expectEqual(std.meta.activeTag(event), .closed);
+        try testing.expectEqual(ServerHandshake.State.closed, harness.server.state);
+        try testing.expectError(
+            error.UnexpectedMessage,
+            harness.server.handleRecord(&ccs, &buffers.server_out),
+        );
+    }
+
+    // Before the first ClientHello, which the server can tell apart.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        try testing.expectError(
+            error.UnexpectedMessage,
+            harness.server.handleRecord(&ccs, &buffers.server_out),
+        );
+    }
+
+    // Inside the window it is still dropped — D.4's compatibility record
+    // is the reason this is tolerated at all, and breaking that would
+    // trade one interop failure for another.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        const hello = harness.client.start(&buffers.client_out);
+        _ = try harness.server.handleRecord(hello, &buffers.server_out);
+        const event = try harness.server.handleRecord(&ccs, &buffers.server_out);
+        try testing.expectEqual(std.meta.activeTag(event), .none);
+    }
+}

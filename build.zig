@@ -200,6 +200,28 @@ pub fn build(b: *std.Build) void {
     const tlsfuzzer_step = b.step("tlsfuzzer", "Adversarial gate: tlsfuzzer's scripts against our server");
     tlsfuzzer_step.dependOn(&tlsfuzzer_run.step);
 
+    // The third adversarial gate: TLS-Anvil's RFC-derived corpus, in a
+    // container, against the same server harness tlsfuzzer drives. It
+    // reuses that harness rather than growing a third one — see
+    // tlsanvil/run.zig.
+    const tlsanvil_module = b.createModule(.{
+        .root_source_file = b.path("tlsanvil/run.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const tlsanvil_exe = b.addExecutable(.{
+        .name = "zssl-tlsanvil",
+        .root_module = tlsanvil_module,
+    });
+    const tlsanvil_run = b.addRunArtifact(tlsanvil_exe);
+    tlsanvil_run.has_side_effects = true;
+    tlsanvil_run.addArg("--server");
+    tlsanvil_run.addArtifactArg(tlsfuzzer_server);
+    tlsanvil_run.addArg("--config");
+    tlsanvil_run.addFileArg(b.path("tlsanvil/tests.json"));
+    const tlsanvil_step = b.step("tlsanvil", "Adversarial gate: TLS-Anvil's RFC corpus against our server");
+    tlsanvil_step.dependOn(&tlsanvil_run.step);
+
     const tlsfuzzer_server_step = b.step(
         "tlsfuzzer-server",
         "Run the tlsfuzzer server harness on its own (for manual scripts)",

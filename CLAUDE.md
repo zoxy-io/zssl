@@ -34,7 +34,15 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
   `tlsfuzzer/run.zig`. Exits 2 as a readable SKIP with no python3 (or no
   network on a cold run). Fails on any script it ran and did not satisfy,
   and on a passing count below the floor. See docs/TLSFUZZER.md.
-- `zig fmt --check src interop bogo tlsfuzzer scripts build.zig
+- `zig build tlsanvil` — the third adversarial gate: TLS-Anvil's
+  RFC-derived corpus against the same `tlsfuzzer/server.zig` harness, at
+  the image digest pinned in `tlsanvil/run.zig`. Exits 2 as a readable
+  SKIP with no reachable Docker daemon. Fails on any test it ran and did
+  not satisfy, on a passing count below the floor, and — distinctly, and
+  before the counts — when the harness died mid-run, because a corpus
+  that ran against a corpse reports a low number that looks exactly like
+  a corpus that refused us. See docs/TLSANVIL.md.
+- `zig fmt --check src interop bogo tlsanvil tlsfuzzer scripts build.zig
   build.zig.zon` — format gate.
 - Run the `tiger-style-reviewer` agent on the working diff before
   committing a slice (same rule as zoxy). Its definition lives in
@@ -70,6 +78,14 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
   family removed it. Do not add backends.
 - Test fixtures in `src/testdata/` are throwaway self-signed material
   shared with zoxy's `src/tls/testdata/`; never real credentials.
+- `tlsanvil/tests.json` is the third ledger, and keys on `<class>.<method>`
+  rather than on TLS-Anvil's own test ids. Those ids are **not stable**:
+  the same corpus produced different ids for the same failures across two
+  runs of a changed tree, so a ledger keyed on them would silently stop
+  matching. Class and method are Java identifiers and do not move.
+  Separately, 321 of the 437 tests disable *themselves* against a
+  TLS 1.3-only server, so that count comes from the tool and is not ours
+  to maintain.
 - `bogo/config.json` is a **ledger**: every `DisabledTests` entry carries
   a one-line reason, and one that reads "OPEN GAP" points at a numbered
   finding in docs/BOGO.md. Never add an entry without a reason, and never
