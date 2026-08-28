@@ -50,6 +50,37 @@ pub const Alert = struct {
     }
 };
 
+/// What §6.1 says to do with an alert that arrived, decided in one place
+/// because both handshakes decide it identically.
+pub const Disposition = enum {
+    /// close_notify: the peer is done sending. §6.1.
+    close,
+    /// A warning-level `user_canceled`. TLS 1.3 meant to remove warning
+    /// alerts and left this one defined without saying how to handle it,
+    /// and JDK 11 sends it after the handshake as a full-duplex close
+    /// signal. Ignoring it is what BoringSSL, NSS and OpenSSL all do, so
+    /// refusing would break real peers — but it is still free work a
+    /// peer can ask for, which is why the caller counts it.
+    ignore,
+    /// Any other warning-level alert. TLS 1.3 has no meaning for one, and
+    /// §6.2's decode_error is the answer BoringSSL gives.
+    refuse,
+    /// Fatal, or a description we do not name: the connection is over.
+    /// §6 makes every alert but the two above fatal anyway.
+    peer_fatal,
+};
+
+pub fn disposition(self: Alert) Disposition {
+    assert(self.level_wire == 1 or self.level_wire == 2);
+    // Checked on the description rather than the level, matching the
+    // file comment: in 1.3 a close_notify is a close whatever level byte
+    // rode with it.
+    if (self.isCloseNotify()) return .close;
+    if (self.level_wire != @intFromEnum(Level.warning)) return .peer_fatal;
+    if (self.description_wire == @intFromEnum(Description.user_canceled)) return .ignore;
+    return .refuse;
+}
+
 pub fn encode(description: Description) [bytes]u8 {
     const level: Level = if (description == .close_notify or description == .user_canceled)
         .warning
@@ -61,10 +92,45 @@ pub fn encode(description: Description) [bytes]u8 {
 
 pub const ParseError = error{MalformedAlert};
 
+pub const Error = ParseError || error{
+    /// A warning-level alert TLS 1.3 gives no meaning to — anything but
+    /// close_notify and user_canceled. Well-formed, so not
+    /// `MalformedAlert`; §6.2's decode_error is what goes back, which is
+    /// also what BoringSSL's `:BAD_ALERT:` carries.
+    BadAlert,
+};
+
 pub fn parse(payload: []const u8) ParseError!Alert {
     if (payload.len != bytes) return error.MalformedAlert;
     if (payload[0] != 1 and payload[0] != 2) return error.MalformedAlert;
     return .{ .level_wire = payload[0], .description_wire = payload[1] };
+}
+
+test "disposition sorts an alert four ways, and the order is the point" {
+    // The two that survive.
+    try std.testing.expectEqual(Disposition.close, disposition(try parse(&.{ 1, 0 })));
+    try std.testing.expectEqual(Disposition.ignore, disposition(try parse(&.{ 1, 90 })));
+
+    // A warning level TLS 1.3 gives no meaning to. Not malformed —
+    // understood, and declined.
+    try std.testing.expectEqual(Disposition.refuse, disposition(try parse(&.{ 1, 40 })));
+    try std.testing.expectEqual(Disposition.refuse, disposition(try parse(&.{ 1, 116 })));
+
+    // Ordinary fatal alerts, named and unnamed.
+    try std.testing.expectEqual(Disposition.peer_fatal, disposition(try parse(&.{ 2, 40 })));
+    try std.testing.expectEqual(Disposition.peer_fatal, disposition(try parse(&.{ 2, 116 })));
+
+    // The two orderings that carry the security of this function.
+    //
+    // `user_canceled` is tolerated *because* it is a warning. At fatal
+    // level the peer is aborting, and reading that as "ignore" would let
+    // a peer's abort be silently discarded — so the level check comes
+    // before the description check.
+    try std.testing.expectEqual(Disposition.peer_fatal, disposition(try parse(&.{ 2, 90 })));
+    // close_notify is decided on the description alone, matching the
+    // file comment. A fatal-level close_notify is still a close, and
+    // this pins that it does not fall through to `peer_fatal`.
+    try std.testing.expectEqual(Disposition.close, disposition(try parse(&.{ 2, 0 })));
 }
 
 test "close_notify round-trips and unknown descriptions stay readable" {

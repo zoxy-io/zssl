@@ -14,6 +14,7 @@ const Credentials = @import("Credentials.zig");
 const ServerHandshake = @import("ServerHandshake.zig");
 const cipher_suite = @import("cipher_suite.zig");
 const record = @import("record.zig");
+const flood = @import("flood.zig");
 const backend = @import("crypto/backend_openssl.zig");
 const key_schedule = @import("key_schedule.zig");
 const protect = @import("protect.zig");
@@ -1071,5 +1072,107 @@ test "§5: a ChangeCipherSpec outside its window is unexpected_message" {
         _ = try harness.server.handleRecord(hello, &buffers.server_out);
         const event = try harness.server.handleRecord(&ccs, &buffers.server_out);
         try testing.expectEqual(std.meta.activeTag(event), .none);
+    }
+}
+
+test "§6.1: user_canceled is ignored and bounded, other warnings are refused" {
+    // The three dispositions a peer can reach, driven through a real
+    // connection rather than through `alert.disposition` alone. Every
+    // alert here is sealed with the client's genuine session key, so it
+    // arrives at the right sequence number and reaches the handler.
+    const user_canceled = [_]u8{ 1, 90 };
+
+    // Four warning-level user_canceled alerts are ignored — the JDK 11
+    // behaviour §6.1 leaves legal — and the fifth is not, because
+    // ignoring is still work a peer is buying.
+    {
+        var buffers: Buffers = .{};
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        try harness.connect(&buffers);
+        switch (harness.client.ladder.?) {
+            inline else => |*arm| {
+                for (0..flood.warning_alerts_max) |_| {
+                    const sealed = try arm.session.?.send.seal(.alert, &user_canceled, &buffers.client_out);
+                    const event = try harness.server.handleRecord(sealed, &buffers.server_out);
+                    try testing.expectEqual(std.meta.activeTag(event), .none);
+                    try testing.expectEqual(ServerHandshake.State.connected, harness.server.state);
+                }
+                const one_too_many = try arm.session.?.send.seal(.alert, &user_canceled, &buffers.client_out);
+                try testing.expectError(
+                    error.TooManyWarningAlerts,
+                    harness.server.handleRecord(one_too_many, &buffers.server_out),
+                );
+            },
+        }
+    }
+
+    // Application bytes are progress, so the budget comes back. Without
+    // this a long-lived connection would eventually die of alerts it was
+    // told to ignore.
+    {
+        var buffers: Buffers = .{};
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        try harness.connect(&buffers);
+        switch (harness.client.ladder.?) {
+            inline else => |*arm| {
+                for (0..flood.warning_alerts_max) |_| {
+                    const sealed = try arm.session.?.send.seal(.alert, &user_canceled, &buffers.client_out);
+                    _ = try harness.server.handleRecord(sealed, &buffers.server_out);
+                }
+                const data = try arm.session.?.send.seal(.application_data, "hello", &buffers.client_out);
+                const event = try harness.server.handleRecord(data, &buffers.server_out);
+                try testing.expectEqualStrings("hello", event.application_data);
+                // The whole budget again, on the far side of one byte.
+                for (0..flood.warning_alerts_max) |_| {
+                    const sealed = try arm.session.?.send.seal(.alert, &user_canceled, &buffers.client_out);
+                    _ = try harness.server.handleRecord(sealed, &buffers.server_out);
+                }
+            },
+        }
+    }
+
+    // A warning level TLS 1.3 gives no meaning to. `alert.encode` cannot
+    // produce one — it makes everything but close_notify and
+    // user_canceled fatal — so this is what a *peer* can send us and we
+    // cannot send back.
+    {
+        var buffers: Buffers = .{};
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        try harness.connect(&buffers);
+        switch (harness.client.ladder.?) {
+            inline else => |*arm| {
+                const warned = try arm.session.?.send.seal(.alert, &.{ 1, 40 }, &buffers.client_out);
+                try testing.expectError(
+                    error.BadAlert,
+                    harness.server.handleRecord(warned, &buffers.server_out),
+                );
+            },
+        }
+    }
+
+    // The ordering that carries the security of this: user_canceled is
+    // tolerated because it is a *warning*. At fatal level the peer is
+    // aborting, and reading it as "ignore" would discard that.
+    {
+        var buffers: Buffers = .{};
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        try harness.connect(&buffers);
+        switch (harness.client.ladder.?) {
+            inline else => |*arm| {
+                const fatal = try arm.session.?.send.seal(.alert, &.{ 2, 90 }, &buffers.client_out);
+                try testing.expectError(
+                    error.PeerAlert,
+                    harness.server.handleRecord(fatal, &buffers.server_out),
+                );
+            },
+        }
     }
 }

@@ -132,7 +132,7 @@ pub const Event = union(enum) {
 };
 
 pub const Error = backend.SignError || protect.Error || handshake.Assembler.Error ||
-    client_hello.Error || alert.ParseError || error{
+    client_hello.Error || alert.Error || error{
     /// The record or message is legal TLS arriving at the wrong moment.
     UnexpectedMessage,
     /// No common cipher suite, group, or signature scheme (§4.1.1).
@@ -243,11 +243,20 @@ fn handlePlaintextAlert(self: *ServerHandshake, payload: []const u8) Error!Event
     assert(self.state != .failed);
     assert(payload.len >= 1);
     const parsed = try alert.parse(payload);
-    if (parsed.isCloseNotify()) {
-        self.state = .closed;
-        return .closed;
+    switch (alert.disposition(parsed)) {
+        .close => {
+            self.state = .closed;
+            return .closed;
+        },
+        // §6.1's user_canceled, which real peers send and this library
+        // has no use for. Counted, because ignoring is work too.
+        .ignore => {
+            try self.flood_guard.observeWarningAlert();
+            return .none;
+        },
+        .refuse => return error.BadAlert,
+        .peer_fatal => return error.PeerAlert,
     }
-    return error.PeerAlert;
 }
 
 fn handlePlaintextHandshake(self: *ServerHandshake, wire_record: []const u8, out: []u8) Error!Event {

@@ -41,16 +41,17 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**263 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. 136 drive
+**266 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. 139 drive
 `ClientHandshake` and 127 drive `ServerHandshake`. The server number was
 6 until RSA signing landed, 100 until secp256r1/secp384r1 did, 110 until
 §9.2's `missing_extension` did, 111 until §5.4's inner-plaintext cap did,
 113 until eight suppressions turned out to be describing bugs that were
 already fixed, 121 until finding 8 was taken apart, and 124 until
 §4.2.9's psk_key_exchange_modes was enforced. The client number
-was 121 until §4.2's unsupported_extension landed, and 134 until finding
-4's flood ceilings did; see below.
+was 121 until §4.2's unsupported_extension landed, 134 until finding 4's
+flood ceilings did, and 136 until finding 5 stopped refusing
+`user_canceled`; see below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
 either gets fixed or gets an entry in `DisabledTests` with a one-line
@@ -131,10 +132,11 @@ Three bugs, fixed in this slice:
    flight was at least 500 bytes, which a legitimately small ECDSA leaf
    falsifies. The floor is now the encoded chain's own size.
 
-Twelve more were open. Four are fixed outright — 2, 3, 4 and 12 — and
-eight still carry ledger entries, 23 suppressed cases between them. Two
-of those eight are no longer gaps in the sense the word implies: 11 is a
-documented non-defect and 8 is down to two divergences we intend to keep.
+Twelve more were open. Five are fixed outright — 2, 3, 4, 5 and 12 —
+and seven still carry ledger entries, 20 suppressed cases between them.
+Two of those seven are no longer gaps in the sense the word implies: 11
+is a documented non-defect and 8 is down to two divergences we intend to
+keep.
 All twelve keep their numbers rather than being renumbered, because the
 ledger cites them by number.
 
@@ -234,9 +236,32 @@ name.
    `UnexpectedMessage`. Same alert on the wire, different error name, so
    the ErrorMap carries both — which is what that table is for, and the
    reason those two cases are not silently re-suppressed.
-5. **Every non-close_notify alert is fatal**, including the
+5. **FIXED — every non-close_notify alert was fatal**, including the
    warning-level `user_canceled` that §6.1 leaves legal and that JDK 11
-   sends in the wild.
+   sends in the wild. TLS 1.3 meant to remove warning alerts and left
+   `user_canceled` defined without saying how to handle it; ignoring it
+   is what BoringSSL, NSS and OpenSSL all do, so refusing it broke real
+   peers rather than hostile ones. `alert.disposition` now sorts an
+   alert four ways — close, ignore, refuse, fatal — in one place,
+   because both handshakes were deciding it with the same nine lines.
+
+   Ignoring is not free, so it is bounded like the other two ceilings:
+   `warning_alerts_max` is 4, BoringSSL's `kMaxWarningAlerts`, which is
+   where `SendUserCanceledAlerts-TLS13` (4 alerts, must pass) and
+   `-TooMany-TLS13` (5, must fail) sit either side of the line. Any
+   *other* warning-level alert is `BadAlert` and §6.2's decode_error,
+   which is `SendWarningAlerts-TLS13`. It is a new error rather than
+   `MalformedAlert` because the alert is well-formed: we understand it
+   and decline it, which is a different sentence.
+
+   Finding 4's guard had a bug this exposed, fixed here. `observeRecord`
+   treated any record carrying content as progress, and an alert carries
+   two bytes — so a peer alternating four warning alerts with a fifth
+   would have refilled its own budget forever and the ceiling would have
+   bounded nothing. BoringSSL avoids this by returning from
+   `ssl_process_alert` before its reset runs, which reads like an
+   accident of control flow and is load-bearing. An alert is never
+   progress; a test pins it for all three counters.
 6. **A close_notify retires the machine**, so an embedder cannot answer
    it with one of its own — zssl models a close as ending the session
    rather than as §6.1's half-close.

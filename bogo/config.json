@@ -30,8 +30,9 @@
       "zssl:MalformedMessage"
     ],
     ":BAD_ALERT:": [
-      "zssl:PeerAlert",
-      "zssl:MalformedAlert"
+      "zssl:BadAlert",
+      "zssl:MalformedAlert",
+      "zssl:PeerAlert"
     ],
     ":DECODE_ERROR:": [
       "zssl:MalformedMessage",
@@ -183,6 +184,9 @@
     ],
     ":TOO_MANY_KEY_UPDATES:": [
       "zssl:TooManyKeyUpdates"
+    ],
+    ":TOO_MANY_WARNING_ALERTS:": [
+      "zssl:TooManyWarningAlerts"
     ]
   },
   "DisabledTests": {
@@ -645,10 +649,7 @@
     "SendSNIWarningAlert": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "SendUnsolicitedOCSPOnCertificate-TLS13": "OCSP stapling: not implemented.",
     "SendUnsolicitedSCTOnCertificate-TLS13": "SCT lists: not implemented.",
-    "SendUserCanceledAlerts-TLS13": "OPEN GAP: every non-close_notify alert is fatal, including the warning-level user_canceled \u00a76.1 leaves legal. docs/BOGO.md, finding 5.",
-    "SendUserCanceledAlerts-TooMany-TLS13": "OPEN GAP: every non-close_notify alert is fatal, including the warning-level user_canceled \u00a76.1 leaves legal. docs/BOGO.md, finding 5.",
     "SendWarningAlerts-Pass": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "SendWarningAlerts-TLS13": "OPEN GAP: every non-close_notify alert is fatal, including the warning-level user_canceled \u00a76.1 leaves legal. docs/BOGO.md, finding 5.",
     "SendWarningAlerts-TooMany": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Server-JDK11-NoWorkaround-0": "The JDK 11 workaround: not implemented.",
     "Server-JDK11-NoWorkaround-1": "The JDK 11 workaround: not implemented.",

@@ -169,7 +169,7 @@ pub const Event = union(enum) {
 };
 
 pub const Error = backend.Error || protect.Error || session_keys.Error ||
-    handshake.Assembler.Error || alert.ParseError || wire.Error || flood.Error || error{
+    handshake.Assembler.Error || alert.Error || wire.Error || flood.Error || error{
     UnexpectedMessage,
     /// The ServerHello broke a rule: bad echo, unknown suite, missing or
     /// wrong supported_versions, a PSK we never offered.
@@ -350,11 +350,20 @@ fn handleAlertPayload(self: *ClientHandshake, payload: []const u8) Error!Event {
     assert(self.state != .failed);
     assert(payload.len >= 1);
     const parsed = try alert.parse(payload);
-    if (parsed.isCloseNotify()) {
-        self.state = .closed;
-        return .closed;
+    switch (alert.disposition(parsed)) {
+        .close => {
+            self.state = .closed;
+            return .closed;
+        },
+        // §6.1's user_canceled, which real peers send and this library
+        // has no use for. Counted, because ignoring is work too.
+        .ignore => {
+            try self.flood_guard.observeWarningAlert();
+            return .none;
+        },
+        .refuse => return error.BadAlert,
+        .peer_fatal => return error.PeerAlert,
     }
-    return error.PeerAlert;
 }
 
 fn handleServerHello(self: *ClientHandshake, message: []const u8) Error!Event {

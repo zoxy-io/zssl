@@ -823,6 +823,7 @@ fn alertFor(err: anyerror) ?alert.Description {
         // is the closest and what BoringSSL sends for both.
         error.TooManyEmptyRecords,
         error.TooManyKeyUpdates,
+        error.TooManyWarningAlerts,
         => .unexpected_message,
         // Not a TLS record at all — the same answer BoringSSL gives an
         // HTTP request that arrived on the TLS port.
@@ -846,8 +847,12 @@ fn alertFor(err: anyerror) ?alert.Description {
         // embedder handed us. That is our capacity, not the peer's
         // illegal parameter, and §6 has no alert for it.
         error.BufferOverflow => .internal_error,
-        // Grammar that does not parse at all.
+        // Grammar that does not parse at all — and, in `BadAlert`, one
+        // that parses perfectly and means nothing in TLS 1.3. §6.2's
+        // decode_error covers both: it is what we send when the bytes
+        // cannot be turned into a decision.
         error.MalformedAlert,
+        error.BadAlert,
         error.MalformedMessage,
         error.MalformedCertificate,
         error.MalformedExtension,
