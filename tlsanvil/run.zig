@@ -26,6 +26,7 @@
 //! Exit status is the verdict: 0 passed, 1 failed, 2 could not run.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const assert = std.debug.assert;
 
@@ -47,6 +48,50 @@ const log_path = work_dir ++ "/tlsanvil.log";
 /// The loopback port the harness binds. Fixed rather than ephemeral
 /// because it is passed to a container on its command line.
 const server_port: u16 = 4435;
+
+/// How a container reaches a harness bound to 127.0.0.1, which differs
+/// by platform because Docker's host networking does.
+///
+/// On Linux `--add-host=host.docker.internal:host-gateway` resolves to
+/// the bridge gateway (172.17.0.1 on a default docker0), and a listener
+/// bound to loopback is *not* reachable there — the corpus retries
+/// "Server not yet available" until the 90-minute watchdog fires, which
+/// is how this gate spent its first Linux run. Host networking puts the
+/// container in the host's network namespace instead, so 127.0.0.1 is
+/// the same 127.0.0.1 the harness bound, and nothing is published on any
+/// interface. On macOS the reverse holds: Docker Desktop runs a VM, its
+/// `host.docker.internal` proxies through to the host's loopback, and
+/// `--network=host` does not give the container the host's stack.
+///
+/// The harness stays on loopback either way. Binding 0.0.0.0 would make
+/// one flag serve both, and would also put a test server that speaks to
+/// anyone on every interface of the machine running the gate.
+///
+/// What this actually keys on is `builtin.os.tag` — the OS running the
+/// `docker` client — plus an unstated assumption that the daemon is
+/// local and shares that OS. Both hold on `ubuntu-latest`, which is
+/// where CI runs it. Two setups break the assumption and land back in
+/// the 90-minute stall above: WSL2, which reports `.linux` while Docker
+/// Desktop's daemon lives in a separate VM whose namespace
+/// `--network=host` joins instead of the distro's, and a `DOCKER_HOST`
+/// pointing at a remote engine, where host networking joins that
+/// machine's namespace and not the one the harness bound. Neither is
+/// worth detecting here; both are worth naming, because the symptom is
+/// a silent retry loop rather than an error.
+///
+/// Note what the host-side liveness probe cannot do for this: it dials
+/// 127.0.0.1 from the host, which is the path that works even when the
+/// container's path does not, so a reachability failure looks perfectly
+/// healthy to it. Only the corpus's own silence reveals it.
+///
+/// The flag and the address are one value rather than two ternaries:
+/// they must agree, and a third platform added to one and not the other
+/// is exactly the silent mismatch this constant exists to end.
+const Networking = struct { flag: []const u8, host: []const u8 };
+const networking: Networking = if (builtin.os.tag == .linux)
+    .{ .flag = "--network=host", .host = "127.0.0.1" }
+else
+    .{ .flag = "--add-host=host.docker.internal:host-gateway", .host = "host.docker.internal" };
 
 /// TLS-Anvil is a JVM in a container running an amd64 image; on an
 /// arm64 host it runs under emulation and takes about four times as
@@ -296,7 +341,7 @@ fn runCorpus(io: Io, arena: std.mem.Allocator) !u8 {
     defer log.close(io);
     const mount = try std.fmt.allocPrint(arena, "{s}:/output", .{try absolutePath(io, arena, work_dir)});
     const reference = try std.fmt.allocPrint(arena, "{s}@{s}", .{ tlsanvil_image, tlsanvil_digest });
-    const connect = try std.fmt.allocPrint(arena, "host.docker.internal:{d}", .{server_port});
+    const connect = try std.fmt.allocPrint(arena, "{s}:{d}", .{ networking.host, server_port });
 
     std.debug.print("tlsanvil: running the corpus (this takes a while)\n", .{});
     var child = try std.process.spawn(io, .{
@@ -308,8 +353,9 @@ fn runCorpus(io: Io, arena: std.mem.Allocator) !u8 {
             // arm64 host from failing rather than emulating.
                    "--platform",
             "linux/amd64",
-            // The harness listens on the host, not in another container.
-                    "--add-host=host.docker.internal:host-gateway",
+            // How the container reaches a harness bound to the host's
+            // loopback. See `networking`.
+                    networking.flag,
             "-v",                  mount,
             reference,
             // tcpdump wants capabilities the container is not given, and

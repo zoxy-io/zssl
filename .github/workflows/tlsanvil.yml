@@ -27,6 +27,12 @@ concurrency:
 jobs:
   tlsanvil:
     runs-on: ubuntu-latest
+    # Above the gate's own 90-minute watchdog, so the watchdog is what
+    # reports a wedged run and this is only the backstop for a runner
+    # that cannot get that far. Without it the default is GitHub's
+    # six-hour job limit, which is how a gate that cannot reach its own
+    # harness burns an afternoon before saying so.
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/zig

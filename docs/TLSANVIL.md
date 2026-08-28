@@ -24,12 +24,36 @@ tlsanvil: PASS
 - **The server under test is `tlsfuzzer/server.zig`** — the same
   long-lived, echoing listener the tlsfuzzer gate drives. TLS-Anvil wants
   exactly that shape, and a third harness would be a third thing to keep
-  correct. It is reached at `host.docker.internal`, because the harness
-  runs on the host and the corpus runs in a container.
+  correct. The harness binds 127.0.0.1 and the corpus runs in a
+  container, so how the two meet differs by platform — see below.
 - **`tlsanvil/run.zig`** starts the harness, runs the container, reads
   the report, and holds the passing count against a floor. Exit 0
   passed, 1 failed, 2 could not run — the same convention as the other
   gates, where 2 here means no reachable Docker daemon.
+- **Reaching the harness is platform-specific**, and getting it wrong
+  does not look like an error. On Linux the container joins the host's
+  network namespace (`--network=host`) and dials `127.0.0.1`; on macOS
+  Docker Desktop runs a VM whose `host.docker.internal` proxies to the
+  host's loopback, and `--network=host` would not give the container the
+  host's stack. `--add-host=host.docker.internal:host-gateway` — the
+  documented Linux spelling — resolves to the *bridge gateway*, which a
+  loopback-bound listener does not answer, and the corpus then retries
+  "Server not yet available" until the watchdog fires 90 minutes later.
+  The harness stays on loopback on both platforms: binding 0.0.0.0 would
+  let one flag serve both, and would also put a test server that speaks
+  to anyone on every interface of the machine running the gate.
+
+  The switch keys on the OS running the `docker` client and assumes the
+  daemon is local and shares it. That holds on `ubuntu-latest`, where CI
+  runs it, and breaks in two setups worth naming because both land back
+  in the 90-minute stall: WSL2, which looks like Linux while Docker
+  Desktop's daemon sits in its own VM, and a `DOCKER_HOST` pointing at a
+  remote engine.
+
+  Nothing in the gate catches this quickly, and it is worth knowing why.
+  The liveness probe dials 127.0.0.1 *from the host*, which is exactly
+  the path that still works when the container's path does not, so a
+  gate that cannot be reached at all looks perfectly healthy to it.
 
 ## It scopes itself
 
@@ -122,6 +146,14 @@ which is how a failure gets diagnosed before it is fixed or written
 down:
 
 ```sh
+# Linux: share the host's network namespace and dial its loopback.
+docker run --rm --platform linux/amd64 \
+    --network=host -v "$PWD/out":/output \
+    ghcr.io/tls-attacker/tlsanvil@sha256:a8a4bb92... \
+    -disableTcpDump -parallelHandshakes 1 -strength 1 -prettyPrintJSON \
+    -outputFolder /output/results server -connect 127.0.0.1:4435
+
+# macOS: Docker Desktop's VM proxies host.docker.internal to the host.
 docker run --rm --platform linux/amd64 \
     --add-host=host.docker.internal:host-gateway -v "$PWD/out":/output \
     ghcr.io/tls-attacker/tlsanvil@sha256:a8a4bb92... \
