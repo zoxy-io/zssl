@@ -253,12 +253,20 @@ are worth:
 
 | Oracle | Status | Details |
 | --- | --- | --- |
-| **BoGo** | [![bogo passing](https://img.shields.io/badge/bogo-261%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | [docs/BOGO.md](docs/BOGO.md) — BoringSSL's hostile-peer runner, pinned; checks *which* alert we send, not just that we refuse. |
-| **tlsfuzzer** | [![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-15%2F57%20scripts-yellow)](docs/TLSFUZZER.md) | [docs/TLSFUZZER.md](docs/TLSFUZZER.md) — Python over tlslite-ng driving our *server*; 1261 conversations, two leaves. |
-| **RFC 8448 replay** | — | [`src/rfc8448_test.zig`](src/rfc8448_test.zig) — key schedule, binders and records reproduce the RFC's traced bytes exactly. |
-| **OpenSSL interop** | — | [`interop/main.zig`](interop/main.zig) — three legs against a real `openssl`, on an ECDSA leaf and an RSA-2048 one. |
-| **`std.crypto.tls`** | — | [`src/std_interop_test.zig`](src/std_interop_test.zig) — a second implementation handshakes both directions and exchanges data. |
-| **Fuzzing** | — | [`src/fuzz_test.zig`](src/fuzz_test.zig) — nine targets: arbitrary peer bytes yield a value or an error, never a panic. |
+| **BoGo** | [![bogo passing](https://img.shields.io/badge/bogo-261%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | [docs/BOGO.md](docs/BOGO.md) — BoringSSL's hostile-peer corpus |
+| **tlsfuzzer** | [![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-15%2F57%20scripts-yellow)](docs/TLSFUZZER.md) | [docs/TLSFUZZER.md](docs/TLSFUZZER.md) — tlslite-ng, against our server |
+| **RFC 8448** | — | [`src/rfc8448_test.zig`](src/rfc8448_test.zig) — the traced bytes, exactly |
+| **OpenSSL** | — | [`interop/main.zig`](interop/main.zig) — three legs, ECDSA and RSA |
+| **`std.crypto.tls`** | — | [`src/std_interop_test.zig`](src/std_interop_test.zig) — a second stack |
+| **Fuzzing** | — | [`src/fuzz_test.zig`](src/fuzz_test.zig) — nine targets, never a panic |
+
+The two adversarial gates are worth their place for different reasons.
+BoGo checks not merely that we refuse a hostile peer but *which alert we
+send*, at a pinned commit, across 134 client and 127 server cases.
+tlsfuzzer drives our server through 1261 scripted conversations from a
+third implementation, including every plaintext length from 1 to 2^14,
+serving an ECDSA leaf and an RSA one because a dozen of its scripts
+advertise RSA-PSS alone.
 
 Plus directed tests for the things that only break under adversity —
 fragmented ClientHellos, tampered Finished messages, corrupted binders,
