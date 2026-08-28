@@ -49,6 +49,12 @@ pub fn SessionKeys(comptime suite: CipherSuite) type {
         send: protect.Protector,
         recv: protect.Protector,
         rotations: u32,
+        /// Whether a KeyUpdate we sent in answer to an update_requested
+        /// is still the most recent thing on our write side — that is,
+        /// whether it still precedes our next application record. While
+        /// it does, §4.6.3 is satisfied and a further request needs no
+        /// further answer. Cleared by `sealApplicationData`.
+        answered_update_request: bool,
 
         const Self = @This();
 
@@ -66,6 +72,7 @@ pub fn SessionKeys(comptime suite: CipherSuite) type {
                 .send = undefined,
                 .recv = undefined,
                 .rotations = 0,
+                .answered_update_request = false,
             };
             keys.send = try protect.Protector.init(suite, &keys.transmit_keys.key, &keys.transmit_keys.iv);
             errdefer keys.send.deinit();
@@ -138,10 +145,39 @@ pub fn SessionKeys(comptime suite: CipherSuite) type {
             try self.rotateReceive();
             assert(self.rotations == generations_before + 1);
             if (!request_update) return null;
+            // §4.6.3 ties the obligation to the *next application record*,
+            // not to each request: "the receiver MUST send a KeyUpdate of
+            // its own ... prior to sending its next Application Data
+            // record." One answer therefore discharges a whole run of
+            // requests that arrive with no application data between them,
+            // because that one answer still precedes whatever we send
+            // next. Answering each of them instead would put KeyUpdates
+            // on the wire the peer never asked for, which is what BoGo's
+            // `KeyUpdate-Requested` refuses — its runner sends five and
+            // says in as many words that "the shim should respond only
+            // once". Returning before any rotation matters: rotating our
+            // transmit side without telling the peer would desynchronise
+            // the very keys this message exists to agree on.
+            if (self.answered_update_request) return null;
             var message_buffer: [8]u8 = undefined;
             const response = @import("server_messages.zig").keyUpdate(&message_buffer, false);
             const sealed = try self.send.seal(.handshake, response, out);
             try self.rotateTransmit();
+            self.answered_update_request = true;
+            return sealed;
+        }
+
+        /// Application data, and the moment §4.6.3's obligation is
+        /// discharged: any KeyUpdate we owed has now preceded an
+        /// application record, so the next request needs its own answer.
+        /// Sealing goes through here rather than through `send` directly
+        /// so that the flag cannot be left behind by a caller who forgot
+        /// it — there is one way to send application data.
+        pub fn sealApplicationData(self: *Self, bytes: []const u8, out: []u8) Error![]const u8 {
+            assert(bytes.len <= record.plaintext_bytes_max);
+            const sealed = try self.send.seal(.application_data, bytes, out);
+            self.answered_update_request = false;
+            assert(!self.answered_update_request);
             return sealed;
         }
 
@@ -217,4 +253,57 @@ test "the rotation ceiling is an error, not a spin" {
     defer keys.deinit();
     keys.rotations = rotations_max;
     try std.testing.expectError(error.RotationsExhausted, keys.rotateTransmit());
+}
+
+test "§4.6.3: a run of update requests is answered once, until application data" {
+    const Keys = SessionKeys(.aes_128_gcm_sha256);
+    const secret = [_]u8{0x22} ** 32;
+    var keys = try Keys.init(&secret, &secret);
+    defer keys.deinit();
+    var out: [record.wire_record_bytes_max]u8 = undefined;
+
+    // update_requested. The first is answered.
+    const answer = (try keys.processKeyUpdate(&.{1}, &out)) orelse
+        return error.TestExpectedResponse;
+    try std.testing.expect(answer.len > 0);
+    try std.testing.expect(keys.answered_update_request);
+
+    // Four more with nothing sent between them. §4.6.3 asks for a
+    // KeyUpdate "prior to sending its next Application Data record", and
+    // the first answer still is — so these need no answer of their own,
+    // and answering them would put KeyUpdates on the wire the peer never
+    // requested.
+    const rotations_after_first = keys.rotations;
+    for (0..4) |_| {
+        try std.testing.expectEqual(
+            @as(?[]const u8, null),
+            try keys.processKeyUpdate(&.{1}, &out),
+        );
+    }
+    // Our receive side still rotated once per message — those are the
+    // peer's generations and have nothing to do with our answer.
+    try std.testing.expectEqual(rotations_after_first + 4, keys.rotations);
+
+    // Application data discharges it: our answer no longer precedes what
+    // we send next, so the following request needs its own.
+    _ = try keys.sealApplicationData("hello", &out);
+    try std.testing.expect(!keys.answered_update_request);
+    try std.testing.expect((try keys.processKeyUpdate(&.{1}, &out)) != null);
+    try std.testing.expect(keys.answered_update_request);
+}
+
+test "§4.6.3: update_not_requested is never answered, and clears nothing" {
+    const Keys = SessionKeys(.aes_128_gcm_sha256);
+    const secret = [_]u8{0x33} ** 32;
+    var keys = try Keys.init(&secret, &secret);
+    defer keys.deinit();
+    var out: [record.wire_record_bytes_max]u8 = undefined;
+
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        try keys.processKeyUpdate(&.{0}, &out),
+    );
+    try std.testing.expect(!keys.answered_update_request);
+    // And one that does ask still gets its answer afterwards.
+    try std.testing.expect((try keys.processKeyUpdate(&.{1}, &out)) != null);
 }

@@ -41,8 +41,8 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**274 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. 143 drive
+**275 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. 144 drive
 `ClientHandshake` and 131 drive `ServerHandshake`. The server number was
 6 until RSA signing landed, 100 until secp256r1/secp384r1 did, 110 until
 §9.2's `missing_extension` did, 111 until §5.4's inner-plaintext cap did,
@@ -53,8 +53,9 @@ did, and 128 until §4.2.11's binder rules were told apart. The client
 number was 121 until §4.2's unsupported_extension landed, 134 until
 finding 4's flood ceilings did, 136 until finding 5 stopped refusing
 `user_canceled`, 139 until that same duplicate rule, 140 until finding 6
-split the close in two, and 141 until finding 7 read the ticket's
-extension block; see below.
+split the close in two, 141 until finding 7 read the ticket's
+extension block, and 143 until §4.6.3's update requests were coalesced;
+see below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
 either gets fixed or gets an entry in `DisabledTests` with a one-line
@@ -136,8 +137,8 @@ Three bugs, fixed in this slice:
    falsifies. The floor is now the encoded chain's own size.
 
 Twelve more were open. Nine are fixed outright — 2, 3, 4, 5, 6, 7, 9, 10
-and 12 — and four still carry ledger entries, 12 suppressed cases
-between them: 4 under finding 1, 5 under 10, 2 under 8 and 1 under 11.
+and 12 — and four still carry ledger entries, 11 suppressed cases
+between them: 3 under finding 1, 5 under 10, 2 under 8 and 1 under 11.
 Only one of those four is a gap in the sense the word implies — finding
 1, the packed post-handshake record. 8 is down to two divergences we
 intend to keep, 11 is a documented non-defect, and finding 10's
@@ -153,20 +154,41 @@ The got-versus-want the runner printed for the other 44 is what the
 descriptions below now say, rather than what anyone inferred from a case
 name.
 
-1. **Only one post-handshake message per record.**
+1. **Only one post-handshake message per record**, and — a second
+   defect this entry was hiding — one KeyUpdate answered per request
+   rather than per run of them. Four cases, of which three are the first
+   and one was never it.
+
    `handlePostHandshake` refuses a non-empty assembler, so two
    NewSessionTickets in one record — or a ticket packed with a KeyUpdate,
-   which both Go and OpenSSL emit — is `UnexpectedMessage`. Legal, common,
-   and refused. This one needs the event surface to grow a way to drain
-   more than one event per record.
+   which both Go and OpenSSL emit — is `UnexpectedMessage`. Legal,
+   common, and refused. That needs the event surface to grow a way to
+   drain more than one event per record, and is what
+   `Shutdown-Runner-TLS-Sync-PackHandshake`,
+   `TLS13-1RTT-Client-TLS-Sync-PackHandshake` and
+   `Shutdown-Shim-KeyUpdate-TLS-Sync-PackHandshake` still wait on.
 
-   Four cases now, not three. `Shutdown-Shim-KeyUpdate-TLS-Sync-`
-   `PackHandshake` joined when finding 6 made the shim read after its
+   The third of those joined when finding 6 made the shim read after its
    own close_notify instead of returning: the case was passing because
    nothing looked at it, and looking found this gap rather than a new
    one. Its `-TLS-Sync` and `-SplitHandshakeRecords` siblings still
    pass, which is what isolates the cause to packing rather than to the
    shutdown path.
+
+   **FIXED — `KeyUpdate-Requested` was not this gap at all**, and only
+   running it said so: our stderr was empty, because we never errored,
+   and the *runner* refused a KeyUpdate we had sent. §4.6.3 ties the
+   obligation to the next application record — "the receiver MUST send a
+   KeyUpdate of its own ... prior to sending its next Application Data
+   record" — rather than to each request, so one answer discharges a
+   whole run of requests arriving with no application data between them.
+   We answered all five, and the runner says in as many words that "the
+   shim should respond only once". `session_keys.zig` tracks whether our
+   answer still precedes what we send next; `sealApplicationData` is now
+   the one way to send application data, so the flag cannot be left
+   behind by a caller who forgot it. The early return happens before any
+   rotation, because rotating our transmit side without telling the peer
+   would desynchronise the keys the message exists to agree on.
 2. **FIXED — the client accepted extensions it never offered.**
    `checkEncryptedExtensions` looked at ALPN and skipped everything
    else, so a server could hand our client any extension it liked and we

@@ -478,7 +478,6 @@
     "HelloRetryRequestCurveMismatch-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
     "HelloRetryRequestVersionMismatch-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
     "InvalidCompressionMethod": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "KeyUpdate-Requested": "OPEN GAP: two post-handshake messages in one record are refused; legal and common. docs/BOGO.md, finding 1.",
     "LooseInitialRecordVersion-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "LooseInitialRecordVersion-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "LooseInitialRecordVersion-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -714,6 +713,7 @@
     "Shutdown-Shim-HelloRequest-Reject-TLS-Sync": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Shutdown-Shim-HelloRequest-Reject-TLS-Sync-PackHandshake": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Shutdown-Shim-HelloRequest-Reject-TLS-Sync-SplitHandshakeRecords": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
+    "Shutdown-Shim-KeyUpdate-TLS-Sync-PackHandshake": "OPEN GAP: two post-handshake messages in one record are refused; legal and common. docs/BOGO.md, finding 1.",
     "Shutdown-Shim-Renegotiate-Server-Forbidden-TLS-Sync": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Shutdown-Shim-Renegotiate-Server-Forbidden-TLS-Sync-PackHandshake": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Shutdown-Shim-Renegotiate-Server-Forbidden-TLS-Sync-SplitHandshakeRecords": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -899,7 +899,6 @@
     "WrongMessageType-ServerFinished-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "WrongMessageType-ServerHello-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "WrongMessageType-ServerHelloDone-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "WrongMessageType-ServerKeyExchange-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "Shutdown-Shim-KeyUpdate-TLS-Sync-PackHandshake": "OPEN GAP: two post-handshake messages in one record are refused; legal and common. docs/BOGO.md, finding 1."
+    "WrongMessageType-ServerKeyExchange-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated."
   }
 }

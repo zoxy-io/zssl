@@ -984,7 +984,7 @@ pub fn sendApplicationData(self: *ClientHandshake, bytes: []const u8, out: []u8)
     assert(bytes.len <= record.plaintext_bytes_max);
     errdefer self.state = .failed;
     switch (self.ladder.?) {
-        inline else => |*arm| return arm.session.?.send.seal(.application_data, bytes, out),
+        inline else => |*arm| return arm.session.?.sealApplicationData(bytes, out),
     }
 }
 
