@@ -27,6 +27,18 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = b.addTest(.{ .root_module = zssl_module });
     const module_tests = b.addRunArtifact(unit_tests);
+
+    // A second build of the same tests, for kcov only.
+    //
+    // `use_llvm` is the whole point. Zig's self-hosted x86_64 backend is
+    // the default for Debug on Linux, and kcov cannot map the DWARF it
+    // emits: pointed at a self-hosted binary it reports 888 source files,
+    // every one of them the vendored OpenSSL C compiled through clang,
+    // and not a single `.zig`. That is what produced a 0% badge from a
+    // run where all 83 tests passed under the tool. macOS defaults to
+    // LLVM, which is why the same command measured 97% there and hid the
+    // problem. Asking for LLVM explicitly makes the two agree.
+    const coverage_tests = b.addTest(.{ .root_module = zssl_module, .use_llvm = true });
     const test_step = b.step("test", "Run unit tests (RFC 8448 vectors + differentials)");
     test_step.dependOn(&module_tests.step);
 
@@ -54,7 +66,7 @@ pub fn build(b: *std.Build) void {
     // `addOutputDirectoryArg` makes the directory, passes it as the
     // argument, and hands back the path to install from.
     const coverage_output = coverage_run.addOutputDirectoryArg("coverage");
-    coverage_run.addArtifactArg(unit_tests);
+    coverage_run.addArtifactArg(coverage_tests);
     const coverage_install = b.addInstallDirectory(.{
         .source_dir = coverage_output,
         .install_dir = .prefix,
