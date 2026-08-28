@@ -14,6 +14,9 @@ concurrency:
 
 env:
   ZIG_VERSION: 0.16.0
+  # The version whose output was verified locally; kcov 38 (the only
+  # Ubuntu package) reports 0% for this project.
+  KCOV_VERSION: v43
 
 jobs:
   # The gates CLAUDE.md names, minus BoGo, which is slow enough to want
@@ -64,18 +67,13 @@ jobs:
   # that branch through its endpoint API. The only credential involved is
   # the token GitHub already hands the job.
   coverage:
-    # Pinned, and not to `ubuntu-latest`, for one checkable reason: kcov
-    # is packaged for jammy (22.04) and for no later Ubuntu — it is absent
-    # from noble, oracular and plucky, and upstream ships source releases
-    # only, no prebuilt binary. `ubuntu-latest` moved to 24.04 and the
-    # install stopped resolving.
-    #
-    # When GitHub retires the 22.04 image, the replacement is to build
-    # kcov from a pinned tag: cmake, binutils-dev, libcurl4-openssl-dev,
-    # zlib1g-dev, libdw-dev, libiberty-dev, then `cmake --install` into a
-    # cached prefix. That is strictly more machinery, so it waits until it
-    # is needed rather than being carried on spec.
-    runs-on: ubuntu-22.04
+    # kcov is built from a pinned tag rather than installed from apt. Two
+    # reasons, both learned the hard way: it is packaged only for jammy
+    # (absent from noble onward, and upstream ships no prebuilt binary),
+    # and the jammy package is kcov 38, which reported 0% for this
+    # project where kcov 43 reports 97%. Building the version that was
+    # actually verified is what makes the number mean anything.
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
@@ -83,8 +81,30 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - name: install kcov
-        run: sudo apt-get update && sudo apt-get install -y kcov
+      - name: cache kcov
+        id: kcov-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/kcov-prefix
+          key: kcov-${{ env.KCOV_VERSION }}-${{ runner.os }}
+      - name: build kcov
+        if: steps.kcov-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cmake binutils-dev libcurl4-openssl-dev \
+            zlib1g-dev libdw-dev libiberty-dev
+          git clone --depth 1 --branch "$KCOV_VERSION" \
+            https://github.com/SimonKagstrom/kcov /tmp/kcov
+          cmake -S /tmp/kcov -B /tmp/kcov/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$HOME/kcov-prefix"
+          cmake --build /tmp/kcov/build -j"$(nproc)"
+          cmake --install /tmp/kcov/build
+      - name: put kcov on PATH
+        run: |
+          echo "$HOME/kcov-prefix/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y libdw1 libcurl4 || true
       - name: coverage
         run: zig build coverage
       # The whole report, always — the badge is a summary and this is the
@@ -100,13 +120,20 @@ jobs:
         id: pct
         run: |
           set -euo pipefail
-          # kcov writes one coverage.json per instrumented binary.
-          file=$(find zig-out/coverage -name coverage.json -print -quit)
+          # kcov writes one coverage.json per instrumented binary, and may
+          # write a merged one beside them. Take the report covering the
+          # most lines rather than whichever `find` reaches first — an
+          # empty merged report is how this produced a 0% badge once.
+          file=$(find zig-out/coverage -name coverage.json -print0 \
+            | xargs -0 -I{} sh -c 'printf "%s %s\n" "$(jq -r ".total_lines // 0" {})" {}' \
+            | sort -rn | head -1 | cut -d" " -f2-)
           if [ -z "$file" ]; then
             echo "no coverage.json under zig-out/coverage" >&2
-            find zig-out/coverage -maxdepth 2 >&2 || true
+            find zig-out/coverage -maxdepth 3 >&2 || true
             exit 1
           fi
+          echo "using $file"
+          jq -r '{percent_covered, covered_lines, total_lines}' "$file"
           pct=$(jq -r '.percent_covered // empty' "$file")
           # A file that exists with the field renamed would otherwise
           # publish a badge reading "null%", which is worse than no badge.
@@ -117,6 +144,15 @@ jobs:
               exit 1
               ;;
           esac
+          # Zero is not a measurement. This suite covers ~97% of `src/`
+          # when kcov instruments it at all, so 0% means the instrumentation
+          # missed — a wrong number that looks like data, which is worse
+          # than a red job.
+          if awk "BEGIN{exit !($pct == 0)}"; then
+            echo "coverage reported 0% — instrumentation did not attach" >&2
+            jq -r '{total_lines, covered_lines, files: (.files|length)}' "$file" >&2 || true
+            exit 1
+          fi
           echo "percent=$pct" >> "$GITHUB_OUTPUT"
           echo "coverage: $pct%"
       # Only on a push to main: a pull request from a fork cannot write
