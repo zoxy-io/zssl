@@ -356,3 +356,92 @@ test "§9.2: an omitted key_share is missing_extension, an empty one is a retry"
         );
     }
 }
+
+test "§4.2.9 and §4.6.1: psk_key_exchange_modes gates both the offer and the ticket" {
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+
+    // §9.2 lists psk_key_exchange_modes among what a TLS 1.3 hello must
+    // carry, and §4.2.9 makes it mandatory beside a PSK: "In order to use
+    // PSKs, clients MUST also send a psk_key_exchange_modes extension".
+    // An offer with no modes leaves nothing to select, and answering it
+    // with a full handshake — which zssl did — hides a malformed offer
+    // behind a working connection.
+    {
+        var harness: Harness = undefined;
+        try harness.init(null);
+        defer harness.deinit();
+        var ticket: test_client.Ticket = .{
+            .lifetime_s = 3600,
+            .age_add = 0,
+            .nonce = undefined,
+            .nonce_bytes = 1,
+            .ticket = undefined,
+            .ticket_bytes = 4,
+            .psk = undefined,
+            .psk_bytes = 32,
+        };
+        ticket.nonce[0] = 0x01;
+        @memcpy(ticket.ticket[0..4], "psk!");
+        @memset(ticket.psk[0..32], 0x5a);
+        var client = Client.init(&client_x25519_private, &.{
+            .resume_with = &ticket,
+            .omit_psk_modes = true,
+        });
+        defer client.deinit();
+        try testing.expectError(
+            error.MissingExtension,
+            harness.server.handleRecord(client.helloRecord(&client_out), &server_out),
+        );
+    }
+
+    // §4.2.9: a client that advertised modes and left ours out of them
+    // must ignore any ticket we send, so the library refuses to mint one
+    // rather than leaving it to the embedder to remember. 0x1a is the
+    // byte BoGo uses: a mode that is neither psk_ke nor psk_dhe_ke.
+    //
+    // Advertising *no* modes is deliberately not this case — the RFC
+    // forbids tickets "not compatible with the advertised modes", and a
+    // hello with none has nothing to be incompatible with. Enforcing the
+    // wider rule broke ten of tlsfuzzer's `connection-abort`
+    // conversations, which wait on a ticket their hello never asked
+    // about, and that is a legitimate client.
+    {
+        var harness: Harness = undefined;
+        try harness.init(null);
+        defer harness.deinit();
+        var client = Client.init(&client_x25519_private, &.{ .psk_mode_byte = 0x1a });
+        defer client.deinit();
+
+        const flight = try harness.server.handleRecord(client.helloRecord(&client_out), &server_out);
+        const reply = try client.absorb(flight.send, &client_out);
+        const done = try feedRecords(&harness.server, reply.connected, &server_out);
+        try testing.expectEqual(std.meta.activeTag(done), .connected);
+
+        try testing.expect(!harness.server.ticketPermitted());
+        // The control: no modes advertised at all is permitted, because
+        // there is nothing the ticket can contradict.
+        {
+            var permissive: Harness = undefined;
+            try permissive.init(null);
+            defer permissive.deinit();
+            var bare = Client.init(&client_x25519_private, &.{ .omit_psk_modes = true });
+            defer bare.deinit();
+            var out: [2 * record.wire_record_bytes_max]u8 = undefined;
+            var scratch: [2 * record.wire_record_bytes_max]u8 = undefined;
+            const bare_flight = try permissive.server.handleRecord(bare.helloRecord(&out), &scratch);
+            const bare_reply = try bare.absorb(bare_flight.send, &out);
+            _ = try feedRecords(&permissive.server, bare_reply.connected, &scratch);
+            try testing.expect(permissive.server.ticketPermitted());
+        }
+        try testing.expectError(error.TicketNotPermitted, harness.server.sendNewSessionTicket(&.{
+            .lifetime_s = 3600,
+            .age_add = 0,
+            .ticket_nonce = &.{0x01},
+            .ticket = "unusable",
+        }, &server_out));
+        // The refusal is about the ticket, not the connection: a peer
+        // that cannot resume is still a peer we are talking to.
+        try testing.expectEqual(ServerHandshake.State.connected, harness.server.state);
+    }
+}

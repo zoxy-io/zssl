@@ -48,6 +48,17 @@ session_echo: [32]u8,
 /// Whether this session came up on an accepted PSK — the fact behind
 /// zoxy's `tls_resumed` counter.
 resumed: bool,
+/// §4.2.9: whether a NewSessionTicket may be sent. Kept because a ticket
+/// is issued long after the hello is gone.
+///
+/// The rule is narrower than "did the client advertise psk_dhe_ke": the
+/// RFC says servers "SHOULD NOT send NewSessionTicket with tickets that
+/// are not compatible with the advertised modes", and a hello advertising
+/// no modes at all has nothing to be incompatible with. Advertising modes
+/// that exclude psk_dhe_ke is the case that forbids a ticket, because
+/// then the client has said which modes it will accept and ours is not
+/// among them.
+ticket_permitted: bool,
 
 const ServerHandshake = @This();
 
@@ -122,10 +133,15 @@ pub const Error = backend.SignError || protect.Error || handshake.Assembler.Erro
     /// No common cipher suite, group, or signature scheme (§4.1.1).
     HandshakeFailure,
     /// A ClientHello negotiating TLS 1.3 that omits an extension §9.2
-    /// makes mandatory — `supported_groups` or `key_share`. Distinct
-    /// from HandshakeFailure, which is an extension that is present and
+    /// makes mandatory — `supported_groups`, `key_share`, or
+    /// `psk_key_exchange_modes` beside a PSK offer. Distinct from
+    /// HandshakeFailure, which is an extension that is present and
     /// offers nothing we hold.
     MissingExtension,
+    /// `sendNewSessionTicket` on a connection whose ClientHello never
+    /// advertised psk_dhe_ke (§4.6.1). The connection is fine; the ticket
+    /// is the thing that must not be sent.
+    TicketNotPermitted,
     /// The client offered ALPN and nothing on it matched (RFC 7301 §3.2).
     NoApplicationProtocol,
     /// The client's second ClientHello broke an HRR rule (§4.1.4).
@@ -152,6 +168,7 @@ pub fn init(config: *const Config) ServerHandshake {
         .config = config.*,
         .key_share_group = .x25519,
         .signature_scheme = config.credentials.signer.supported()[0],
+        .ticket_permitted = false,
         .assembler = handshake.Assembler.init(config.reassembly),
         .ladder = null,
         .ccs_seen = 0,
@@ -282,6 +299,16 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
     if (hello.pre_shared_key_wire == null and hello.supported_groups_wire == null) {
         return error.MissingExtension;
     }
+    // §4.2.9 and §9.2 together: "In order to use PSKs, clients MUST also
+    // send a psk_key_exchange_modes extension", and a hello missing an
+    // extension §9.2 requires is a missing_extension abort. Offering a
+    // PSK with no modes at all leaves the server nothing to select, and
+    // answering it with a full handshake — which is what zssl did — hides
+    // a malformed offer behind a working connection.
+    if (hello.pre_shared_key_wire != null and hello.psk_modes_wire == null) {
+        return error.MissingExtension;
+    }
+    self.ticket_permitted = hello.psk_modes_wire == null or hello.offersPskDheKe();
     if (hello.preferredKeyShare()) |offered| {
         // §4.2.8 leaves the choice to us among what the client sent.
         self.key_share_group = backend.Group.fromWire(offered.group).?;
@@ -708,6 +735,16 @@ pub const alert_bytes_min: u8 = record.header_bytes + alert.bytes + 1 + cipher_s
 /// §4.6.1: derive the PSK a ticket nonce will stand for. Separate from
 /// sending, because a stateless embedder needs the PSK *before* the
 /// ticket that seals it exists — zoxy's `Tickets.seal` order.
+/// §4.2.9: whether a NewSessionTicket may be sent to this peer. False
+/// only when the ClientHello advertised key exchange modes and none of
+/// them is one zssl can resume under. An embedder should ask before
+/// building a ticket — the PSK derivation and sealing either side of
+/// `sendNewSessionTicket` are the expensive parts, and this is free.
+pub fn ticketPermitted(self: *const ServerHandshake) bool {
+    assert(self.state != .awaiting_client_hello or !self.ticket_permitted);
+    return self.ticket_permitted;
+}
+
 pub fn resumptionPsk(
     self: *const ServerHandshake,
     ticket_nonce: []const u8,
@@ -746,6 +783,13 @@ pub fn sendNewSessionTicket(
     assert(self.state == .connected);
     assert(params.ticket.len >= 1);
     assert(params.ticket.len <= server_messages.ticket_bytes_max);
+    // §4.2.9: a ticket incompatible with every mode the client advertised
+    // is one it must ignore, so sending it is a wasted flight the RFC
+    // tells servers not to send. Checked before the `errdefer` below,
+    // because an embedder ticketing such a client has made a policy
+    // mistake rather than broken the connection — `ticketPermitted` is
+    // the question it should have asked.
+    if (!self.ticket_permitted) return error.TicketNotPermitted;
     errdefer self.state = .failed;
     var message_buffer: [server_messages.new_session_ticket_bytes_max]u8 = undefined;
     const message = server_messages.newSessionTicket(

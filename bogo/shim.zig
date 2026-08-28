@@ -472,19 +472,31 @@ fn runServer(
         .alpn = connection.select_alpn,
         .reassembly = &handshake_reassembly,
         .flight = &flight_storage,
-        .psk_lookup = .{ .context = store, .lookup = TicketStore.lookup },
+        // `SSL_OP_NO_TICKET` means the server must not *accept* a ticket
+        // either, not merely decline to mint one — BoGo's
+        // `TLS13-NoTicket-NoAccept` sets it only on the resumed
+        // connection and expects a full handshake. Withholding the
+        // lookup is how an embedder says no.
+        .psk_lookup = if (connection.no_ticket)
+            null
+        else
+            .{ .context = store, .lookup = TicketStore.lookup },
     });
     defer server.deinit();
 
     // Read before the handshake consumes it: `psk_lookup` answers from
     // the same store the next issuance overwrites.
-    const offered = connection.index >= 1 and store.psk_bytes >= 1;
+    const offered = !connection.no_ticket and connection.index >= 1 and store.psk_bytes >= 1;
     pump.handshakeServer(&server) catch |err| return pump.abort(&server, err);
     try checkNegotiated(connection, server.resumed, offered, null);
 
     // Slice 3's ordering, and §4.6.1's: derive the PSK, then seal the
     // ticket that stands for it, and only after `connected`.
-    if (!connection.no_ticket) {
+    // §4.6.1 is the library's to enforce and the embedder's to respect:
+    // a client that never advertised psk_dhe_ke cannot use a ticket, and
+    // `sendNewSessionTicket` refuses to mint one. Asking first is what
+    // keeps that from being an error path.
+    if (!connection.no_ticket and server.ticketPermitted()) {
         const psk = server.resumptionPsk(&ticket_nonce, &store.psk);
         store.psk_bytes = @intCast(psk.len);
         @memcpy(store.identity[0..ticket_identity.len], ticket_identity);

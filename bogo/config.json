@@ -176,6 +176,9 @@
     ],
     ":TLSV1_ALERT_RECORD_OVERFLOW:": [
       "zssl:PeerAlert"
+    ],
+    ":MISSING_EXTENSION:": [
+      "zssl:MissingExtension"
     ]
   },
   "DisabledTests": {
@@ -626,7 +629,7 @@
     "Resume-Server-TLS13-TLS11-TLS": "The resumed leg speaks 1.3 alone against a 1.2-only runner (DESIGN.md \u00a71).",
     "Resume-Server-TLS13-TLS12-TLS": "The resumed leg speaks 1.3 alone against a 1.2-only runner (DESIGN.md \u00a71).",
     "Resume-Server-UnofferedCipher": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "Resume-Server-UnofferedCipher-TLS13": "OPEN GAP: a resumed session is accepted under a suite the ClientHello did not offer. docs/BOGO.md, finding 11.",
+    "Resume-Server-UnofferedCipher-TLS13": "Not a defect: the runner's own comment says \"Servers may resume at another cipher if the PRF matches\" and that BoringSSL declines by policy. The resume hello offers AES-128-GCM-SHA256 for a ChaCha20-SHA256 ticket; the PRF matches, so zssl resumes. docs/BOGO.md, finding 11.",
     "ResumeTLS12SessionID-TLS13": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "SecondClientHelloMissingKeyShare-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
     "SecondClientHelloWrongCurve-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
@@ -808,10 +811,7 @@
     "TLS13-Client-EmptyTicketFlags": "OPEN GAP: NewSessionTicket extension bodies are not checked for a minimal encoding. docs/BOGO.md, finding 7.",
     "TLS13-Client-NonminimalTicketFlags": "OPEN GAP: NewSessionTicket extension bodies are not checked for a minimal encoding. docs/BOGO.md, finding 7.",
     "TLS13-DuplicateTicketEarlyDataSupport": "0-RTT: deferred pending a replay analysis (DESIGN.md \u00a71).",
-    "TLS13-ExpectNoSessionTicketOnBadKEMode-Server": "OPEN GAP: psk_key_exchange_modes is not consulted before issuing a NewSessionTicket. docs/BOGO.md, finding 12.",
     "TLS13-HRR-InvalidCompressionMethod": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
-    "TLS13-NoTicket-NoAccept": "OPEN GAP: a resumed session is accepted under a suite the ClientHello did not offer. docs/BOGO.md, finding 11.",
-    "TLS13-SendNoKEMModesWithPSK-Server": "OPEN GAP: psk_key_exchange_modes is not consulted before issuing a NewSessionTicket. docs/BOGO.md, finding 12.",
     "Ticket-Forbidden-TLS13": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TicketSessionIDLength-0-TLS-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TicketSessionIDLength-0-TLS-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",

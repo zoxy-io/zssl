@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 258 passed, 0 failed, 6918 declined by the shim (89), floor 258
+bogo: 261 passed, 0 failed, 6918 declined by the shim (89), floor 261
 bogo: PASS
 ```
 
@@ -41,13 +41,14 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**258 passed.** Cases the runner ran end to end and we satisfied —
+**261 passed.** Cases the runner ran end to end and we satisfied —
 including the alert we sent, which BoGo checks by name. 134 drive
-`ClientHandshake` and 124 drive `ServerHandshake`. The server number was
+`ClientHandshake` and 127 drive `ServerHandshake`. The server number was
 6 until RSA signing landed, 100 until secp256r1/secp384r1 did, 110 until
 §9.2's `missing_extension` did, 111 until §5.4's inner-plaintext cap did,
 113 until eight suppressions turned out to be describing bugs that were
-already fixed, and 121 until finding 8 was taken apart. The client number
+already fixed, 121 until finding 8 was taken apart, and 124 until
+§4.2.9's psk_key_exchange_modes was enforced. The client number
 was 121 until §4.2's unsupported_extension landed; see below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
@@ -129,10 +130,12 @@ Three bugs, fixed in this slice:
    flight was at least 500 bytes, which a legitimately small ECDSA leaf
    falsifies. The floor is now the encoded chain's own size.
 
-Twelve more were open and ten remain — 2 and 3 are fixed and 8 is down to
-two cases we intend to keep. All three are kept in place below rather
-than renumbered, because the ledger cites these by number. 28 suppressed
-cases sit across the ten.
+Twelve more were open. Three are fixed outright — 2, 3 and 12 — and nine
+still carry ledger entries, 25 suppressed cases between them. Two of
+those nine are no longer gaps in the sense the word implies: 11 is a
+documented non-defect and 8 is down to two divergences we intend to keep.
+All twelve keep their numbers rather than being renumbered, because the
+ledger cites them by number.
 
 Those 44 are what survived being *measured*. Every OPEN GAP entry was
 lifted at once and the corpus run in full: 8 of the 52 passed outright,
@@ -286,11 +289,46 @@ name.
     the opposite`, which looks like an offer we neither resumed nor
     refused, and is in fact one we declined by written policy. A symptom
     is not a cause even when the symptom is precise.
-11. **A resumed session is accepted under a suite the ClientHello did not
-    offer.**
-12. **`psk_key_exchange_modes` is not consulted before issuing a
-    NewSessionTicket**, which §4.6.1 requires — the mirror, on the server
-    side, of the client bug in the fixed list above.
+11. **NOT A DEFECT — a resumed session accepted under a suite the
+    ClientHello did not offer.** Read the runner's own comment before
+    acting on this one, which is what took two attempts:
+
+        In TLS 1.3, clients may advertise a cipher list which does not
+        include the selected cipher. Test that we tolerate this. Servers
+        may resume at another cipher if the PRF matches and are not doing
+        0-RTT, but BoringSSL will always decline.
+
+    `Resume-Server-UnofferedCipher-TLS13` offers AES-128-GCM-SHA256 for a
+    ChaCha20-SHA256 ticket. The PRF matches, so resuming is permitted and
+    `expectResumeRejected` encodes BoringSSL's policy rather than a
+    requirement. Its sibling `TLS13-NoTicket-NoAccept` was ours but not
+    the library's: `SSL_OP_NO_TICKET` means the server must not *accept*
+    a ticket either, and the shim was using the flag only to skip minting
+    one. Fixed there.
+12. **FIXED — `psk_key_exchange_modes` was not consulted**, in both
+    directions.
+
+    Outbound, §4.2.9: servers "SHOULD NOT send NewSessionTicket with
+    tickets that are not compatible with the advertised modes", and zssl
+    minted one for anybody. `sendNewSessionTicket` now refuses with
+    `TicketNotPermitted` — before the `errdefer` that fails the machine,
+    because ticketing a client that must ignore the ticket is the
+    embedder's policy mistake and not a broken connection.
+    `ticketPermitted` is the question to ask instead, and both harnesses
+    now ask it.
+
+    The rule is deliberately narrow: false only when the hello advertised
+    modes and left ours out of them. A hello advertising *none* has
+    nothing for a ticket to be incompatible with, and the first version
+    of this fix refused those too — which broke ten of tlsfuzzer's
+    `connection-abort` conversations, all waiting on a ticket their hello
+    never asked about. They are legitimate clients, and the RFC's wording
+    is about compatibility rather than about permission.
+
+    Inbound, §4.2.9 and §9.2: "In order to use PSKs, clients MUST also
+    send a psk_key_exchange_modes extension". An offer arriving without
+    one was answered with a full handshake — a malformed offer hidden
+    behind a working connection — and is now missing_extension.
 
 None of these are exploitable as far as the runner can show; they are
 laxity, and laxity is what BoGo exists to find.

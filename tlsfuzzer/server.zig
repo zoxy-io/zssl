@@ -192,7 +192,13 @@ fn serve(
     // §4.6.1's ordering: derive the PSK, then seal the ticket that stands
     // for it, and only after `connected`.
     var issued: u8 = 0;
-    while (issued < options.tickets) : (issued += 1) {
+    // §4.6.1 is the library's to enforce: a client that never advertised
+    // psk_dhe_ke cannot use a ticket and `sendNewSessionTicket` refuses
+    // to mint one. Most tlsfuzzer scripts do not offer the extension, so
+    // asking first is what keeps that refusal from failing conversations
+    // that are otherwise correct.
+    const ticket_count: u8 = if (server.ticketPermitted()) options.tickets else 0;
+    while (issued < ticket_count) : (issued += 1) {
         const psk = server.resumptionPsk(&ticket_nonce, &store.psk);
         store.psk_bytes = @intCast(psk.len);
         const sealed = server.sendNewSessionTicket(&.{

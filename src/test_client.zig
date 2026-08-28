@@ -38,6 +38,13 @@ pub const Options = struct {
     /// not on the curve — the parser admits it and the key exchange must
     /// be what refuses it.
     offer_bogus_p256_share: bool = false,
+    /// Omit psk_key_exchange_modes. Beside a PSK offer that is §4.2.9's
+    /// missing_extension; alone it is a hello with nothing for a ticket
+    /// to be incompatible with, so a ticket is still permitted — see
+    /// `ServerHandshake.ticketPermitted`. Advertising modes that exclude
+    /// psk_dhe_ke is the case that forbids one, and `psk_mode_byte`
+    /// reaches it.
+    omit_psk_modes: bool = false,
     /// Omit the key_share extension outright, rather than sending an
     /// empty one. §9.2 makes that a missing_extension; an empty
     /// `client_shares` is the legal §4.2.8 request for the server's
@@ -337,6 +344,8 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             }
             builder.patchU16(share_list);
             builder.patchU16(shares);
+            if (!self.options.omit_psk_modes) self.buildPskModes(builder);
+            // §4.2: pre_shared_key is last, so it stays after the modes.
             if (self.options.resume_with != null) self.buildPskExtensions(builder);
         }
 
@@ -344,15 +353,24 @@ pub fn TestClient(comptime suite: CipherSuite) type {
         /// §4.2 requires to be the last extension. The binder is written
         /// as zeros here and patched by `buildHello` once the message is
         /// complete — §4.2.11.2's truncated-transcript dance.
-        fn buildPskExtensions(self: *Self, builder: *wire.Builder) void {
-            const ticket = self.options.resume_with.?;
-            assert(ticket.psk_bytes == hash_bytes);
-            assert(ticket.ticket_bytes >= 1);
+        /// §4.2.9, on every hello rather than only when resuming, because
+        /// the extension governs the tickets a server may *send* as well
+        /// as the PSKs a client may offer — a test client that only ever
+        /// sent it while resuming could not exercise the outbound half of
+        /// that rule at all. `client_messages.zig` sends it
+        /// unconditionally for the same reason.
+        fn buildPskModes(self: *Self, builder: *wire.Builder) void {
             builder.putU16(45); // psk_key_exchange_modes
             const modes = builder.markU16();
             builder.putByte(1);
             builder.putByte(self.options.psk_mode_byte);
             builder.patchU16(modes);
+        }
+
+        fn buildPskExtensions(self: *Self, builder: *wire.Builder) void {
+            const ticket = self.options.resume_with.?;
+            assert(ticket.psk_bytes == hash_bytes);
+            assert(ticket.ticket_bytes >= 1);
             builder.putU16(41); // pre_shared_key
             const extension = builder.markU16();
             const identities = builder.markU16();

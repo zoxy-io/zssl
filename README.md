@@ -29,7 +29,7 @@ know about.
 interoperates with OpenSSL and `std.crypto.tls` in both directions, and
 both halves run under BoringSSL's adversarial BoGo runner, which has
 found real defects — a remote panic on a garbage certificate among them —
-and still has ten open gaps, all recorded in
+and leaves nine findings still on the ledger, all recorded in
 [docs/BOGO.md](docs/BOGO.md). The server half also runs under tlsfuzzer,
 which has found three ([docs/TLSFUZZER.md](docs/TLSFUZZER.md)). It has had
 no external audit. Don't put it in front of anything you care about yet.
@@ -253,7 +253,7 @@ are worth:
 
 | Oracle | What it proves |
 | --- | --- |
-| **BoGo**<br>[![bogo passing](https://img.shields.io/badge/bogo-258%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | BoringSSL's own hostile-peer runner, at a pinned commit, drives `bogo/shim.zig` through the corpus and checks not only that we refuse but *which alert we send*. 258 cases pass (134 client, 124 server), 0 fail, 6918 are declined by the shim as out of scope, and 718 are suppressed by name with a one-line reason each. A floor on the passing count is what stops a suppression from being quiet — and the two badges are a pair on purpose, because a bare "258 passing" reads as a coverage claim when 6918 cases were never run at all. |
+| **BoGo**<br>[![bogo passing](https://img.shields.io/badge/bogo-261%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | BoringSSL's own hostile-peer runner, at a pinned commit, drives `bogo/shim.zig` through the corpus and checks not only that we refuse but *which alert we send*. 261 cases pass (134 client, 127 server), 0 fail, 6918 are declined by the shim as out of scope, and 715 are suppressed by name with a one-line reason each. A floor on the passing count is what stops a suppression from being quiet — and the two badges are a pair on purpose, because a bare "261 passing" reads as a coverage claim when 6918 cases were never run at all. |
 | **tlsfuzzer**<br>[![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-15%2F57%20scripts-yellow)](docs/TLSFUZZER.md) | A third implementation — Python over tlslite-ng — driving our *server* through scripted conversations, at a pinned commit. 15 of 57 TLS 1.3 scripts run and pass, 1261 conversations between them: every plaintext length from 1 to 2^14, and 150 that abort the connection at every point in the handshake. The gate serves two leaves, ECDSA and RSA, because a dozen scripts advertise RSA-PSS alone and a single-leaf harness could only answer them with handshake_failure. 42 scripts are disabled and 18 of those are not yet triaged: a debt the gate prints on every run rather than burying. |
 | **RFC 8448** replay | The key schedule, binder chain and record layer produce the RFC's traced bytes exactly — secrets, flights and ServerHello re-encoded byte for byte. |
 | **OpenSSL interop** | Three legs. `openssl s_client` completes against our server, with openssl's own X.509 verifying our certificate. Our client completes against `openssl s_server -rev` and opens the echo it seals back — twice, once against an ECDSA certificate and once against an RSA-2048 one openssl mints on the spot, since those are different verification paths. Each client leg asserts the leaf key type it meant to exercise, so the RSA leg cannot quietly pass on an ECDSA certificate, and both drive the `chain_verifier` seam and assert it saw the chain. |
@@ -265,7 +265,7 @@ fragmented ClientHellos, tampered Finished messages, corrupted binders,
 inverted flights, sequence exhaustion.
 
 The gaps, stated plainly: BoGo's own count of what it never ran is far
-larger than what it ran — 6918 cases against 258 — and the ten
+larger than what it ran — 6918 cases against 261 — and the nine
 laxities it did find are still open. [docs/BOGO.md](docs/BOGO.md) has
 both, by name.
 
