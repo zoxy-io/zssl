@@ -10,8 +10,8 @@ itself.
 It runs: `zig build tlsfuzzer`.
 
 ```
-tlsfuzzer: 14 scripts to run, 43 disabled (22 of those untriaged)
-tlsfuzzer: 14 scripts passed, 0 failed, 43 disabled, floor 14
+tlsfuzzer: 15 scripts to run, 42 disabled (18 of those untriaged)
+tlsfuzzer: 15 scripts passed, 0 failed, 42 disabled, floor 15
 tlsfuzzer: PASS
 ```
 
@@ -23,11 +23,11 @@ is thin, and the rest of this file is about how thin, and why.
 - **`tlsfuzzer/server.zig`** — the server under test. A long-lived
   listener rather than a per-case binary: it never dies on a failing
   connection (most of tlsfuzzer's conversations are *meant* to fail), it
-  answers `GET / HTTP/1.0` with a small HTTP response because the scripts
-  wait for bytes back, and it answers a close_notify with a close_notify
-  because the scripts' `ExpectAlert` requires one — BoGo's open finding 6
-  seen from the other side. It keeps a ticket across connections so the
-  resumption scripts have something to return with.
+  **echoes application data back byte for byte**, and it answers a
+  close_notify with a close_notify because the scripts' `ExpectAlert`
+  requires one — BoGo's open finding 6 seen from the other side. It keeps
+  a ticket across connections so the resumption scripts have something to
+  return with.
 - **`tlsfuzzer/run.zig`** — the gate. Fetches the pinned tlsfuzzer commit
   into `zig-out/tlsfuzzer/`, builds a virtualenv holding tlsfuzzer's own
   pinned tlslite-ng, starts **one harness per leaf**, runs the scripts,
@@ -59,32 +59,41 @@ is reporting on the fixture.
 
 ## The numbers, and the debt
 
-**14 of 57** `test-tls13-*` scripts run, 259 conversations between them.
-`test-tls13-connection-abort` is 150 of those on its own: it aborts the
-connection at every point in the handshake and checks the server neither
-hangs nor crashes. `test-tls13-invalid-ciphers` is another 52. The rest
-are the basic conversation, alert handling encrypted and not, Minerva
-timing-signal sanity, HelloRetryRequest and the §9.2 hello that must not
-get one, empty and unrecognised cipher lists, record padding, ticket
-counting, and the two RSA signature scripts.
+**15 of 57** `test-tls13-*` scripts run, 1261 conversations between them.
+`test-tls13-lengths` is 1002 of those on its own: every plaintext length
+from 1 to 2^14, each echoed back and checked for size.
+`test-tls13-connection-abort` is another 150, aborting the connection at
+every point in the handshake and checking the server neither hangs nor
+crashes, and `test-tls13-invalid-ciphers` 52. The rest are the basic
+conversation, alert handling encrypted and not, Minerva timing-signal
+sanity, HelloRetryRequest and the §9.2 hello that must not get one, empty
+and unrecognised cipher lists, record padding, ticket counting, and the
+two RSA signature scripts.
 
-**43 disabled, and 22 of them say "not yet triaged".** That is a debt,
-not a result. 21 carry real scope reasons — client certificates, FFDHE,
+**42 disabled, and 18 of them say "not yet triaged".** That is a debt,
+not a result. 24 carry real scope reasons — client certificates, FFDHE,
 brainpool curves, EdDSA, ML-DSA, ML-KEM, 0-RTT, compressed certificates,
-`psk_ke` without (EC)DHE — each pointing at a written decision. The
-other 22 are scripts that run against the harness and fail some or all
-of their conversations, and nobody has yet worked out whether each is a
-scope decision or a defect. The ledger records the counts observed and
-which leaf produced them, so they can be triaged rather than
-rediscovered.
+`psk_ke` without (EC)DHE, TLS 1.2 fallback, AES-CCM — each pointing at a
+written decision. The other 18 are scripts that run against the harness
+and fail some or all of their conversations, and nobody has yet worked
+out whether each is a scope decision or a defect. The ledger records the
+counts observed and which leaf produced them, so they can be triaged
+rather than rediscovered.
+
+One caution about those counts, learned by measuring twice: some scripts
+randomise their own vectors, so their pass count moves run to run with
+nothing changing underneath. `symetric-ciphers` scored 59, 71, 69 and 75
+on one unmodified binary. Its entry names the cause — every failure is an
+AES-CCM suite — and deliberately carries no number, because a number that
+moves on its own is worse in a ledger than no number at all.
 
 The gate prints the untriaged number on every run for that reason: a
 suppression ledger where most entries say "unknown" is a debt, and a debt
-that is not counted is a debt that is not paid. Triaging those 22 is the
+that is not counted is a debt that is not paid. Triaging those 18 is the
 next work here, and it has already produced three findings — 4 through 6
 below — the way BoGo's first run did.
 
-**The floor** is 14. `scripts.json` can disable a script, but not quietly:
+**The floor** is 15. `scripts.json` can disable a script, but not quietly:
 the passing count falls with it and the gate goes red.
 
 ## What it cost to get here
@@ -177,11 +186,17 @@ of the six would have been visible to a gate that was only read.
 
 ## Timing
 
-A warm run is about **2.5 seconds**; the scripts are trivially fast, with
-`connection-abort`'s 150 conversations taking 0.81 s. A cold run adds a
-`git clone` and a virtualenv with two pip installs, which is the minute
-or so, and both are cached in `zig-out/tlsfuzzer/` afterwards. In CI the
-setup dominates and the corpus does not.
+A warm run is about **44 seconds**, and 35 of those are
+`test-tls13-lengths` walking 1002 conversations from one byte to 2^14.
+Everything else together is under ten: `connection-abort`'s 150
+conversations take 0.81 s. A cold run adds a `git clone` and a virtualenv
+with two pip installs, which is the minute or so, and both are cached in
+`zig-out/tlsfuzzer/` afterwards.
+
+Worth the 35 seconds: those conversations are the only coverage the
+record layer gets across every legal plaintext length, and the §5.4 cap
+that BoGo's open finding 3 says is missing lives in exactly that path.
+The gate ran in 2.5 s before `lengths` could run at all.
 
 ## Running it
 
@@ -191,7 +206,7 @@ zig build tlsfuzzer-server -- --port 4433    # the server alone, to hand-drive
 ```
 
 With the server running, any script in the pinned checkout can be pointed
-at it — which is how the 22 untriaged entries get triaged:
+at it — which is how the 18 untriaged entries get triaged:
 
 ```sh
 cd zig-out/tlsfuzzer/tlsfuzzer

@@ -140,9 +140,20 @@ suppressed cases between them:
    `key_share` in EncryptedExtensions, extended_master_secret,
    ec_point_formats, an OCSP or SCT response on Certificate, trust
    anchors, and unknown or duplicate extensions. We ignore all of them.
-3. **No §5.4 cap on the decrypted inner plaintext.** DESIGN.md §5 claims
-   the cap; the padded cases show content past 2^14 getting through once
-   padding is stripped.
+3. **No §5.4 cap on the inner plaintext *before* padding is stripped.**
+   `Protector.open` bounds the content it hands back — `content_bytes >
+   plaintext_bytes_max` has been a `record_overflow` since slice 1 — but
+   never checks the inner plaintext it was handed against
+   `record.inner_plaintext_bytes_max` (§5.4's 2^14+1), which is why that
+   constant is defined and unused. So `LargePlaintext-TLS13-Padded-16384-1`
+   and `-8193-8192`, both 16386 inner bytes, are accepted where §5.4 says
+   record_overflow.
+
+   Worth reading as a lesson about findings: this said "content past 2^14
+   getting through once padding is stripped" until 2025-08-28, which is
+   the half that *was* checked. The case numbers were right and the
+   diagnosis was not, so nobody could act on it. A finding is a
+   measurement or it is a guess with a case number attached.
 4. **No bound on empty application records or on KeyUpdates** within a
    session. BoringSSL caps both; our KeyUpdate ceiling is far above the
    count that should end a connection.

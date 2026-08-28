@@ -129,9 +129,10 @@ plaintext and the embedder compensated above the API.
 `Protector` is one direction under one traffic key: AEAD contexts,
 static IV, sequence. The §5.5 sequence bound (2^24 records, the
 AES-GCM-conservative figure applied to every suite) is an error, not a
-wrap. zssl never writes padding; it strips peers' padding per §5.4 —
-though not, yet, the §5.4 length cap on what is left once the padding is
-gone, which is BoGo finding 3 in `docs/BOGO.md`.
+wrap. zssl never writes padding; it strips peers' padding per §5.4, and caps
+what is left at §5.1's 2^14 — but not, yet, the §5.4 cap on the inner
+plaintext it was handed *before* stripping, which is BoGo finding 3 in
+`docs/BOGO.md`.
 
 ## §6 Slices
 

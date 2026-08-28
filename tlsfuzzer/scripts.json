@@ -35,6 +35,9 @@
       "leaf": "rsa"
     },
     {
+      "name": "test-tls13-lengths.py"
+    },
+    {
       "name": "test-tls13-minerva.py"
     },
     {
@@ -80,12 +83,11 @@
     "test-tls13-keyupdate.py": "Fails 2 of 62 conversations against the rsa leaf, its best; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
     "test-tls13-large-number-of-extensions.py": "Fails 20 of 22 conversations against the rsa leaf, its best; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
     "test-tls13-legacy-version.py": "Fails 8 of 10 conversations against the rsa leaf, its best; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
-    "test-tls13-lengths.py": "Fails 1000 of 1002 conversations against the ecdsa leaf, its best; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
     "test-tls13-mldsa-in-certificate-verify.py": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",
     "test-tls13-mlkem.py": "ML-KEM: post-quantum key exchange, not implemented (DESIGN.md \u00a71).",
     "test-tls13-multiple-ccs-messages.py": "Fails 4 of 7 conversations against the ecdsa leaf, its best; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
     "test-tls13-no-unknown-groups.py": "Groups outside x25519/secp256r1/secp384r1 (DESIGN.md \u00a71).",
-    "test-tls13-non-support.py": "Fails 53 of 53 conversations against the ecdsa leaf, its best; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-non-support.py": "TLS 1.2: the script expects a ServerHello at (3,3) followed by a ServerHelloDone, so every conversation asks for a version zssl does not implement (DESIGN.md \u00a71).",
     "test-tls13-obsolete-curves.py": "Groups outside x25519/secp256r1/secp384r1 (DESIGN.md \u00a71).",
     "test-tls13-post-handshake-auth.py": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",
     "test-tls13-psk_dhe_ke.py": "Fails 4 of 4 conversations against the ecdsa leaf, its best; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
@@ -96,9 +98,9 @@
     "test-tls13-session-resumption.py": "Fails 3 of 7 conversations against the rsa leaf, its best; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
     "test-tls13-shuffled-extentions.py": "Fails 17 of 19 conversations against the rsa leaf, its best; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
     "test-tls13-signature-algorithms.py": "Fails 7 of 102 conversations against the rsa leaf, its best; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
-    "test-tls13-symetric-ciphers.py": "Fails 34 of 102 conversations against the rsa leaf, its best; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-symetric-ciphers.py": "AES-CCM: every failure is TLS_AES_128_CCM_SHA256 or TLS_AES_128_CCM_8_SHA256, outside the suite policy (DESIGN.md \u00a71). No count here on purpose \u2014 the script randomises its fuzz vectors, so it varies run to run.",
     "test-tls13-unrecognised-groups.py": "Groups outside x25519/secp256r1/secp384r1 (DESIGN.md \u00a71).",
-    "test-tls13-version-negotiation.py": "Fails 197 of 202 conversations against the rsa leaf, its best; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
+    "test-tls13-version-negotiation.py": "TLS 1.2: every failing conversation is a fallback from a 1.3 draft codepoint to 1.2, which zssl does not implement (DESIGN.md \u00a71).",
     "test-tls13-zero-content-type.py": "Fails 2 of 8 conversations against the ecdsa leaf, its best; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md",
     "test-tls13-zero-length-data.py": "Fails 3 of 11 conversations against the rsa leaf, its best; not yet triaged into a scope decision or a defect. docs/TLSFUZZER.md"
   }

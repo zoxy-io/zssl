@@ -82,7 +82,7 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
   needs `raw.githubusercontent.com` auth, and the badge would have to go
   static like the BoGo pair.
 - `tlsfuzzer/scripts.json` is the same kind of ledger as
-  `bogo/config.json`, with one difference that matters: 22 of its entries
+  `bogo/config.json`, with one difference that matters: 18 of its entries
   say "not yet triaged", and the gate counts and prints them. That number
   should go *down*. Never add a new untriaged entry when the cause is
   known, and never let the count grow to make a pin bump green. Triage a

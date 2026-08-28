@@ -13,8 +13,10 @@
 //!     most of tlsfuzzer's conversations are *meant* to fail, and a
 //!     harness that exits on the first refusal scores one case and then
 //!     hangs the rest;
-//!   - answer application data with something, because the scripts send
-//!     `GET / HTTP/1.0` and wait for bytes back;
+//!   - echo application data back byte for byte, which is the mode
+//!     tlsfuzzer's scripts are written against — `test-tls13-lengths`
+//!     calls it "echo mode" in its own help text and sends every length
+//!     from 1 to 2^14 expecting exactly that many bytes in reply;
 //!   - answer a close_notify with a close_notify, which `ExpectAlert`
 //!     requires and which `sendAlert` made expressible.
 //!
@@ -30,15 +32,6 @@ const Credentials = zssl.Credentials;
 const ServerHandshake = zssl.ServerHandshake;
 const cipher_suite = zssl.cipher_suite;
 const record = zssl.record;
-
-/// What we answer `GET / HTTP/1.0` with. The scripts check that bytes
-/// came back, not what they say.
-const http_response =
-    "HTTP/1.0 200 OK\r\n" ++
-    "Content-Type: text/plain\r\n" ++
-    "Connection: close\r\n" ++
-    "\r\n" ++
-    "zssl\n";
 
 /// A conversation that needs more records than this is not a test case,
 /// it is a peer that has stopped making progress.
@@ -223,6 +216,10 @@ const Pump = struct {
     write_buffer: [4 * record.wire_record_bytes_max]u8,
     storage: [4 * record.wire_record_bytes_max]u8,
     out: [4 * record.wire_record_bytes_max]u8,
+    /// Where a record's plaintext is held while its echo is sealed back
+    /// into `out`. §5.1's cap, because that is the most
+    /// `sendApplicationData` accepts in one record.
+    echo: [record.plaintext_bytes_max]u8,
 
     fn init(pump: *Pump, io: Io, stream: Io.net.Stream) void {
         pump.io = io;
@@ -281,8 +278,35 @@ const Pump = struct {
             switch (event) {
                 .application_data => |bytes| {
                     if (bytes.len == 0) continue;
-                    const sealed = server.sendApplicationData(http_response, &pump.out) catch |err|
-                        return pump.abort(server, err);
+                    // Echo, byte for byte. A canned HTTP response answers
+                    // "did anything come back" and nothing else, which is
+                    // all most scripts ask — but `test-tls13-lengths`
+                    // checks the *length* of the reply against what it
+                    // sent, across every size from 1 to 2^14, and no
+                    // fixed response can satisfy 1002 conversations that
+                    // each want a different one.
+                    //
+                    // An error rather than an assertion, because the
+                    // length is one the peer chose. No peer can reach it
+                    // today: `Protector.open` caps the stripped content
+                    // at §5.1's 2^14 before it ever becomes an event, and
+                    // `sendApplicationData` asserts the same bound on the
+                    // way back out. It is here so that the slice below is
+                    // guarded by a refusal rather than by a bound proved
+                    // two modules away — and if that bound ever moves,
+                    // this harness answers record_overflow instead of
+                    // aborting the listener mid-corpus.
+                    if (bytes.len > pump.echo.len) {
+                        return pump.abort(server, error.RecordOverflow);
+                    }
+                    // Copied out first: `bytes` points into `pump.out`,
+                    // which is where the reply gets sealed, and sealing
+                    // copies its content into that same buffer.
+                    @memcpy(pump.echo[0..bytes.len], bytes);
+                    const sealed = server.sendApplicationData(
+                        pump.echo[0..bytes.len],
+                        &pump.out,
+                    ) catch |err| return pump.abort(server, err);
                     try pump.write(sealed);
                 },
                 .closed => {
