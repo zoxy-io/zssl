@@ -246,19 +246,23 @@ Everything above is argued in [docs/DESIGN.md](docs/DESIGN.md) §1.
 
 ## Testing
 
-`zig build test` runs the unit suite; `zig build interop` runs the
-real-OpenSSL gate; `zig build bogo` and `zig build tlsfuzzer` run the two
-adversarial ones. Six kinds of evidence, in rough order of how much they
-are worth:
+Six kinds of evidence, in rough order of how much they are worth. The two
+adversarial gates run as `zig build bogo` and `zig build tlsfuzzer`;
+everything else runs on every build.
 
 | Oracle | Status | Details |
 | --- | --- | --- |
 | [**BoGo**](docs/BOGO.md) | [![bogo passing](https://img.shields.io/badge/bogo-261%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | Hostile-peer corpus; checks *which* alert we send |
 | [**tlsfuzzer**](docs/TLSFUZZER.md) | [![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-15%2F57%20scripts-yellow)](docs/TLSFUZZER.md) | A third implementation, driving our *server* |
-| [**RFC 8448**](src/rfc8448_test.zig) | — | The RFC's traced bytes, reproduced exactly |
-| [**OpenSSL**](interop/main.zig) | — | Three legs against a real `openssl` binary |
-| [**`std.crypto.tls`**](src/std_interop_test.zig) | — | A second stack, in memory, both directions |
-| [**Fuzzing**](src/fuzz_test.zig) | — | Nine targets: a value or an error, never a panic |
+| [**RFC 8448**](src/rfc8448_test.zig) | `zig build test` | The RFC's traced bytes, reproduced exactly |
+| [**OpenSSL**](interop/main.zig) | `zig build interop` | Three legs against a real `openssl` binary |
+| [**`std.crypto.tls`**](src/std_interop_test.zig) | `zig build test` | A second stack, in memory, both directions |
+| [**Fuzzing**](src/fuzz_test.zig) | `zig build test` | Nine targets: a value or an error, never a panic |
+
+A badge means the gate holds a passing count against a floor, so a
+regression or a quiet suppression stops the build. The rows carrying a
+command instead are pass/fail suites with no floor to hold: they run on
+every build, and the `ci` badge at the top of this file is their status.
 
 Both adversarial gates run at a pinned commit. BoGo covers 134 client and
 127 server cases; tlsfuzzer covers 1261 conversations, among them every
