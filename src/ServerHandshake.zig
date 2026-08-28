@@ -265,11 +265,21 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
     // parser records presence separately and why this sits ahead of the
     // retry path.
     //
-    // Neither extension present is a different case: a client not
-    // offering (EC)DHE at all, which §9.2 does not reach. zssl requires
-    // (EC)DHE in every mode (DESIGN §6), so that refusal is a
-    // handshake_failure, and the branch below produces it.
+    // Neither extension present splits in two, which is what the clause
+    // just below sorts out: with no PSK offered it is still a §9.2
+    // violation, and with one it may be a legitimate attempt at psk_ke,
+    // which §9.2 does not reach and which zssl refuses for its own
+    // reasons (DESIGN §6) as a handshake_failure further down.
     if (hello.supported_groups_wire != null and !hello.has_key_share) {
+        return error.MissingExtension;
+    }
+    // The other direction, and the reason the rule above is not the whole
+    // of §9.2: a hello offering no PSK at all can only be attempting
+    // (EC)DHE, so *both* extensions are mandatory and either one missing
+    // is the same abort. A hello that does offer a PSK might legitimately
+    // be attempting psk_ke, which §9.2 does not reach — zssl refuses that
+    // for its own reasons (DESIGN §6), with handshake_failure below.
+    if (hello.pre_shared_key_wire == null and hello.supported_groups_wire == null) {
         return error.MissingExtension;
     }
     if (hello.preferredKeyShare()) |offered| {

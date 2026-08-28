@@ -360,6 +360,7 @@ fn alertFor(err: anyerror) ?zssl.alert.Description {
         => .illegal_parameter,
         error.MalformedAlert,
         error.MalformedMessage,
+        error.MalformedCertificate,
         error.MalformedExtension,
         error.DuplicateExtension,
         error.SuiteOverflow,

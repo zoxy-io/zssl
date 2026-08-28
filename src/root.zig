@@ -15,6 +15,7 @@ pub const Credentials = @import("Credentials.zig");
 pub const ServerHandshake = @import("ServerHandshake.zig");
 pub const alert = @import("alert.zig");
 pub const certificate_list = @import("certificate_list.zig");
+pub const der_bounds = @import("der_bounds.zig");
 pub const cipher_suite = @import("cipher_suite.zig");
 pub const client_hello = @import("client_hello.zig");
 pub const client_messages = @import("client_messages.zig");

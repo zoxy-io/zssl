@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 249 passed, 0 failed, 6918 declined by the shim (89), floor 249
+bogo: 258 passed, 0 failed, 6918 declined by the shim (89), floor 258
 bogo: PASS
 ```
 
@@ -41,14 +41,14 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**249 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. 128 drive
-`ClientHandshake` and 121 drive `ServerHandshake`. The server number was
+**258 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. 134 drive
+`ClientHandshake` and 124 drive `ServerHandshake`. The server number was
 6 until RSA signing landed, 100 until secp256r1/secp384r1 did, 110 until
 §9.2's `missing_extension` did, 111 until §5.4's inner-plaintext cap did,
-and 113 until eight suppressions turned out to be describing bugs that
-were already fixed. The client number was 121 until §4.2's
-unsupported_extension landed; see below.
+113 until eight suppressions turned out to be describing bugs that were
+already fixed, and 121 until finding 8 was taken apart. The client number
+was 121 until §4.2's unsupported_extension landed; see below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
 either gets fixed or gets an entry in `DisabledTests` with a one-line
@@ -129,10 +129,10 @@ Three bugs, fixed in this slice:
    flight was at least 500 bytes, which a legitimately small ECDSA leaf
    falsifies. The floor is now the encoded chain's own size.
 
-Twelve more were open and ten remain — 2 and 3 are now fixed, and are
-kept in place below rather than renumbered, because the ledger cites
-these by number. Each of the ten is an entry in the ledger citing this
-list, 37 suppressed cases between them.
+Twelve more were open and ten remain — 2 and 3 are fixed and 8 is down to
+two cases we intend to keep. All three are kept in place below rather
+than renumbered, because the ledger cites these by number. 28 suppressed
+cases sit across the ten.
 
 Those 44 are what survived being *measured*. Every OPEN GAP entry was
 lifted at once and the corpus run in full: 8 of the 52 passed outright,
@@ -205,32 +205,63 @@ name.
    rather than as §6.1's half-close.
 7. **NewSessionTicket extension bodies are not checked** for a minimal
    encoding.
-8. **Some alert choices differ from BoringSSL's** — trailing data after a
-   Certificate answers `bad_certificate` where `decode_error` is the
-   better reading, and a malformed alert answers `decode_error` where
-   §6.1 wants `illegal_parameter`. 11 cases, down from 19, and no longer
-   describable as "the least interesting".
+8. **Two alert choices we mean to keep**, down from 19. What was here
+   was never one finding, and the label cost four slices:
 
-   This entry has been wrong three times, which is the useful part.
-   `MissingKeyShare-Server-TLS13` left it when tlsfuzzer's
-   `keyshare-omitted` showed §9.2's `missing_extension` was never sent at
-   all (docs/TLSFUZZER.md, finding 6). Eight more left it when the group
-   was measured: `TrailingDataWithFinished-{,Resume-}Server`,
-   `TrailingMessageData-TLS13-ClientFinished`,
-   `WrongMessageType-TLS13-ClientFinished`,
-   `UnexpectedClientEncryptedExtensions-{New,Old}` and
-   `CurveTest-Invalid-{Pad,Truncate}KeyShare-Server-X25519` all pass now,
-   with no change made for them. And one of the 11 that remain wants
-   `missing extension` where we send `handshake_failure` — another
-   missing behaviour sitting in a bucket labelled cosmetic.
+   - `GarbageCertificate-Client-TLS13` was **a remote panic**, not a
+     description. `std.crypto.Certificate.parse` computes where one
+     element starts from where the last ended and reads there without a
+     bounds check, so seven bytes of garbage from a peer aborted the
+     process — in ReleaseSafe, which is what release builds ship, and
+     `catch` cannot answer a safety panic. `src/der_bounds.zig` walks the
+     framing first and refuses anything std could step off the end of.
+   - `ALPNServer-EmptyProtocolName` was **accepted outright**. The
+     server stopped at the first protocol it liked, so a list whose later
+     entries were malformed passed whenever an earlier one matched. ALPN
+     framing is now validated where the ClientHello is parsed, which is
+     not a question the server's configuration gets to answer.
+   - `NoSupportedCurves-TLS13` was **the other half of §9.2**. A hello
+     offering no PSK can only be attempting (EC)DHE, so a missing
+     `supported_groups` is the same abort as a missing `key_share`.
+   - Four were **the wrong error, not the wrong alert**: trailing bytes
+     after EncryptedExtensions, a Certificate, or a CertificateVerify are
+     a framing fault, and so is a NewSessionTicket with an empty ticket.
+     Those answered `bad_certificate`, `decrypt_error` and
+     `unexpected_message` — verdicts about the thing being framed rather
+     than about the framing. `MalformedMessage` and
+     `MalformedCertificate` now carry them, and §6.2's decode_error is
+     what goes on the wire.
+   - Two were **ordering**: a run of noise is answered as "not a TLS
+     record" before "not a content type I know", which is what
+     `record.zig`'s own comment already said the major-byte check was
+     for; and an unrecognised *inner* content type is now
+     `UnknownContentType` rather than the catch-all for a record that
+     never yielded a type at all.
 
-   The common thread is worth naming: an alert the peer cannot read looks
-   exactly like an alert with the wrong description. Five of the eight
-   sit in the window the §4.4.4 fix repaired (docs/TLSFUZZER.md, finding
-   5), where the server sealed with handshake keys the peer had already
-   moved past. This bucket is where that class of bug goes to hide, so
-   nothing should be filed here without the runner's got-versus-want
-   quoted beside it.
+   The two that remain are genuine disagreements, and we keep our answer:
+
+   - `SendBogusAlertType` sends an alert whose level byte is 0x42. We
+     answer decode_error, BoringSSL illegal_parameter. Neither is
+     mandated, and the first draft of this entry overstated it: TLS 1.3
+     declares `AlertLevel` an open enum — `{ warning(1), fatal(2), (255) }`
+     — and deprecates the field outright, so "out of range" is not the
+     clean argument it looked like. What we keep is the refusal: an
+     unrecognised level is a field we cannot interpret, and §6.2's
+     decode_error is the closest description of that. Ignoring the byte
+     entirely, which §6 arguably licenses, would be the other defensible
+     answer and is not the one BoGo wants either.
+   - `UnencryptedEncryptedExtensions` sends EncryptedExtensions as a
+     plaintext handshake record. We answer unexpected_message, BoringSSL
+     bad_record_mac because it attempts decryption. §5.2 gives protected
+     records content_type application_data, so a handshake-typed record
+     there is a message at the wrong moment, and we would rather not run
+     peer bytes through the AEAD when the record's own type says it is
+     not protected.
+
+   The lesson stands and is now paid for: an alert the peer cannot read,
+   a panic, a missing check and a misclassified error all look identical
+   from outside — the runner just says the description differs. Nothing
+   is filed here without the got-versus-want quoted beside it.
 9. **A duplicate extension in the peer's hello is accepted** rather than
    refused, on both sides.
 10. **A PSK offer whose binder list does not match its identity list**,

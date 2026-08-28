@@ -145,8 +145,11 @@ pub const Protector = struct {
         }
         if (index == 0) return error.BadInnerPlaintext;
         const content_bytes = index - 1;
+        // A type we do not know is exactly that, and §5.4 answers it with
+        // unexpected_message — distinct from `BadInnerPlaintext`, which
+        // is a record whose structure never yielded a type byte at all.
         const content_type = record.ContentType.fromWire(out[content_bytes]) orelse
-            return error.BadInnerPlaintext;
+            return error.UnknownContentType;
         // §5.1's cap on what survives unpadding, and now a consequence
         // rather than a check: the guard above holds inner_bytes at
         // 2^14+1, the content-type byte costs one, so this can only be

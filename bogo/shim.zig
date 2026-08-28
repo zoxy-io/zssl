@@ -832,6 +832,7 @@ fn alertFor(err: anyerror) ?alert.Description {
         // Grammar that does not parse at all.
         error.MalformedAlert,
         error.MalformedMessage,
+        error.MalformedCertificate,
         error.MalformedExtension,
         error.MalformedEntry,
         error.DuplicateExtension,

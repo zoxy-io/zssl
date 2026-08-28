@@ -38,6 +38,10 @@ pub const Error = error{
 pub const suites_count_max: u16 = 128;
 pub const extensions_count_max: u16 = 64;
 pub const key_share_entries_max: u16 = 16;
+
+/// Names in one ALPN offer. Browsers send two or three; past this is a
+/// probe, not a client.
+pub const alpn_entries_max: u16 = 32;
 pub const groups_count_max: u16 = 64;
 pub const schemes_count_max: u16 = 64;
 pub const psk_identities_max: u8 = 4;
@@ -285,6 +289,23 @@ fn trackedBit(extension_type: u16) ?u6 {
     };
 }
 
+/// RFC 7301 §3.1: a list of length-prefixed names, each at least one
+/// byte. An empty name is the one shape the grammar forbids outright.
+fn validateAlpnList(data: []const u8) Error!void {
+    var cursor = wire.Cursor.init(data);
+    const list_bytes = try cursor.takeU16();
+    if (list_bytes != cursor.remaining()) return error.MalformedExtension;
+    var entries: u16 = 0;
+    while (cursor.remaining() > 0) : (entries += 1) {
+        if (entries == alpn_entries_max) return error.ExtensionOverflow;
+        assert(entries < alpn_entries_max);
+        const name_bytes = try cursor.takeByte();
+        if (name_bytes == 0) return error.MalformedExtension;
+        _ = try cursor.takeSlice(name_bytes);
+    }
+    if (entries == 0) return error.MalformedExtension;
+}
+
 fn applyExtension(extension_type: u16, data: []const u8, hello: *ClientHello) Error!void {
     switch (extension_type) {
         extension_server_name => hello.server_name = try parseServerName(data),
@@ -300,7 +321,17 @@ fn applyExtension(extension_type: u16, data: []const u8, hello: *ClientHello) Er
             hello.signature_algorithms_wire = try parseU16List(data, schemes_count_max);
         },
         extension_alpn => {
-            if (data.len < 4) return error.MalformedExtension;
+            // No length floor here: `validateAlpnList` needs two bytes of
+            // list length, one of name length and one of name to
+            // succeed, so it enforces the same four and does not need
+            // help arriving at them.
+            // Validated in full here rather than where a protocol gets
+            // selected: selection stops at the first name it likes, so a
+            // list whose *later* entries are malformed would be accepted
+            // whenever an earlier one matched — BoGo offers
+            // ["foo", "", "baz"] and asks for "foo". Framing is not a
+            // question the server's configuration gets to answer.
+            try validateAlpnList(data);
             hello.alpn_wire = data;
         },
         extension_psk_key_exchange_modes => {

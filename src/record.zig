@@ -68,8 +68,12 @@ pub const HeaderError = error{
 /// ciphertext bound; every plaintext type stops at §5.1's. Zero-length
 /// handshake and alert fragments are forbidden by §5.1.
 pub fn parseHeader(bytes: *const [header_bytes]u8) HeaderError!Header {
-    const content_type = ContentType.fromWire(bytes[0]) orelse
-        return error.UnknownContentType;
+    // The major version byte first, because it is the framing question:
+    // "is this a TLS record at all" is answered before "what kind of TLS
+    // record is it", and garbage answers the first one. BoringSSL orders
+    // it the same way (`WRONG_VERSION_NUMBER` for a run of noise), and it
+    // matches what the comment below already says this check is for.
+    //
     // legacy_record_version, bytes[1..3]. §5.1 says it "MUST be ignored
     // for all purposes", and zssl used to admit only 0x0303 and 0x0301 —
     // stricter than the spec, about a field carrying no information, and
@@ -81,6 +85,8 @@ pub fn parseHeader(bytes: *const [header_bytes]u8) HeaderError!Header {
     // sends one has not started a handshake we can continue. We still
     // only ever *write* 0x0303.
     if (bytes[1] != 0x03) return error.NotATlsRecord;
+    const content_type = ContentType.fromWire(bytes[0]) orelse
+        return error.UnknownContentType;
     const length = std.mem.readInt(u16, bytes[3..5], .big);
     const cap: u16 = switch (content_type) {
         .application_data => ciphertext_bytes_max,

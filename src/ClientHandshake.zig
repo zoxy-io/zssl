@@ -32,6 +32,7 @@ const assert = std.debug.assert;
 const alert = @import("alert.zig");
 const backend = @import("crypto/backend_openssl.zig");
 const certificate_list = @import("certificate_list.zig");
+const der_bounds = @import("der_bounds.zig");
 const cipher_suite = @import("cipher_suite.zig");
 const client_hello = @import("client_hello.zig");
 const client_messages = @import("client_messages.zig");
@@ -174,6 +175,16 @@ pub const Error = backend.Error || protect.Error || session_keys.Error ||
     /// does not belong in the message carrying it. Distinct from
     /// `MalformedExtension`, which is a body we could not read.
     UnsupportedExtension,
+    /// A handshake message whose framing does not decode — trailing
+    /// bytes, a length that disagrees with its container. §6.2's
+    /// decode_error, and deliberately not a verdict about whatever the
+    /// message was carrying.
+    MalformedMessage,
+    /// A certificate whose DER framing does not decode. Separate from
+    /// `BadCertificate`, which is a judgement about a certificate we
+    /// could read: wrong key size, unusable algorithm, a chain the
+    /// embedder refused.
+    MalformedCertificate,
     /// An extension whose body does not parse as its type requires.
     MalformedExtension,
     /// The certificate could not be read or its key is outside policy.
@@ -498,7 +509,10 @@ fn drainFlight(self: *ClientHandshake, arm: anytype, out: []u8) Error!Event {
 fn checkEncryptedExtensions(self: *ClientHandshake, body: []const u8) Error!void {
     var cursor = wire.Cursor.init(body);
     const extensions_bytes = try cursor.takeU16();
-    if (extensions_bytes != cursor.remaining()) return error.UnexpectedMessage;
+    // Trailing bytes after the extension block are a framing fault, and
+    // §6.2 calls that decode_error: the message could not be decoded,
+    // rather than arriving at the wrong moment.
+    if (extensions_bytes != cursor.remaining()) return error.MalformedMessage;
     var extensions_seen: u8 = 0;
     while (cursor.remaining() > 0) : (extensions_seen += 1) {
         if (extensions_seen == 8) return error.UnexpectedMessage;
@@ -546,10 +560,11 @@ fn captureLeaf(self: *ClientHandshake, body: []const u8) Error!void {
     assert(self.leaf_key_kind == .none);
     var cursor = wire.Cursor.init(body);
     // certificate_request_context: empty in a server Certificate (§4.4.2).
-    if (try cursor.takeByte() != 0) return error.BadCertificate;
+    if (try cursor.takeByte() != 0) return error.MalformedMessage;
     const list_bytes = try cursor.takeU24();
     const list_der = try cursor.takeSlice(list_bytes);
-    if (cursor.remaining() != 0) return error.BadCertificate;
+    // Bytes after the chain say nothing about the certificates in it.
+    if (cursor.remaining() != 0) return error.MalformedMessage;
     self.certificate_seen = true;
     if (self.config.certificate_policy == .insecure_no_verification) return;
 
@@ -578,8 +593,15 @@ fn captureLeaf(self: *ClientHandshake, body: []const u8) Error!void {
         error.UnsupportedExtension => return error.UnsupportedExtension,
         else => return error.BadCertificate,
     }) orelse return error.BadCertificate;
+    // Framing before meaning. `std.crypto.Certificate.parse` computes
+    // where one element starts from where the last one ended and reads
+    // there unchecked, so a leaf whose lengths point past the end panics
+    // rather than erroring — and `catch` cannot answer a safety panic.
+    // Seven bytes from a peer were enough (BoGo's
+    // `GarbageCertificate-Client-TLS13`).
+    der_bounds.validate(leaf_der) catch return error.MalformedCertificate;
     const certificate: std.crypto.Certificate = .{ .buffer = leaf_der, .index = 0 };
-    const parsed = certificate.parse() catch return error.BadCertificate;
+    const parsed = certificate.parse() catch return error.MalformedCertificate;
     const public_key = parsed.pubKey();
     if (public_key.len > leaf_public_key_bytes_max) return error.BadCertificate;
     switch (parsed.pub_key_algo) {
@@ -621,7 +643,9 @@ fn verifyCertificate(self: *ClientHandshake, arm: anytype, message: handshake.Me
     var body = wire.Cursor.init(message.body());
     const scheme = try body.takeU16();
     const signature = try body.takeSlice(try body.takeU16());
-    if (body.remaining() != 0) return error.BadSignature;
+    // Bytes after the signature are a framing fault; the signature
+    // itself may be perfectly good and has not been checked yet.
+    if (body.remaining() != 0) return error.MalformedMessage;
     var content_buffer: [server_messages.certificate_verify_content_bytes_max]u8 = undefined;
     const content = server_messages.certificateVerifyContent(.server, &arm.transcriptHash(), &content_buffer);
     const public_key = self.leaf_public_key[0..self.leaf_public_key_bytes];
@@ -726,14 +750,19 @@ fn parseTicket(body: []const u8) Error!Ticket {
     ticket.lifetime_s = try cursor.takeU32();
     ticket.age_add = try cursor.takeU32();
     const nonce_bytes = try cursor.takeByte();
-    if (nonce_bytes == 0) return error.UnexpectedMessage;
+    // §4.6.1 writes `ticket_nonce<0..255>`, so an empty nonce is inside
+    // the grammar and this is zssl's policy rather than the RFC's: a
+    // nonce is what a resumption PSK is derived from, and one with no
+    // bytes has nothing to distinguish it. The sibling below *is* the
+    // grammar — `ticket<1..2^16-1>` has a floor of one.
+    if (nonce_bytes == 0) return error.MalformedMessage;
     ticket.nonce = try cursor.takeSlice(nonce_bytes);
     const ticket_bytes = try cursor.takeU16();
-    if (ticket_bytes == 0) return error.UnexpectedMessage;
+    if (ticket_bytes == 0) return error.MalformedMessage;
     ticket.ticket = try cursor.takeSlice(ticket_bytes);
     const extensions_bytes = try cursor.takeU16();
     _ = try cursor.takeSlice(extensions_bytes);
-    if (cursor.remaining() != 0) return error.UnexpectedMessage;
+    if (cursor.remaining() != 0) return error.MalformedMessage;
     assert(ticket.nonce.len >= 1);
     assert(ticket.ticket.len >= 1);
     return ticket;
