@@ -43,11 +43,21 @@ pub fn build(b: *std.Build) void {
         "--include-pattern=/src/",
         "--exclude-pattern=/src/testdata/,/zig-pkg/,/.zig-cache/",
     });
-    coverage_run.addArg(b.pathJoin(&.{ b.install_path, "coverage" }));
+    // The build system owns the output directory rather than kcov: kcov
+    // creates its target but not the target's parent, and nothing else in
+    // this build has any reason to create `zig-out`, so a first run on a
+    // clean checkout — which is every CI run — died on the missing parent.
+    // `addOutputDirectoryArg` makes the directory, passes it as the
+    // argument, and hands back the path to install from.
+    const coverage_output = coverage_run.addOutputDirectoryArg("coverage");
     coverage_run.addArtifactArg(unit_tests);
-    coverage_run.has_side_effects = true;
+    const coverage_install = b.addInstallDirectory(.{
+        .source_dir = coverage_output,
+        .install_dir = .prefix,
+        .install_subdir = "coverage",
+    });
     const coverage_step = b.step("coverage", "Line coverage of the unit suite (needs kcov)");
-    coverage_step.dependOn(&coverage_run.step);
+    coverage_step.dependOn(&coverage_install.step);
 
     // The interop gate: our machines against the real `openssl` binary —
     // genuine libssl, no shared code. Its own executable rather than a
