@@ -66,5 +66,10 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
   a one-line reason, and one that reads "OPEN GAP" points at a numbered
   finding in docs/BOGO.md. Never add an entry without a reason, and never
   lower `passing_floor` to make a run green.
+- The two BoGo badges in README.md are static and carry the same numbers
+  as `passing_floor` and the decline count. They move in the same commit
+  the floor does; a badge that disagrees with the gate is worse than no
+  badge. They are a pair on purpose — the passing figure alone reads as
+  a coverage claim it cannot support.
 - Workflow: one slice per commit, descriptive commit messages recording
   what the oracles proved. Push only when asked.

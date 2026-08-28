@@ -25,9 +25,29 @@ pub fn build(b: *std.Build) void {
     zssl_module.link_libc = true;
     zssl_module.linkLibrary(libcrypto);
 
-    const module_tests = b.addRunArtifact(b.addTest(.{ .root_module = zssl_module }));
+    const unit_tests = b.addTest(.{ .root_module = zssl_module });
+    const module_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests (RFC 8448 vectors + differentials)");
     test_step.dependOn(&module_tests.step);
+
+    // Line coverage over the suite, via kcov's DWARF instrumentation —
+    // the same binary `zig build test` runs, under a tool rather than
+    // directly. Scoped to `src/`: libcrypto is vendored C we do not
+    // write, and the test fixtures are data.
+    //
+    // kcov is a Linux tool. On macOS this step will not find it, which
+    // is why CI is where the number comes from.
+    const coverage_run = b.addSystemCommand(&.{
+        "kcov",
+        "--clean",
+        "--include-pattern=/src/",
+        "--exclude-pattern=/src/testdata/,/zig-pkg/,/.zig-cache/",
+    });
+    coverage_run.addArg(b.pathJoin(&.{ b.install_path, "coverage" }));
+    coverage_run.addArtifactArg(unit_tests);
+    coverage_run.has_side_effects = true;
+    const coverage_step = b.step("coverage", "Line coverage of the unit suite (needs kcov)");
+    coverage_step.dependOn(&coverage_run.step);
 
     // The interop gate: our machines against the real `openssl` binary —
     // genuine libssl, no shared code. Its own executable rather than a

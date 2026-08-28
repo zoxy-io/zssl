@@ -1,5 +1,10 @@
 # zssl
 
+[![ci](https://github.com/zoxy-io/zssl/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/ci.yml)
+[![coverage](https://codecov.io/gh/zoxy-io/zssl/branch/main/graph/badge.svg)](https://codecov.io/gh/zoxy-io/zssl)
+[![bogo passing](https://img.shields.io/badge/bogo-221%20passing-brightgreen)](docs/BOGO.md)
+[![bogo declined](https://img.shields.io/badge/bogo-6965%20declined-lightgrey)](docs/BOGO.md#the-three-numbers)
+
 A sans-I/O TLS 1.3 library in Zig, over libcrypto primitives.
 
 zssl implements the protocol — records, the key schedule, both handshake
@@ -242,6 +247,12 @@ Everything above is argued in [docs/DESIGN.md](docs/DESIGN.md) §1.
 real-OpenSSL gate; `zig build bogo` runs BoringSSL's adversarial one.
 Five kinds of evidence, in rough order of how much they are worth:
 
+The two BoGo badges above are deliberately a pair. A single "221
+passing" would read as a coverage claim, and 6965 cases were never run
+at all — the second badge is there so the first cannot be mistaken for
+the whole picture. Both are static, and move in the same commit as
+`passing_floor` in `bogo/run.zig`.
+
 | Oracle | What it proves |
 | --- | --- |
 | **BoGo** | BoringSSL's own hostile-peer runner, at a pinned commit, drives `bogo/shim.zig` through the corpus and checks not only that we refuse but *which alert we send*. 221 cases pass (121 client, 100 server), 0 fail, 6965 are declined by the shim as out of scope, and 708 are suppressed by name with a one-line reason each. A floor on the passing count is what stops a suppression from being quiet. |
@@ -266,6 +277,7 @@ zig build test                          # the suite
 zig build test -Doptimize=ReleaseSafe   # the mode releases ship
 zig build interop                       # against a real openssl binary
 zig build bogo                          # against BoringSSL's BoGo runner
+zig build coverage                      # line coverage, needs kcov (Linux)
 zig fmt --check src interop bogo scripts build.zig build.zig.zon
 ```
 

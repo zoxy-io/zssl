@@ -1,0 +1,77 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A push that lands while an earlier run is still going supersedes it:
+# the BoGo job takes minutes and there is no value in finishing a run
+# for a commit that is already history.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  # The gates CLAUDE.md names, minus BoGo, which is slow enough to want
+  # its own job. ReleaseSafe is run because it is what releases ship and
+  # assertions stay on there.
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: format
+        run: zig fmt --check src interop bogo scripts build.zig build.zig.zon
+      - name: test
+        run: zig build test
+      - name: test (ReleaseSafe)
+        run: zig build test -Doptimize=ReleaseSafe
+      - name: interop
+        # Exit 2 is the gate's own SKIP; ubuntu ships an openssl that
+        # speaks 1.3, so it should not fire, and a SKIP is not a failure.
+        run: zig build interop || [ $? -eq 2 ]
+
+  # BoringSSL's adversarial runner. Fetches the pinned checkout on first
+  # run, so this job is the one that needs network and Go.
+  bogo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: bogo
+        run: zig build bogo
+      - name: upload the runner log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bogo-log
+          path: zig-out/bogo/bogo.log
+          if-no-files-found: ignore
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: install kcov
+        run: sudo apt-get update && sudo apt-get install -y kcov
+      - name: coverage
+        run: zig build coverage
+      - uses: codecov/codecov-action@v5
+        with:
+          directory: zig-out/coverage
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
