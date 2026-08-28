@@ -247,9 +247,8 @@ Everything above is argued in [docs/DESIGN.md](docs/DESIGN.md) §1.
 
 ## Testing
 
-Six kinds of evidence, in rough order of how much they are worth. The two
-adversarial gates run as `zig build bogo` and `zig build tlsfuzzer`;
-everything else runs on every build.
+Six kinds of evidence, in rough order of how much they are worth. Each is
+its own CI workflow, so they run in parallel and fail separately.
 
 | Oracle | Status | Details |
 | --- | --- | --- |
@@ -260,32 +259,18 @@ everything else runs on every build.
 | [**`std.crypto.tls`**](src/std_interop_test.zig) | [![std.crypto.tls](https://github.com/zoxy-io/zssl/actions/workflows/std-interop.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/std-interop.yml) | A second stack, in memory, both directions |
 | [**Fuzzing**](src/fuzz_test.zig) | [![fuzz](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml) | Nine targets: a value or an error, never a panic |
 
-Every row is its own CI workflow, so the first badge is that workflow's
-last result and the rows run in parallel. BoGo and tlsfuzzer carry a
-second kind of badge underneath: a counted one, because those two gates
-hold a passing count against a floor, and a regression or a quiet
-suppression has to stop the build rather than merely be visible.
-
-Both adversarial gates run at a pinned commit. BoGo covers 134 client and
-127 server cases; tlsfuzzer covers 1261 conversations, among them every
-plaintext length from 1 to 2^14, served over an ECDSA leaf and an RSA one
-because a dozen of its scripts advertise RSA-PSS alone.
-
-Plus directed tests for the things that only break under adversity —
-fragmented ClientHellos, tampered Finished messages, corrupted binders,
-inverted flights, sequence exhaustion.
+Plus directed tests for what only breaks under adversity — fragmented
+ClientHellos, tampered Finished messages, corrupted binders, inverted
+flights, sequence exhaustion.
 
 The gaps, stated plainly. Both adversarial gates decline far more than
-they run, and both say so in their own badge rather than behind it: BoGo
-never ran 6918 of its cases, and tlsfuzzer runs 15 scripts of 57. BoGo's
-two badges are a pair on purpose — "261 passing" alone reads as a
-coverage claim that 6918 declined cases cannot support.
-
-Of what they did run, nine findings still sit on BoGo's ledger and 18
-tlsfuzzer scripts are not yet triaged into a scope decision or a defect.
-Every one is named, with a reason, in the two documents above, and a
-floor on each passing count is what stops a suppression from being
-quiet.
+they run: BoGo never ran 6918 of its cases, and tlsfuzzer runs 15 scripts
+of 57 — 1261 conversations. That is why each carries a second, counted
+badge rather than a bare pass mark, and why both hold their passing count
+against a floor, so a regression or a quiet suppression stops the build.
+Nine findings sit on BoGo's ledger and 18 tlsfuzzer scripts are not yet
+triaged into a scope decision or a defect; the two documents name every
+one, with a reason.
 
 ## Development
 
