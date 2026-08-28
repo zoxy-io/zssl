@@ -961,3 +961,28 @@ test "§4.2: EncryptedExtensions may carry only what we offered, where it is leg
         return error.TestUnexpectedResult;
     }
 }
+
+test "an empty application_data record is refused, not asserted away" {
+    // §5.1 permits a zero-length fragment for application_data and for
+    // nothing else, so `record.parseHeader` admits it by design — and
+    // `handleProtectedRecord` then asserted the record was longer than
+    // its own header. Five bytes from a connected peer aborted the
+    // server. TLS-Anvil found it 51 tests into its first run.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+    try harness.connect(&buffers);
+
+    var empty: [record.header_bytes]u8 = undefined;
+    record.writeHeader(
+        .{ .content_type = .application_data, .length = 0 },
+        empty[0..record.header_bytes],
+    );
+    // The header parses — that is the point — and the refusal comes from
+    // the record layer, which knows a protected record needs a tag.
+    try testing.expectError(
+        error.BadInnerPlaintext,
+        harness.server.handleRecord(&empty, &buffers.server_out),
+    );
+}

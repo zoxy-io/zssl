@@ -588,7 +588,14 @@ fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: [
         else => return error.UnexpectedMessage,
     }
     assert(self.ladder != null);
-    assert(wire_record.len > record.header_bytes);
+    // No length assertion here. §5.1 lets an application_data record be
+    // empty on the wire — `record.parseHeader` admits exactly that case
+    // and refuses it for every other content type — so a record whose
+    // length is zero is legal framing a peer can send at will, and
+    // asserting it away aborted the process. `Protector.open` already
+    // holds the real minimum (a header, a tag, and one inner byte) and
+    // answers a short record with `BadInnerPlaintext`, which is what a
+    // peer deserves. TLS-Anvil found this.
     switch (self.ladder.?) {
         inline else => |*arm| {
             const opened = switch (self.state) {
