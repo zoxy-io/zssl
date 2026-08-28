@@ -64,7 +64,18 @@ jobs:
   # that branch through its endpoint API. The only credential involved is
   # the token GitHub already hands the job.
   coverage:
-    runs-on: ubuntu-latest
+    # Pinned, and not to `ubuntu-latest`, for one checkable reason: kcov
+    # is packaged for jammy (22.04) and for no later Ubuntu — it is absent
+    # from noble, oracular and plucky, and upstream ships source releases
+    # only, no prebuilt binary. `ubuntu-latest` moved to 24.04 and the
+    # install stopped resolving.
+    #
+    # When GitHub retires the 22.04 image, the replacement is to build
+    # kcov from a pinned tag: cmake, binutils-dev, libcurl4-openssl-dev,
+    # zlib1g-dev, libdw-dev, libiberty-dev, then `cmake --install` into a
+    # cached prefix. That is strictly more machinery, so it waits until it
+    # is needed rather than being carried on spec.
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
