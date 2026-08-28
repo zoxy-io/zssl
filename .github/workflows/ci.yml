@@ -27,7 +27,7 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: format
-        run: zig fmt --check src interop bogo scripts build.zig build.zig.zon
+        run: zig fmt --check src interop bogo tlsfuzzer scripts build.zig build.zig.zon
       - name: test
         run: zig build test
       - name: test (ReleaseSafe)

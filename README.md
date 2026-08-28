@@ -270,6 +270,13 @@ larger than what it ran — 6965 cases against 221 — and the twelve
 laxities it did find are still open. [docs/BOGO.md](docs/BOGO.md) has
 both, by name.
 
+A second adversarial client, [tlsfuzzer](https://github.com/tlsfuzzer/tlsfuzzer),
+has a working server harness (`zig build tlsfuzzer-server`) but **no
+gate**: 48 of its 57 TLS 1.3 scripts hardcode secp256r1, which zssl does
+not offer, so a gate today would cover one script.
+[docs/TLSFUZZER.md](docs/TLSFUZZER.md) measures that and says what
+unlocks it.
+
 ## Development
 
 ```sh
@@ -277,8 +284,9 @@ zig build test                          # the suite
 zig build test -Doptimize=ReleaseSafe   # the mode releases ship
 zig build interop                       # against a real openssl binary
 zig build bogo                          # against BoringSSL's BoGo runner
+zig build tlsfuzzer-server -- --port 4433   # server under test for tlsfuzzer
 zig build coverage                      # line coverage, needs kcov (Linux)
-zig fmt --check src interop bogo scripts build.zig build.zig.zon
+zig fmt --check src interop bogo tlsfuzzer scripts build.zig build.zig.zon
 ```
 
 RFC 8448 vectors are generated, never transcribed:

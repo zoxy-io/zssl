@@ -108,4 +108,26 @@ pub fn build(b: *std.Build) void {
     if (b.args) |forwarded| bogo_run.addArgs(forwarded);
     const bogo_step = b.step("bogo", "Adversarial gate: BoringSSL's BoGo runner against zssl");
     bogo_step.dependOn(&bogo_run.step);
+
+    // The second adversarial gate: tlsfuzzer, a TLS client in Python over
+    // tlslite-ng. It drives our *server* through hundreds of
+    // conversations per script, which is the half BoGo reaches least.
+    const tlsfuzzer_server_module = b.createModule(.{
+        .root_source_file = b.path("tlsfuzzer/server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tlsfuzzer_server_module.addImport("zssl", zssl_module);
+    const tlsfuzzer_server = b.addExecutable(.{
+        .name = "zssl-tlsfuzzer-server",
+        .root_module = tlsfuzzer_server_module,
+    });
+    const tlsfuzzer_server_step = b.step(
+        "tlsfuzzer-server",
+        "Run the tlsfuzzer server harness on its own (for manual scripts)",
+    );
+    const tlsfuzzer_server_run = b.addRunArtifact(tlsfuzzer_server);
+    tlsfuzzer_server_run.has_side_effects = true;
+    if (b.args) |forwarded| tlsfuzzer_server_run.addArgs(forwarded);
+    tlsfuzzer_server_step.dependOn(&tlsfuzzer_server_run.step);
 }

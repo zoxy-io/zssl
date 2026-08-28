@@ -29,8 +29,13 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
   case the runner ran and we did not satisfy, *and* on a passing count
   below the floor in `bogo/run.zig` — that floor is what stops a
   `config.json` suppression from being silent. See docs/BOGO.md.
-- `zig fmt --check src interop bogo scripts build.zig build.zig.zon` —
-  format gate.
+- `zig fmt --check src interop bogo tlsfuzzer scripts build.zig
+  build.zig.zon` — format gate.
+`zig build tlsfuzzer-server` is **not** a gate — it is the server under
+test for tlsfuzzer, driven by hand. docs/TLSFUZZER.md records why there
+is no gate yet and what unlocks one; do not add a badge or a CI job for
+it before that lands.
+
 - Run the `tiger-style-reviewer` agent on the working diff before
   committing a slice (same rule as zoxy). Point it at the
   security-critical paths of the diff by name; reachable assertions on
