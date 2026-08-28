@@ -815,6 +815,7 @@ fn alertFor(err: anyerror) ?alert.Description {
         error.RecordOverflow => .record_overflow,
         error.HandshakeFailure => .handshake_failure,
         error.MissingExtension => .missing_extension,
+        error.UnsupportedExtension => .unsupported_extension,
         // Legal grammar, illegal content.
         error.IllegalRetry,
         error.BadServerHello,

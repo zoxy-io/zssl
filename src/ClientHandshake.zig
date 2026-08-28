@@ -170,6 +170,12 @@ pub const Error = backend.Error || protect.Error || session_keys.Error ||
     BadServerHello,
     /// HelloRetryRequest — see the file comment for why this is final.
     HandshakeFailure,
+    /// §4.2: the peer sent an extension we did not offer, or one that
+    /// does not belong in the message carrying it. Distinct from
+    /// `MalformedExtension`, which is a body we could not read.
+    UnsupportedExtension,
+    /// An extension whose body does not parse as its type requires.
+    MalformedExtension,
     /// The certificate could not be read or its key is outside policy.
     BadCertificate,
     /// CertificateVerify did not verify against the leaf.
@@ -476,7 +482,19 @@ fn drainFlight(self: *ClientHandshake, arm: anytype, out: []u8) Error!Event {
     return .none;
 }
 
-/// RFC 7301 §3.2: the server may select only something we offered.
+/// §4.2: EncryptedExtensions carries only extensions the client offered
+/// *and* that §4.2's table permits there. A client receiving any other
+/// "MUST abort the handshake with an unsupported_extension alert".
+///
+/// The intersection is small, which is the point — of everything zssl
+/// offers, only `server_name`, `supported_groups` and ALPN are legal
+/// here. `key_share`, `supported_versions` and `pre_shared_key` are
+/// offered but belong to ServerHello, so seeing one here is as
+/// unsolicited as an extension we never sent at all.
+///
+/// This ignored every extension but ALPN until BoGo's finding 2 was
+/// measured: a server could hand our client anything it liked and we
+/// took it.
 fn checkEncryptedExtensions(self: *ClientHandshake, body: []const u8) Error!void {
     var cursor = wire.Cursor.init(body);
     const extensions_bytes = try cursor.takeU16();
@@ -487,20 +505,38 @@ fn checkEncryptedExtensions(self: *ClientHandshake, body: []const u8) Error!void
         assert(extensions_seen < 8);
         const extension_type = try cursor.takeU16();
         const data = try cursor.takeSlice(try cursor.takeU16());
-        if (extension_type == 16) {
-            if (self.config.alpn_protocols.len == 0) return error.BadAlpn;
-            var list = wire.Cursor.init(data);
-            const list_bytes = try list.takeU16();
-            if (list_bytes != list.remaining()) return error.BadAlpn;
-            // §3.2: the server names exactly one protocol, and it must be
-            // one of ours.
-            const name = try list.takeSlice(try list.takeByte());
-            if (list.remaining() != 0) return error.BadAlpn;
-            self.alpn_selected = for (self.config.alpn_protocols, 0..) |ours, index| {
-                if (std.mem.eql(u8, name, ours)) break @intCast(index);
-            } else return error.BadAlpn;
+        switch (extension_type) {
+            0 => { // server_name
+                // RFC 6066 §3: the ack is empty. Bytes after it are a
+                // framing error, and that verdict has to come *before*
+                // the solicitation check below — BoGo wants decode_error
+                // for a malformed ack and unsupported_extension for a
+                // well-formed one we never asked for, and checking
+                // solicitation first would collapse the two.
+                if (data.len != 0) return error.MalformedExtension;
+                if (self.config.server_name == null) return error.UnsupportedExtension;
+            },
+            10 => {}, // supported_groups: legal here, always offered, advisory.
+            16 => try self.selectAlpn(data), // application_layer_protocol_negotiation
+            else => return error.UnsupportedExtension,
         }
     }
+}
+
+/// RFC 7301 §3.2: the server names exactly one protocol, and it must be
+/// one of ours. Split out because the order of its two refusals matters:
+/// a well-formed selection when we offered no ALPN at all is the whole
+/// extension being unsolicited (§4.2), not a bad choice within it.
+fn selectAlpn(self: *ClientHandshake, data: []const u8) Error!void {
+    var list = wire.Cursor.init(data);
+    const list_bytes = try list.takeU16();
+    if (list_bytes != list.remaining()) return error.BadAlpn;
+    const name = try list.takeSlice(try list.takeByte());
+    if (list.remaining() != 0) return error.BadAlpn;
+    if (self.config.alpn_protocols.len == 0) return error.UnsupportedExtension;
+    self.alpn_selected = for (self.config.alpn_protocols, 0..) |ours, index| {
+        if (std.mem.eql(u8, name, ours)) break @intCast(index);
+    } else return error.BadAlpn;
 }
 
 /// Show the chain to the embedder, then pull the leaf's public key out
@@ -526,13 +562,22 @@ fn captureLeaf(self: *ClientHandshake, body: []const u8) Error!void {
         // A list whose framing does not parse is not a chain the
         // embedder can judge — refuse it here rather than hand over
         // entries we could not walk.
-        _ = chain.count() catch return error.BadCertificate;
+        _ = chain.count() catch |err| switch (err) {
+            error.UnsupportedExtension => return error.UnsupportedExtension,
+            else => return error.BadCertificate,
+        };
         if (!verifier.verify(verifier.context, chain)) return error.BadCertificate;
     }
 
     var entries = CertificateList.init(list_der).iterator();
-    const leaf_der = (entries.next() catch return error.BadCertificate) orelse
-        return error.BadCertificate;
+    // §4.2's refusal travels intact rather than becoming BadCertificate:
+    // an unsolicited extension on the leaf says nothing about the
+    // certificate, which may be perfectly good, and the alert §4.2 asks
+    // for is unsupported_extension rather than bad_certificate.
+    const leaf_der = (entries.next() catch |err| switch (err) {
+        error.UnsupportedExtension => return error.UnsupportedExtension,
+        else => return error.BadCertificate,
+    }) orelse return error.BadCertificate;
     const certificate: std.crypto.Certificate = .{ .buffer = leaf_der, .index = 0 };
     const parsed = certificate.parse() catch return error.BadCertificate;
     const public_key = parsed.pubKey();

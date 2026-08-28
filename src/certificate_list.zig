@@ -22,7 +22,7 @@ const wire = @import("wire.zig");
 pub const CertificateList = struct {
     bytes: []const u8,
 
-    pub const Error = wire.Error || error{MalformedEntry};
+    pub const Error = wire.Error || error{ MalformedEntry, UnsupportedExtension };
 
     pub fn init(bytes: []const u8) CertificateList {
         return .{ .bytes = bytes };
@@ -46,10 +46,25 @@ pub const CertificateList = struct {
 
 pub const Iterator = struct {
     cursor: wire.Cursor,
+    /// Which entry `next` will return. Only the first is the leaf, and
+    /// only the leaf's extensions are ours to refuse.
+    entry_index: usize = 0,
 
-    /// The next entry's `cert_data`, or null at the end of the list. Its
-    /// per-entry extensions are skipped: §4.4.2 defines none a client acts
-    /// on, and an embedder that wanted them would want the raw list.
+    /// The next entry's `cert_data`, or null at the end of the list.
+    ///
+    /// §4.4.2: a CertificateEntry's extensions must be ones the client
+    /// asked for, and a client that receives any other "MUST abort with
+    /// an unsupported_extension alert" (§4.2). zssl requests none —
+    /// neither status_request nor SCT — so on the leaf the block must be
+    /// empty and anything in it is unsolicited.
+    ///
+    /// Intermediates are exempt, which is not laxity but the rule: §4.4.2
+    /// says an extension applying to the chain belongs on the first
+    /// entry, so what rides an intermediate is decoration a client is
+    /// meant to ignore rather than answer. BoringSSL draws the same line
+    /// (`IgnoreExtensionsOnIntermediates-TLS13` against
+    /// `SendUnknownExtensionOnCertificate-TLS13`), and refusing both
+    /// would fail a legitimate chain.
     pub fn next(self: *Iterator) CertificateList.Error!?[]const u8 {
         if (self.cursor.remaining() == 0) return null;
         const cert_bytes = try self.cursor.takeU24();
@@ -58,7 +73,11 @@ pub const Iterator = struct {
         if (cert_bytes == 0) return error.MalformedEntry;
         const cert_data = try self.cursor.takeSlice(cert_bytes);
         const extensions_bytes = try self.cursor.takeU16();
+        if (self.entry_index == 0 and extensions_bytes != 0) {
+            return error.UnsupportedExtension;
+        }
         _ = try self.cursor.takeSlice(extensions_bytes);
+        self.entry_index += 1;
         assert(cert_data.len >= 1);
         return cert_data;
     }
@@ -98,4 +117,35 @@ test "a zero-length entry is malformed" {
     const list = CertificateList.init(&.{ 0, 0, 0, 0, 0 });
     var it = list.iterator();
     try std.testing.expectError(error.MalformedEntry, it.next());
+}
+
+test "§4.4.2: an extension on the leaf is refused, one on an intermediate is ignored" {
+    // The existing walk test already covers the ignored case from the
+    // other side — its second entry carries a one-byte extension — so
+    // this pins the asymmetry rather than either half alone. BoGo draws
+    // the same line with `SendUnknownExtensionOnCertificate-TLS13`
+    // against `IgnoreExtensionsOnIntermediates-TLS13`, and answering both
+    // the same way fails one of them whichever way you pick.
+
+    // Leaf first, carrying extension 0x007f with an empty body: exactly
+    // the four bytes BoGo sends.
+    const leaf_carries = CertificateList.init(&.{
+        0,    0,    2,   'A', 'B', 0, 4,
+        0x00, 0x7f, 0,   0,   0,   0, 3,
+        'C',  'D',  'E', 0,   0,
+    });
+    var refused = leaf_carries.iterator();
+    try std.testing.expectError(error.UnsupportedExtension, refused.next());
+
+    // The same extension one entry later is decoration a client is meant
+    // to ignore, and the leaf still comes back whole.
+    const intermediate_carries = CertificateList.init(&.{
+        0, 0,    2,    'A', 'B', 0,   0,
+        0, 0,    3,    'C', 'D', 'E', 0,
+        4, 0x00, 0x7f, 0,   0,
+    });
+    var allowed = intermediate_carries.iterator();
+    try std.testing.expectEqualSlices(u8, "AB", (try allowed.next()).?);
+    try std.testing.expectEqualSlices(u8, "CDE", (try allowed.next()).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), try allowed.next());
 }

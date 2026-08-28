@@ -53,12 +53,14 @@
     ":UNEXPECTED_EXTENSION:": [
       "zssl:BadServerHello",
       "zssl:UnexpectedMessage",
-      "zssl:BadAlpn"
+      "zssl:BadAlpn",
+      "zssl:UnsupportedExtension"
     ],
     ":ERROR_PARSING_EXTENSION:": [
       "zssl:MalformedExtension",
       "zssl:BadServerHello",
-      "zssl:UnexpectedMessage"
+      "zssl:UnexpectedMessage",
+      "zssl:UnsupportedExtension"
     ],
     ":BAD_ECPOINT:": [
       "zssl:BadServerHello",
@@ -416,7 +418,6 @@
     "EmptyExtensions-ServerHello-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "EmptyExtensions-ServerHello-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "EmptySessionID": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "EncryptedExtensionsWithKeyShare-TLS13": "OPEN GAP: an extension the peer never offered is accepted; \u00a74.2 wants unsupported_extension. docs/BOGO.md, finding 2.",
     "ExpectOmitExtensions": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "ExtendedMasterSecret-NoToNo-Client": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "ExtendedMasterSecret-NoToNo-Server": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -429,7 +430,6 @@
     "ExtensionTrailingData-ServerName-Client-TLS-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "ExtensionTrailingData-ServerName-Client-TLS-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "ExtensionTrailingData-ServerName-Client-TLS-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "ExtensionTrailingData-ServerName-Client-TLS-TLS13": "OPEN GAP: an extension the peer never offered is accepted; \u00a74.2 wants unsupported_extension. docs/BOGO.md, finding 2.",
     "ExtensionTrailingData-TrustAnchors-ClientHello-Server-TLS-TLS13": "Trust anchor negotiation: not implemented.",
     "ExtraCompressionMethods-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "FallbackSCSV": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -530,7 +530,6 @@
     "PointFormat-Client-Missing": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "PointFormat-Client-MissingUncompressed": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "PointFormat-Client-Tolerance": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "PointFormat-EncryptedExtensions-TLS13": "OPEN GAP: an extension the peer never offered is accepted; \u00a74.2 wants unsupported_extension. docs/BOGO.md, finding 2.",
     "PointFormat-Server-Missing": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "PointFormat-Server-MissingUncompressed": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "PointFormat-Server-Tolerance": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -640,7 +639,6 @@
     "SendEmptySessionTicket-TLS13": "OPEN GAP: we refuse this, with a different alert than BoringSSL sends. docs/BOGO.md, finding 8.",
     "SendInvalidRecordType": "OPEN GAP: we refuse this, with a different alert than BoringSSL sends. docs/BOGO.md, finding 8.",
     "SendSNIWarningAlert": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "SendUnknownExtensionOnCertificate-TLS13": "OPEN GAP: an extension the peer never offered is accepted; \u00a74.2 wants unsupported_extension. docs/BOGO.md, finding 2.",
     "SendUnsolicitedOCSPOnCertificate-TLS13": "OCSP stapling: not implemented.",
     "SendUnsolicitedSCTOnCertificate-TLS13": "SCT lists: not implemented.",
     "SendUserCanceledAlerts-TLS13": "OPEN GAP: every non-close_notify alert is fatal, including the warning-level user_canceled \u00a76.1 leaves legal. docs/BOGO.md, finding 5.",
@@ -870,14 +868,11 @@
     "UnknownCurve-HelloRetryRequest-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
     "UnknownCurve-TLS13": "The runner offers only a group zssl does not hold, so the handshake fails where BoringSSL would retry (DESIGN.md \u00a71).",
     "UnknownExtension-Client": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "UnknownExtension-Client-TLS13": "OPEN GAP: an extension the peer never offered is accepted; \u00a74.2 wants unsupported_extension. docs/BOGO.md, finding 2.",
     "UnknownExtensionInCertificateRequest-TLS13": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",
     "UnofferedExtension-Client": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "UnofferedExtension-Client-TLS13": "OPEN GAP: an extension the peer never offered is accepted; \u00a74.2 wants unsupported_extension. docs/BOGO.md, finding 2.",
     "UnsolicitedServerNameAck-TLS-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "UnsolicitedServerNameAck-TLS-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "UnsolicitedServerNameAck-TLS-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "UnsolicitedServerNameAck-TLS-TLS13": "OPEN GAP: an extension the peer never offered is accepted; \u00a74.2 wants unsupported_extension. docs/BOGO.md, finding 2.",
     "V2ClientHello-EmptyRecordPrefix": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "V2ClientHello-WarningAlertPrefix": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Verify-ServerAuth-SignatureType": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",

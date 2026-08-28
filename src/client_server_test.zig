@@ -20,6 +20,8 @@ const protect = @import("protect.zig");
 const client_hello_mod = @import("client_hello.zig");
 const server_messages = @import("server_messages.zig");
 const transcript = @import("transcript.zig");
+const wire = @import("wire.zig");
+const handshake = @import("handshake.zig");
 
 const client_x25519_private = [_]u8{0x31} ** 31 ++ [_]u8{0x07};
 
@@ -820,4 +822,142 @@ test "an alert the server sends before the client's Finished is readable by the 
         error.PeerAlert,
         harness.client.handleRecord(sealed, &buffers.scratch),
     );
+}
+
+/// An EncryptedExtensions message carrying one extension of our choosing,
+/// which `server_messages.encryptedExtensions` deliberately cannot build:
+/// it only ever emits a legal ALPN selection, and these tests need the
+/// illegal shapes a hostile server would send.
+fn forgedEncryptedExtensions(out: []u8, extension_type: u16, data: []const u8) []const u8 {
+    var builder = wire.Builder.init(out);
+    const message = handshake.beginMessage(&builder, .encrypted_extensions);
+    const extensions = builder.markU16();
+    builder.putU16(extension_type);
+    const body = builder.markU16();
+    builder.putSlice(data);
+    builder.patchU16(body);
+    builder.patchU16(extensions);
+    handshake.endMessage(&builder, message);
+    return builder.written();
+}
+
+test "§4.2: EncryptedExtensions may carry only what we offered, where it is legal" {
+    // Every shape below once reached our client and was ignored: the
+    // loop looked at ALPN and skipped everything else, so a server could
+    // hand us any extension it liked. §4.2 makes that
+    // unsupported_extension. BoGo's finding 2 is where it was measured.
+    const Shape = struct {
+        extension_type: u16,
+        data: []const u8,
+        alpn: []const []const u8,
+        server_name: ?[]const u8,
+        expected: anyerror,
+        note: []const u8,
+    };
+    const shapes = [_]Shape{
+        // An extension nobody has heard of.
+        .{
+            .extension_type = 0x7f00,
+            .data = &.{},
+            .alpn = &.{},
+            .server_name = null,
+            .expected = error.UnsupportedExtension,
+            .note = "unknown",
+        },
+        // key_share: offered in our ClientHello, but §4.2 puts it in
+        // ServerHello. Offered is not the same as legal here.
+        .{
+            .extension_type = 51,
+            .data = &.{ 0x00, 0x1d, 0x00, 0x00 },
+            .alpn = &.{},
+            .server_name = null,
+            .expected = error.UnsupportedExtension,
+            .note = "key_share in EE",
+        },
+        // A well-formed server_name ack we never asked for.
+        .{
+            .extension_type = 0,
+            .data = &.{},
+            .alpn = &.{},
+            .server_name = null,
+            .expected = error.UnsupportedExtension,
+            .note = "unsolicited SNI ack",
+        },
+        // The same ack, asked for, but with bytes after it: a body we
+        // cannot read is decode_error, not unsupported_extension.
+        .{
+            .extension_type = 0,
+            .data = &.{0x00},
+            .alpn = &.{},
+            .server_name = "example.com",
+            .expected = error.MalformedExtension,
+            .note = "SNI ack with trailing data",
+        },
+        // Malformed *and* unsolicited, which is the only combination
+        // where the order of the two checks is observable — the two
+        // shapes above each satisfy one condition and would pass with the
+        // checks either way round. Parsing wins: decode_error.
+        .{
+            .extension_type = 0,
+            .data = &.{0x00},
+            .alpn = &.{},
+            .server_name = null,
+            .expected = error.MalformedExtension,
+            .note = "SNI ack malformed and unsolicited",
+        },
+        // The same combination for ALPN: a list whose framing does not
+        // parse, sent when we offered no ALPN at all. `selectAlpn` reads
+        // the body before it asks whether we offered the extension, so
+        // this is the framing error rather than unsupported_extension.
+        .{
+            .extension_type = 16,
+            .data = &.{ 0x00, 0x05, 0x04, 'a' },
+            .alpn = &.{},
+            .server_name = null,
+            .expected = error.BadAlpn,
+            .note = "ALPN malformed and unoffered",
+        },
+        // ALPN selected when we offered none: the extension itself is
+        // unsolicited, rather than a bad choice within one we sent.
+        .{
+            .extension_type = 16,
+            .data = &.{ 0x00, 0x05, 0x04, 'a', 'l', 'p', 'n' },
+            .alpn = &.{},
+            .server_name = null,
+            .expected = error.UnsupportedExtension,
+            .note = "ALPN never offered",
+        },
+    };
+    for (shapes) |shape| {
+        var buffers: Buffers = .{};
+        var harness: Harness = undefined;
+        try harness.init(.{ .client_alpn = shape.alpn, .server_alpn = null });
+        defer harness.deinit();
+        harness.client.config.server_name = shape.server_name;
+
+        const hello = harness.client.start(&buffers.client_out);
+        const flight = try harness.server.handleRecord(hello, &buffers.server_out);
+        const server_hello_record = recordAt(flight.send, 0);
+        _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
+
+        var forger = try serverFlightProtector(
+            &client_x25519_private,
+            hello,
+            server_hello_record,
+        );
+        defer forger.deinit();
+        var plaintext: [4096]u8 = undefined;
+        const message = forgedEncryptedExtensions(&plaintext, shape.extension_type, shape.data);
+        var forged_record: [record.wire_record_bytes_max]u8 = undefined;
+        const sealed = try forger.seal(.handshake, message, &forged_record);
+        _ = harness.client.handleRecord(sealed, &buffers.scratch) catch |err| {
+            if (err != shape.expected) {
+                std.debug.print("shape '{s}': expected {t}, got {t}\n", .{ shape.note, shape.expected, err });
+                return error.TestUnexpectedResult;
+            }
+            continue;
+        };
+        std.debug.print("shape '{s}': accepted, expected {t}\n", .{ shape.note, shape.expected });
+        return error.TestUnexpectedResult;
+    }
 }

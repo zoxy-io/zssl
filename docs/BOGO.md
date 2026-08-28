@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 242 passed, 0 failed, 6918 declined by the shim (89), floor 242
+bogo: 249 passed, 0 failed, 6918 declined by the shim (89), floor 249
 bogo: PASS
 ```
 
@@ -41,13 +41,14 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**242 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. 121 drive
+**249 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. 128 drive
 `ClientHandshake` and 121 drive `ServerHandshake`. The server number was
 6 until RSA signing landed, 100 until secp256r1/secp384r1 did, 110 until
 §9.2's `missing_extension` did, 111 until §5.4's inner-plaintext cap did,
 and 113 until eight suppressions turned out to be describing bugs that
-were already fixed; see below.
+were already fixed. The client number was 121 until §4.2's
+unsupported_extension landed; see below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
 either gets fixed or gets an entry in `DisabledTests` with a one-line
@@ -128,10 +129,10 @@ Three bugs, fixed in this slice:
    flight was at least 500 bytes, which a legitimately small ECDSA leaf
    falsifies. The floor is now the encoded chain's own size.
 
-Twelve more were open and eleven remain — 3 is now fixed, and is kept in
-place below rather than renumbered, because the ledger cites these by
-number. Each of the eleven is an entry in the ledger citing this list, 44
-suppressed cases between them.
+Twelve more were open and ten remain — 2 and 3 are now fixed, and are
+kept in place below rather than renumbered, because the ledger cites
+these by number. Each of the ten is an entry in the ledger citing this
+list, 37 suppressed cases between them.
 
 Those 44 are what survived being *measured*. Every OPEN GAP entry was
 lifted at once and the corpus run in full: 8 of the 52 passed outright,
@@ -146,11 +147,35 @@ name.
    which both Go and OpenSSL emit — is `UnexpectedMessage`. Legal, common,
    and refused. This one needs the event surface to grow a way to drain
    more than one event per record.
-2. **The client accepts extensions it never offered.** §4.2 wants
-   `unsupported_extension` for an unsolicited server_name ack, a
-   `key_share` in EncryptedExtensions, extended_master_secret,
-   ec_point_formats, an OCSP or SCT response on Certificate, trust
-   anchors, and unknown or duplicate extensions. We ignore all of them.
+2. **FIXED — the client accepted extensions it never offered.**
+   `checkEncryptedExtensions` looked at ALPN and skipped everything
+   else, so a server could hand our client any extension it liked and we
+   took it. §4.2 makes that `unsupported_extension`, and it is the half
+   of the library zoxy uses to originate.
+
+   The fix is an allow-list rather than a deny-list: of everything zssl
+   offers, only `server_name`, `supported_groups` and ALPN are legal in
+   EncryptedExtensions, so `key_share` — offered in our ClientHello but
+   belonging to ServerHello — is as unsolicited there as an extension we
+   never sent. On the Certificate message the leaf's extension block must
+   be empty, because zssl requests neither status_request nor SCT;
+   intermediates stay ignored, which §4.4.2 asks for and BoGo checks
+   both ways.
+
+   Two orderings turned out to be load-bearing, and both were found by
+   running the cases rather than reading them. A `server_name` ack is
+   parsed before its solicitation is checked, because
+   `ExtensionTrailingData-ServerName-Client` wants `decode_error` for a
+   malformed ack while `UnsolicitedServerNameAck` wants
+   `unsupported_extension` for a well-formed one — check solicitation
+   first and the former silently becomes the latter. And an ALPN
+   selection when we offered no ALPN is the *extension* being
+   unsolicited, not a bad choice inside one, so it stops being
+   `illegal_parameter`.
+
+   `captureLeaf` also had to stop turning the refusal into
+   `BadCertificate`: an unsolicited extension says nothing about the
+   certificate, which may be perfectly good.
 3. **FIXED — no §5.4 cap on the inner plaintext *before* padding is
    stripped.** `Protector.open` bounded the content it handed back —
    `content_bytes > plaintext_bytes_max` has been a `record_overflow`

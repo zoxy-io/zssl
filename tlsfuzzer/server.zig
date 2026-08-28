@@ -350,6 +350,7 @@ fn alertFor(err: anyerror) ?zssl.alert.Description {
         error.NotATlsRecord => .protocol_version,
         error.HandshakeFailure => .handshake_failure,
         error.MissingExtension => .missing_extension,
+        error.UnsupportedExtension => .unsupported_extension,
         error.IllegalRetry,
         error.IdentityElement,
         error.IllegalKeyUpdate,
