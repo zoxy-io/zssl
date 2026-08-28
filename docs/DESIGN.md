@@ -31,8 +31,20 @@ proxy needs instead of what a general TLS library carries.
   together at load: PSS draws a fresh salt per signature, so the
   seeded-replay property cannot survive an RSA key and is not quietly
   dropped.
-- x25519 key exchange; PSK resumption with server-side NewSessionTicket
-  issuance; ALPN and SNI reads.
+- Key exchange over x25519, secp256r1 and secp384r1 — server side. The
+  server completes whichever of the three the client offers a share for,
+  choosing in its own preference order (§4.2.8 leaves the choice to the
+  server), and asks for the first one it holds in a HelloRetryRequest
+  when the client offered none. x25519 stayed the only group for two
+  slices and that was the right default; what changed the answer is that
+  the corpora which test a *server* mostly assume secp256r1 — 48 of
+  tlsfuzzer's 57 TLS 1.3 scripts hardcode it and never mention x25519 —
+  so an x25519-only server was not merely narrow, it was close to
+  untestable by anything but our own client. The client half still
+  offers x25519 alone: offering more only pays with HelloRetryRequest
+  support, which it refuses structurally (slice 4).
+- PSK resumption with server-side NewSessionTicket issuance; ALPN and
+  SNI reads.
 - kTLS key export (§4).
 
 **Out, permanently** (a caller that needs these wants a different

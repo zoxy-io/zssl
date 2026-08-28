@@ -217,7 +217,7 @@ test "the production hello parses under our own strict parser" {
     // RSA-PSS travels beside ECDSA: an upstream with an RSA leaf must not
     // see a list that forces it to fail the handshake.
     try std.testing.expect(hello.offersScheme(0x0804));
-    try std.testing.expectEqualSlices(u8, &public, hello.key_share_x25519.?);
+    try std.testing.expectEqualSlices(u8, &public, hello.keyShareFor(client_hello.group_x25519).?);
     try std.testing.expect(hello.offersSuite(.aes_128_gcm_sha256));
     try std.testing.expect(hello.offersSuite(.aes_256_gcm_sha384));
     try std.testing.expect(hello.offersSuite(.chacha20_poly1305_sha256));

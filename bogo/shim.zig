@@ -152,6 +152,12 @@ const Connection = struct {
     expect_alpn: ?[]const u8 = null,
     host_name: ?[]const u8 = null,
 
+    /// The groups `-curves` named, in order. Whether they can be
+    /// honoured is a question for the role: our server completes any of
+    /// the three it holds, while our client offers x25519 alone.
+    curves: [4]u16 = undefined,
+    curve_count: u8 = 0,
+
     expect_version: ?u16 = null,
     expect_curve_id: ?u16 = null,
     expect_session_miss: bool = false,
@@ -291,10 +297,13 @@ fn applyFlag(connection: *Connection, name: []const u8, value: ?[]const u8) Pars
     } else if (std.mem.eql(u8, name, "-expect-version")) {
         connection.expect_version = std.fmt.parseInt(u16, value.?, 10) catch return error.BadFlagValue;
     } else if (std.mem.eql(u8, name, "-curves")) {
-        // Repeatable. zssl holds one group, so a case naming any other
-        // is asking for key exchange we do not have.
+        // Repeatable, one group per occurrence. Recorded rather than
+        // acted on here: whether the set is honourable depends on which
+        // role we are playing, and `-server` may not have been seen yet.
         const group = std.fmt.parseInt(u16, value.?, 10) catch return error.BadFlagValue;
-        if (group != group_x25519) return unimplemented(name);
+        if (connection.curve_count == connection.curves.len) return unimplemented(name);
+        connection.curves[connection.curve_count] = group;
+        connection.curve_count += 1;
     } else if (std.mem.eql(u8, name, "-expect-curve-id")) {
         connection.expect_curve_id = std.fmt.parseInt(u16, value.?, 10) catch return error.BadFlagValue;
     } else if (std.mem.eql(u8, name, "-advertise-alpn")) {
@@ -432,6 +441,13 @@ fn runServer(
     store: *TicketStore,
     pump: *Pump,
 ) !void {
+    // Our server completes every group it holds and cannot be told to
+    // accept a narrower set, so a case naming only groups we hold runs
+    // as asked; one naming any other is asking for a refusal we cannot
+    // configure.
+    for (connection.curves[0..connection.curve_count]) |group| {
+        if (zssl.client_hello.groupShareBytes(group) == null) return unimplemented("-curves");
+    }
     const cert_path = connection.cert_path orelse return unimplemented("-cert-file");
     const key_path = connection.key_path orelse return unimplemented("-key-file");
     const cert_pem = try readFile(io, arena, cert_path);
@@ -447,12 +463,12 @@ fn runServer(
     };
     defer credentials.deinit();
 
-    var entropy: [64]u8 = undefined;
+    var entropy: [80]u8 = undefined;
     io.random(&entropy);
     var server = ServerHandshake.init(&.{
         .credentials = &credentials,
         .server_random = entropy[0..32].*,
-        .x25519_private = entropy[32..64].*,
+        .key_share_private = entropy[32..80].*,
         .alpn = connection.select_alpn,
         .reassembly = &handshake_reassembly,
         .flight = &flight_storage,
@@ -491,6 +507,12 @@ fn runClient(
     store: *TicketStore,
     pump: *Pump,
 ) !void {
+    // `ClientHandshake` offers x25519 and holds one scalar, so a case
+    // naming any other group would be run against a ClientHello it did
+    // not ask for. Declined until the client can choose its group.
+    for (connection.curves[0..connection.curve_count]) |group| {
+        if (group != group_x25519) return unimplemented("-curves");
+    }
     var protocols: [alpn_protocols_max][]const u8 = undefined;
     const offered = try splitAlpn(connection.advertise_alpn, &protocols);
 
@@ -548,7 +570,7 @@ fn checkNegotiated(
         if (version != version_tls13) return error.UnexpectedVersion;
     }
     if (connection.expect_curve_id) |group| {
-        if (group != group_x25519) return error.UnexpectedCurve;
+        if (zssl.client_hello.groupShareBytes(group) == null) return error.UnexpectedCurve;
     }
     if (connection.expect_alpn) |expected| {
         const selected = alpn orelse return error.NoAlpnSelected;
@@ -799,6 +821,7 @@ fn alertFor(err: anyerror) ?alert.Description {
         error.IllegalKeyUpdate,
         error.IllegalCompression,
         error.PskNotLast,
+        error.BadKeyShare,
         => .illegal_parameter,
         // A well-formed message larger than the reassembly space the
         // embedder handed us. That is our capacity, not the peer's

@@ -1,4 +1,4 @@
-# tlsfuzzer — harness wired, gate blocked
+# tlsfuzzer — harness wired, gate not built yet
 
 [tlsfuzzer](https://github.com/tlsfuzzer/tlsfuzzer) is a TLS client
 written in Python over tlslite-ng: a third implementation, by different
@@ -14,7 +14,9 @@ not an omission.
 
 ## Why there is no gate yet
 
-tlsfuzzer's TLS 1.3 scripts overwhelmingly hardcode **secp256r1**:
+tlsfuzzer's TLS 1.3 scripts overwhelmingly hardcode **secp256r1**. When
+this was first measured, against a server that spoke x25519 alone, that
+made almost the whole corpus inapplicable:
 
 | | |
 | ---: | --- |
@@ -22,10 +24,14 @@ tlsfuzzer's TLS 1.3 scripts overwhelmingly hardcode **secp256r1**:
 | 48 | that never mention x25519 at all |
 | 2 | that expose a `-g` flag to choose the group |
 
-zssl offers x25519 and nothing else (DESIGN.md §1), so a client whose
-ClientHello carries a secp256r1 key share *and* a secp256r1-only
-supported_groups list gets `handshake_failure`. That is correct
-behaviour, and it makes nearly the whole corpus inapplicable as written.
+zssl offered x25519 and nothing else at the time, so a client whose
+ClientHello carried a secp256r1 key share *and* a secp256r1-only
+supported_groups list got `handshake_failure` — correct behaviour, and
+enough to make the corpus unusable. **That blocker is gone**: the server
+completes secp256r1 and secp384r1 now (DESIGN.md §1), which is the
+change that measurement argued for. The counts in this section are the
+*before* picture, kept because they are the reason the gate was deferred
+rather than half-built.
 
 Of the two scripts that take `-g x25519`:
 
@@ -34,15 +40,15 @@ test-tls13-conversation      PASS: 3   FAIL: 0
 test-tls13-ecdsa-support     PASS: 5   FAIL: 5   (wants P-256/384/521 certificates)
 ```
 
-So a gate built today would gate on one script. `docs/BOGO.md` argues at
-length that a runner reporting green over a sliver of its corpus is
-worse than no runner, because it reads like coverage. The same argument
-applies here to the same standard, so the gate waits.
+A gate built at that point would have gated on one script, and
+`docs/BOGO.md` argues at length that a runner reporting green over a
+sliver of its corpus is worse than no runner, because it reads like
+coverage. That is why the gate waited rather than shipping thin.
 
-**The blocker is one library change, and it is not tlsfuzzer's alone.**
-BoGo declines 208 cases for exactly this reason — "a group that is not
-x25519". Adding secp256r1 and secp384r1 key exchange unlocks both at
-once, which is why it is the next slice rather than a curiosity.
+What is missing now is only the gate itself: `tlsfuzzer/run.zig`, a
+pinned checkout, a virtualenv, a curated script list and a floor. The
+first step is re-running the sweep above against the new server, because
+every number in this section is from before the curves landed.
 
 ## What the harness does
 
@@ -95,8 +101,9 @@ The harness takes `--port`, `--cert`, `--key`, `--alpn` and `--tickets`;
 
 In order:
 
-1. **secp256r1 and secp384r1 key exchange** — the blocker, and worth
-   208 BoGo cases besides.
+1. ~~secp256r1 and secp384r1 key exchange~~ — done, and worth 10 BoGo
+   cases besides. Re-run the sweep in this file against the new server
+   before curating anything: the counts above are stale by design.
 2. A `tlsfuzzer/run.zig` gate in the shape of `bogo/run.zig`: pin the
    checkout by commit, build a virtualenv, run a curated script list,
    hold the result against a floor, exit 2 as a readable SKIP with no
@@ -107,5 +114,5 @@ In order:
    and all.
 4. A CI job, and only then a badge.
 
-Until step 1 lands, the honest count for this runner is one script, and
-that is what this file says.
+The honest count for this runner is still one script, because nobody has
+re-measured it yet. That is what this file will say until someone does.

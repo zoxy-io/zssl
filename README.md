@@ -2,8 +2,6 @@
 
 [![ci](https://github.com/zoxy-io/zssl/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/ci.yml)
 [![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzoxy-io%2Fzssl%2Fbadges%2Fcoverage.json)](https://github.com/zoxy-io/zssl/actions/workflows/ci.yml)
-[![bogo passing](https://img.shields.io/badge/bogo-221%20passing-brightgreen)](docs/BOGO.md)
-[![bogo declined](https://img.shields.io/badge/bogo-6965%20declined-lightgrey)](docs/BOGO.md#the-three-numbers)
 
 A sans-I/O TLS 1.3 library in Zig, over libcrypto primitives.
 
@@ -93,13 +91,14 @@ of entropy you supply:
 var reassembly: [16 * 1024]u8 = undefined;
 var flight: [zssl.Credentials.chain_bytes_max + 1024]u8 = undefined;
 
-var entropy: [64]u8 = undefined;
+var entropy: [80]u8 = undefined;
 io.random(&entropy); // your `std.Io` — zssl never calls an RNG itself
 
 var server = zssl.ServerHandshake.init(&.{
     .credentials = &credentials,
     .server_random = entropy[0..32].*,
-    .x25519_private = entropy[32..64].*,
+    // 48 bytes: enough scalar for the largest group zssl offers.
+    .key_share_private = entropy[32..80].*,
     .alpn = "http/1.1",
     .reassembly = &reassembly,
     .flight = &flight,
@@ -217,8 +216,10 @@ refused, not downgraded.
 
 ## Scope
 
-**In:** TLS 1.3 (RFC 8446), the three standard cipher suites, x25519,
-ECDSA P-256/P-384 and RSA-PSS signing and verification, SNI, ALPN,
+**In:** TLS 1.3 (RFC 8446), the three standard cipher suites, key
+exchange over x25519, secp256r1 and secp384r1 (server side; the client
+offers x25519 alone), ECDSA P-256/P-384 and RSA-PSS signing and
+verification, SNI, ALPN,
 HelloRetryRequest (the server issues it; the client refuses it
 structurally, holding keys for one group), PSK resumption with
 server-side tickets, KeyUpdate, and kTLS key export.
@@ -247,15 +248,19 @@ Everything above is argued in [docs/DESIGN.md](docs/DESIGN.md) §1.
 real-OpenSSL gate; `zig build bogo` runs BoringSSL's adversarial one.
 Five kinds of evidence, in rough order of how much they are worth:
 
-The two BoGo badges above are deliberately a pair. A single "221
-passing" would read as a coverage claim, and 6965 cases were never run
-at all — the second badge is there so the first cannot be mistaken for
-the whole picture. Both are static, and move in the same commit as
-`passing_floor` in `bogo/run.zig`.
+[![bogo passing](https://img.shields.io/badge/bogo-231%20passing-brightgreen)](docs/BOGO.md)
+[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers)
+
+Those two badges are deliberately a pair, and they live here rather than
+in the header because they need this table beside them. A single "221
+passing" would read as a coverage claim, and 6965 cases were never run at
+all — the second badge is there so the first cannot be quoted alone. Both
+are static, and move in the same commit as `passing_floor` in
+`bogo/run.zig`.
 
 | Oracle | What it proves |
 | --- | --- |
-| **BoGo** | BoringSSL's own hostile-peer runner, at a pinned commit, drives `bogo/shim.zig` through the corpus and checks not only that we refuse but *which alert we send*. 221 cases pass (121 client, 100 server), 0 fail, 6965 are declined by the shim as out of scope, and 708 are suppressed by name with a one-line reason each. A floor on the passing count is what stops a suppression from being quiet. |
+| **BoGo** | BoringSSL's own hostile-peer runner, at a pinned commit, drives `bogo/shim.zig` through the corpus and checks not only that we refuse but *which alert we send*. 231 cases pass (121 client, 110 server), 0 fail, 6918 are declined by the shim as out of scope, and 745 are suppressed by name with a one-line reason each. A floor on the passing count is what stops a suppression from being quiet. |
 | **RFC 8448** replay | The key schedule, binder chain and record layer produce the RFC's traced bytes exactly — secrets, flights and ServerHello re-encoded byte for byte. |
 | **OpenSSL interop** | Three legs. `openssl s_client` completes against our server, with openssl's own X.509 verifying our certificate. Our client completes against `openssl s_server -rev` and opens the echo it seals back — twice, once against an ECDSA certificate and once against an RSA-2048 one openssl mints on the spot, since those are different verification paths. Each client leg asserts the leaf key type it meant to exercise, so the RSA leg cannot quietly pass on an ECDSA certificate, and both drive the `chain_verifier` seam and assert it saw the chain. |
 | **`std.crypto.tls`** | A second independent implementation completes a full in-memory handshake, in both directions, and exchanges data. |
@@ -266,7 +271,7 @@ fragmented ClientHellos, tampered Finished messages, corrupted binders,
 inverted flights, sequence exhaustion.
 
 The gaps, stated plainly: BoGo's own count of what it never ran is far
-larger than what it ran — 6965 cases against 221 — and the twelve
+larger than what it ran — 6918 cases against 231 — and the twelve
 laxities it did find are still open. [docs/BOGO.md](docs/BOGO.md) has
 both, by name.
 

@@ -31,6 +31,9 @@ const CipherSuite = cipher_suite.CipherSuite;
 
 state: State,
 config: Config,
+/// The key-exchange group this handshake settled on, fixed when the
+/// ClientHello's shares are read.
+key_share_group: backend.Group,
 /// The scheme the CertificateVerify will carry, fixed at negotiation:
 /// the first of our key's schemes the client offered. Meaningless on a
 /// resumed handshake, which signs nothing.
@@ -61,7 +64,11 @@ pub const Config = struct {
     credentials: *const Credentials,
     /// Embedder-supplied entropy; zssl generates none.
     server_random: [32]u8,
-    x25519_private: [32]u8,
+    /// The key-exchange scalar. Sized for the largest group zssl offers
+    /// (secp384r1); the shorter ones take a prefix, because stretching a
+    /// short scalar would quietly take the entropy policy away from the
+    /// embedder it belongs to.
+    key_share_private: [backend.group_private_bytes_max]u8,
     /// The one protocol this server will negotiate via ALPN, or null to
     /// skip the extension entirely.
     alpn: ?[]const u8 = null,
@@ -138,6 +145,7 @@ pub fn init(config: *const Config) ServerHandshake {
     return .{
         .state = .awaiting_client_hello,
         .config = config.*,
+        .key_share_group = .x25519,
         .signature_scheme = config.credentials.signer.supported()[0],
         .assembler = handshake.Assembler.init(config.reassembly),
         .ladder = null,
@@ -231,18 +239,24 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
         // §4.1.4: the retry must keep the suite and answer the demand.
         const ladder_suite: CipherSuite = self.ladder.?;
         if (suite != ladder_suite) return error.IllegalRetry;
-        if (hello.key_share_x25519 == null) return error.IllegalRetry;
+        // The retry must answer the group we asked for, and no other.
+        const retried = hello.keyShareFor(@intFromEnum(self.key_share_group)) orelse
+            return error.IllegalRetry;
+        _ = retried;
         return self.acceptClientHello(&hello, message, suite, selected_psk, out);
     }
 
     assert(self.state == .awaiting_client_hello);
-    if (hello.key_share_x25519 == null) {
-        // No usable share. If the client can do x25519, demand it (§4.1.4);
-        // if it cannot, there is no handshake to have.
-        if (!hello.supportsGroup(client_hello.group_x25519)) return error.HandshakeFailure;
-        return self.sendHelloRetry(message, suite, out);
+    if (hello.preferredKeyShare()) |offered| {
+        // §4.2.8 leaves the choice to us among what the client sent.
+        self.key_share_group = backend.Group.fromWire(offered.group).?;
+        return self.acceptClientHello(&hello, message, suite, selected_psk, out);
     }
-    return self.acceptClientHello(&hello, message, suite, selected_psk, out);
+    // No share we can use. If the client says it supports a group we
+    // hold, demand it (§4.1.4); if it does not, there is no handshake.
+    const wanted = hello.preferredSupportedGroup() orelse return error.HandshakeFailure;
+    self.key_share_group = backend.Group.fromWire(wanted).?;
+    return self.sendHelloRetry(message, suite, out);
 }
 
 /// §4.2.11: walk the offered identities through the embedder's lookup;
@@ -262,7 +276,7 @@ fn selectPsk(
 ) Error!?SelectedPsk {
     const lookup = self.config.psk_lookup orelse return null;
     if (self.state != .awaiting_client_hello) return null;
-    if (hello.key_share_x25519 == null) return null; // psk_dhe_ke needs the share.
+    if (hello.preferredKeyShare() == null) return null; // psk_dhe_ke needs a share.
     if (!hello.offersPskDheKe()) return null;
     const offer = (try client_hello.parsePskOffer(hello)) orelse return null;
     assert(offer.count >= 1);
@@ -352,7 +366,7 @@ fn sendHelloRetry(self: *ServerHandshake, ch1: []const u8, suite: CipherSuite, o
     self.ladder = Ladder.initFor(suite);
     var message_buffer: [server_messages.server_hello_bytes_max]u8 = undefined;
     const echo = self.session_echo[0..self.session_echo_bytes];
-    const hrr = server_messages.helloRetryRequest(&message_buffer, echo, suite);
+    const hrr = server_messages.helloRetryRequest(&message_buffer, echo, suite, @intFromEnum(self.key_share_group));
     switch (self.ladder.?) {
         inline else => |*arm| arm.absorbRetryClientHello(ch1, hrr),
     }
@@ -371,17 +385,19 @@ fn acceptClientHello(
     selected_psk: ?SelectedPsk,
     out: []u8,
 ) Error!Event {
-    assert(hello.key_share_x25519 != null);
+    const group = self.key_share_group;
+    const peer_share = hello.keyShareFor(@intFromEnum(group)).?;
     const first_flight = self.state == .awaiting_client_hello;
     if (first_flight) {
         assert(self.ladder == null);
         self.ladder = Ladder.initFor(suite);
     }
-    var shared: [32]u8 = undefined;
-    try backend.x25519Shared(&self.config.x25519_private, hello.key_share_x25519.?, &shared);
-    defer std.crypto.secureZero(u8, &shared);
-    var x25519_public: [32]u8 = undefined;
-    try backend.x25519Public(&self.config.x25519_private, &x25519_public);
+    const private_key = self.config.key_share_private[0..group.privateBytes()];
+    var shared_buffer: [backend.group_shared_bytes_max]u8 = undefined;
+    defer std.crypto.secureZero(u8, &shared_buffer);
+    const shared = try backend.keyShareShared(group, private_key, peer_share, &shared_buffer);
+    var public_buffer: [backend.group_public_bytes_max]u8 = undefined;
+    const public_key = try backend.keySharePublic(group, private_key, &public_buffer);
 
     var message_buffer: [server_messages.server_hello_bytes_max]u8 = undefined;
     const echo = self.session_echo[0..self.session_echo_bytes];
@@ -390,7 +406,8 @@ fn acceptClientHello(
         &self.config.server_random,
         echo,
         suite,
-        &x25519_public,
+        @intFromEnum(group),
+        public_key,
         if (selected_psk) |psk| psk.index else null,
     );
     self.resumed = selected_psk != null;
@@ -401,7 +418,7 @@ fn acceptClientHello(
             arm.absorbMessage(message);
             arm.absorbMessage(hello_bytes);
             const psk_slice: ?[]const u8 = if (selected_psk) |*psk| psk.psk[0..psk.psk_bytes] else null;
-            try arm.startHandshakeKeys(&shared, psk_slice);
+            try arm.startHandshakeKeys(shared, psk_slice);
             const flight = try self.buildFlightPlaintext(arm, selected_alpn);
             var builder = @import("wire.zig").Builder.init(out);
             appendPlaintextRecord(&builder, .handshake, hello_bytes);
@@ -846,7 +863,7 @@ fn LadderOf(comptime suite: CipherSuite) type {
         /// `psk` is the accepted resumption secret, or null for a full
         /// handshake — either way the (EC)DHE share is mixed (psk_dhe_ke
         /// is the only mode this library speaks).
-        fn startHandshakeKeys(self: *Self, shared: *const [32]u8, psk: ?[]const u8) protect.Error!void {
+        fn startHandshakeKeys(self: *Self, shared: []const u8, psk: ?[]const u8) protect.Error!void {
             assert(self.schedule == null);
             assert(self.recv == null);
             if (psk) |bytes| assert(bytes.len == hash_bytes);

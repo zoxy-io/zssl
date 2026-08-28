@@ -252,12 +252,12 @@ fn runServerLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8) !void {
     defer credentials.deinit();
     var reassembly: [16384]u8 = undefined;
     var flight: [Credentials.chain_bytes_max + 1024]u8 = undefined;
-    var entropy: [64]u8 = undefined;
+    var entropy: [80]u8 = undefined;
     io.random(&entropy);
     var server = ServerHandshake.init(&.{
         .credentials = &credentials,
         .server_random = entropy[0..32].*,
-        .x25519_private = entropy[32..64].*,
+        .key_share_private = entropy[32..80].*,
         .reassembly = &reassembly,
         .flight = &flight,
     });
@@ -422,7 +422,7 @@ fn runClientLeg(
     defer stream.close(io);
 
     var reassembly: [16384]u8 = undefined;
-    var entropy: [64]u8 = undefined;
+    var entropy: [80]u8 = undefined;
     io.random(&entropy);
     var witness: ChainWitness = .{};
     var client = ClientHandshake.init(&.{

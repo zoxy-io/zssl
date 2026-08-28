@@ -11,6 +11,9 @@ pub const c = @cImport({
     @cInclude("openssl/err.h");
     @cInclude("openssl/evp.h");
     @cInclude("openssl/params.h");
+    @cInclude("openssl/param_build.h");
     @cInclude("openssl/pem.h");
     @cInclude("openssl/rsa.h");
+    @cInclude("openssl/bn.h");
+    @cInclude("openssl/ec.h");
 });

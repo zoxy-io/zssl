@@ -20,7 +20,7 @@ const Schedule = key_schedule.KeySchedule(.aes_128_gcm_sha256);
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const client_x25519_private = [_]u8{0x11} ** 31 ++ [_]u8{0x42};
-const server_x25519_private = [_]u8{0x99} ** 31 ++ [_]u8{0x24};
+const server_key_share_private = [_]u8{0x99} ** 47 ++ [_]u8{0x24};
 
 test "§4 vectors: the binder chain, truncation arithmetic, and the PSK ladder" {
     // §3 ends where §4 begins: the resumed trace's PSK is §3's
@@ -150,7 +150,7 @@ const Harness = struct {
         harness.server = ServerHandshake.init(&.{
             .credentials = &harness.credentials,
             .server_random = .{0x5c} ** 32,
-            .x25519_private = server_x25519_private,
+            .key_share_private = server_key_share_private,
             .reassembly = &harness.reassembly,
             .flight = &harness.flight,
             .psk_lookup = if (store) |context| .{

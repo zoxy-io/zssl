@@ -172,12 +172,12 @@ fn serve(
     const pump = &pump_storage;
     pump.init(io, stream);
 
-    var entropy: [64]u8 = undefined;
+    var entropy: [80]u8 = undefined;
     io.random(&entropy);
     var server = ServerHandshake.init(&.{
         .credentials = credentials,
         .server_random = entropy[0..32].*,
-        .x25519_private = entropy[32..64].*,
+        .key_share_private = entropy[32..80].*,
         .alpn = options.alpn,
         .reassembly = &reassembly,
         .flight = &flight_storage,
@@ -321,6 +321,7 @@ fn alertFor(err: anyerror) ?zssl.alert.Description {
         error.IllegalKeyUpdate,
         error.IllegalCompression,
         error.PskNotLast,
+        error.BadKeyShare,
         => .illegal_parameter,
         error.MalformedAlert,
         error.MalformedMessage,

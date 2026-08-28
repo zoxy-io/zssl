@@ -8,13 +8,14 @@ const testing = std.testing;
 
 const Credentials = @import("Credentials.zig");
 const ServerHandshake = @import("ServerHandshake.zig");
+const backend = @import("crypto/backend_openssl.zig");
 const record = @import("record.zig");
 const test_client = @import("test_client.zig");
 
 const Client = test_client.TestClient(.aes_128_gcm_sha256);
 
 const client_x25519_private = [_]u8{0x11} ** 31 ++ [_]u8{0x42};
-const server_x25519_private = [_]u8{0x99} ** 31 ++ [_]u8{0x24};
+const server_key_share_private = [_]u8{0x99} ** 47 ++ [_]u8{0x24};
 const server_random = [_]u8{0x5c} ** 32;
 
 const Harness = struct {
@@ -34,7 +35,7 @@ const Harness = struct {
         harness.server = ServerHandshake.init(&.{
             .credentials = &harness.credentials,
             .server_random = server_random,
-            .x25519_private = server_x25519_private,
+            .key_share_private = server_key_share_private,
             .alpn = alpn,
             .reassembly = &harness.reassembly,
             .flight = &harness.flight,
@@ -169,7 +170,7 @@ test "HelloRetryRequest: no usable share, retry, complete" {
     defer harness.deinit();
     var client = Client.init(&client_x25519_private, &.{
         .offer_x25519_share = false,
-        .offer_p256_decoy = true,
+        .offer_unsupported_decoy = true,
     });
     defer client.deinit();
     var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
@@ -258,4 +259,57 @@ test "failure paths fail closed" {
         const replay = second.helloRecord(&client_out);
         try testing.expectError(error.UnexpectedMessage, harness.server.handleRecord(replay, &server_out));
     }
+}
+
+test "the server negotiates whichever group the client offers a share for" {
+    // x25519 is covered everywhere else; these are the two that arrived
+    // with secp256r1/secp384r1 support, and the point is that the whole
+    // handshake completes on them — ServerHello share, key schedule,
+    // Finished — not merely that the ECDH agrees.
+    for ([_]backend.Group{ .secp256r1, .secp384r1 }) |group| {
+        var harness: Harness = undefined;
+        try harness.init(null);
+        defer harness.deinit();
+        var client = Client.init(&client_x25519_private, &.{ .group = group });
+        defer client.deinit();
+
+        var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+        var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+
+        const hello = client.helloRecord(&client_out);
+        const flight = try harness.server.handleRecord(hello, &server_out);
+        try testing.expectEqual(std.meta.activeTag(flight), .send);
+        // No HelloRetryRequest: the share was usable as offered.
+        try testing.expectEqual(ServerHandshake.State.awaiting_finished, harness.server.state);
+        try testing.expectEqual(group, harness.server.key_share_group);
+
+        const reply = try client.absorb(flight.send, &client_out);
+        try testing.expectEqual(std.meta.activeTag(reply), .connected);
+        try testing.expect(client.certificate_verified);
+        const done = try feedRecords(&harness.server, reply.connected, &server_out);
+        try testing.expectEqual(std.meta.activeTag(done), .connected);
+    }
+}
+
+test "a share whose point is not on the curve is refused, not negotiated" {
+    var harness: Harness = undefined;
+    try harness.init(null);
+    defer harness.deinit();
+    // A P-256 group with a garbage point: the length is right, so the
+    // parser admits it and the refusal has to come from the key
+    // exchange itself (§4.2.8.2).
+    var client = Client.init(&client_x25519_private, &.{
+        .offer_x25519_share = false,
+        .offer_bogus_p256_share = true,
+    });
+    defer client.deinit();
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+
+    const hello = client.helloRecord(&client_out);
+    try testing.expectError(
+        error.IdentityElement,
+        harness.server.handleRecord(hello, &server_out),
+    );
+    try testing.expectEqual(ServerHandshake.State.failed, harness.server.state);
 }

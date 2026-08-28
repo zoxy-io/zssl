@@ -137,7 +137,7 @@ test "std.crypto.tls.Client: full handshake and data, no shared code" {
     var server = ServerHandshake.init(&.{
         .credentials = &credentials,
         .server_random = .{0x2f} ** 32,
-        .x25519_private = .{0x77} ** 31 ++ .{0x01},
+        .key_share_private = .{0x77} ** 47 ++ .{0x01},
         .reassembly = &reassembly,
         .flight = &flight,
     });

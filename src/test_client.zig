@@ -29,8 +29,17 @@ pub const Options = struct {
     /// Offer an x25519 key share in the first ClientHello. Off forces the
     /// server down the HelloRetryRequest path.
     offer_x25519_share: bool = true,
+    /// The group whose share this client offers and completes. The
+    /// scalar is stretched from the 32-byte constant every caller passes
+    /// — fine in a test client, and exactly the thing the library
+    /// refuses to do (DESIGN.md §1: entropy is the embedder's).
+    group: backend.Group = .x25519,
+    /// A P-256 KeyShareEntry of the right length carrying a point that is
+    /// not on the curve — the parser admits it and the key exchange must
+    /// be what refuses it.
+    offer_bogus_p256_share: bool = false,
     /// Offer a fake P-256 share beside (or instead of) the x25519 one.
-    offer_p256_decoy: bool = false,
+    offer_unsupported_decoy: bool = false,
     /// Cipher suites to offer, wire order; null offers all three.
     suites_wire: ?[]const u8 = null,
     alpn: ?[]const u8 = null,
@@ -67,6 +76,7 @@ pub fn TestClient(comptime suite: CipherSuite) type {
     return struct {
         options: Options,
         x25519_private: [32]u8,
+        scalar_storage: [backend.group_private_bytes_max]u8,
         state: ClientState,
         transcript: Transcript,
         schedule: ?Schedule,
@@ -111,12 +121,22 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             record_buffer.RecordBuffer.Error || wire.Error ||
             error{ UnexpectedMessage, BadServerHello, BadSignature, BadFinished, BadCertificate };
 
+        /// The private scalar for the configured group, stretched from
+        /// the 32-byte constant callers pass. A test client may do that;
+        /// the library may not.
+        fn scalar(self: *const Self) []const u8 {
+            const wanted = self.options.group.privateBytes();
+            assert(wanted <= self.scalar_storage.len);
+            return self.scalar_storage[0..wanted];
+        }
+
         pub fn init(x25519_private: *const [32]u8, options: *const Options) Self {
             assert(options.session_id.len <= 32);
             assert(!std.mem.allEqual(u8, x25519_private, 0));
             var client: Self = .{
                 .options = options.*,
                 .x25519_private = x25519_private.*,
+                .scalar_storage = x25519_private.* ++ x25519_private[0..16].*,
                 .state = .awaiting_server_hello,
                 .transcript = .empty,
                 .schedule = null,
@@ -161,7 +181,7 @@ pub fn TestClient(comptime suite: CipherSuite) type {
         pub fn helloRecord(self: *Self, out: []u8) []const u8 {
             assert(self.state == .awaiting_server_hello);
             assert(out.len >= record.header_bytes + self.hello_storage.len);
-            const message = self.buildHello(self.options.offer_x25519_share, self.options.offer_p256_decoy);
+            const message = self.buildHello(self.options.offer_x25519_share, self.options.offer_unsupported_decoy);
             self.transcript.update(message);
             var builder = wire.Builder.init(out);
             appendPlaintextRecord(&builder, .handshake, message);
@@ -263,22 +283,38 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             builder.putU16(51); // key_share
             const shares = builder.markU16();
             const share_list = builder.markU16();
-            if (with_decoy) {
-                builder.putU16(0x0017);
+            if (self.options.offer_bogus_p256_share) {
+                builder.putU16(@intFromEnum(backend.Group.secp256r1));
                 builder.putU16(65);
                 builder.putByte(0x04);
                 builder.putSlice(&(.{0x5a} ** 64));
             }
+            if (with_decoy) {
+                // secp521r1: a group zssl does not hold, so the share is
+                // unusable and the server must retry. It used to be
+                // P-256, which zssl now *does* hold — a decoy has to be
+                // a group we genuinely cannot complete or it stops
+                // testing HelloRetryRequest at all.
+                builder.putU16(0x0019);
+                builder.putU16(133);
+                builder.putByte(0x04);
+                builder.putSlice(&(.{0x5a} ** 132));
+            }
             if (with_x25519) {
-                var public: [32]u8 = undefined;
-                // Unreachable rather than propagated: the private key is a
+                // Unreachable rather than propagated: the scalar is a
                 // fixed nonzero test constant (asserted at init), so the
                 // only failure left is a libcrypto fault, which a test run
                 // should crash on rather than dress up as a peer error.
-                backend.x25519Public(&self.x25519_private, &public) catch unreachable;
-                builder.putU16(client_hello.group_x25519);
-                builder.putU16(32);
-                builder.putSlice(&public);
+                var public_buffer: [backend.group_public_bytes_max]u8 = undefined;
+                const group = self.options.group;
+                const public = backend.keySharePublic(
+                    group,
+                    self.scalar(),
+                    &public_buffer,
+                ) catch unreachable;
+                builder.putU16(@intFromEnum(group));
+                builder.putU16(@intCast(public.len));
+                builder.putSlice(public);
             }
             builder.patchU16(share_list);
             builder.patchU16(shares);
@@ -358,7 +394,8 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             if (CipherSuite.fromWire(suite_wire) != suite) return error.BadServerHello;
             if (try body.takeByte() != 0) return error.BadServerHello;
             const is_retry = std.mem.eql(u8, random, &server_messages.hello_retry_magic);
-            var server_share: ?[32]u8 = null;
+            var server_share_buffer: [backend.group_public_bytes_max]u8 = undefined;
+            var server_share_bytes: ?u8 = null;
             const extensions_bytes = try body.takeU16();
             if (extensions_bytes != body.remaining()) return error.BadServerHello;
             var extensions_seen: u8 = 0;
@@ -368,9 +405,13 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                 const data = try body.takeSlice(try body.takeU16());
                 if (extension_type == 51 and !is_retry) {
                     var share = wire.Cursor.init(data);
-                    if (try share.takeU16() != client_hello.group_x25519) return error.BadServerHello;
-                    if (try share.takeU16() != 32) return error.BadServerHello;
-                    server_share = (try share.takeSlice(32))[0..32].*;
+                    const group = self.options.group;
+                    if (try share.takeU16() != @intFromEnum(group)) return error.BadServerHello;
+                    const expected = group.publicBytes();
+                    if (try share.takeU16() != expected) return error.BadServerHello;
+                    const bytes = try share.takeSlice(expected);
+                    @memcpy(server_share_buffer[0..expected], bytes);
+                    server_share_bytes = expected;
                 }
                 if (extension_type == 41) {
                     // The server accepted our PSK; we only ever offer one.
@@ -382,7 +423,8 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             }
             if (is_retry) return self.handleRetry(message, out);
             self.transcript.update(message);
-            try self.startHandshakeKeys(&(server_share orelse return error.BadServerHello));
+            const share_bytes = server_share_bytes orelse return error.BadServerHello;
+            try self.startHandshakeKeys(server_share_buffer[0..share_bytes]);
             self.state = .awaiting_flight;
             return .none;
         }
@@ -412,17 +454,22 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             return .{ .send = builder.written() };
         }
 
-        fn startHandshakeKeys(self: *Self, server_share: *const [32]u8) Error!void {
+        fn startHandshakeKeys(self: *Self, server_share: []const u8) Error!void {
             assert(self.schedule == null);
-            var shared: [32]u8 = undefined;
-            try backend.x25519Shared(&self.x25519_private, server_share, &shared);
-            defer std.crypto.secureZero(u8, &shared);
+            var shared_buffer: [backend.group_shared_bytes_max]u8 = undefined;
+            defer std.crypto.secureZero(u8, &shared_buffer);
+            const shared = try backend.keyShareShared(
+                self.options.group,
+                self.scalar(),
+                server_share,
+                &shared_buffer,
+            );
             const psk: ?[]const u8 = if (self.psk_accepted)
                 self.options.resume_with.?.psk[0..hash_bytes]
             else
                 null;
             var schedule = Schedule.initEarly(psk);
-            schedule.advanceToHandshake(&shared);
+            schedule.advanceToHandshake(shared);
             const hello_hash = self.transcript.currentHash();
             self.client_handshake_traffic = schedule.deriveAt(.handshake, "c hs traffic", &hello_hash);
             self.server_handshake_traffic = schedule.deriveAt(.handshake, "s hs traffic", &hello_hash);

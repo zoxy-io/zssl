@@ -28,21 +28,26 @@ pub const hello_retry_magic = [32]u8{
 /// ServerHello and otherwise meaningless.
 pub const change_cipher_spec_record = [6]u8{ 0x14, 0x03, 0x03, 0x00, 0x01, 0x01 };
 
-/// A ServerHello needs ~90 bytes plus the session echo; the flight
-/// encoders below all assert against their real need, this is for sizing
-/// callers' buffers.
-pub const server_hello_bytes_max: u16 = 128;
+/// A ServerHello needs ~90 bytes plus the session echo and the key
+/// share, and the share is the part that moves: 32 bytes for x25519, 97
+/// for secp384r1's uncompressed point. Sized for the largest group so
+/// the buffer does not depend on what the client offered; the flight
+/// encoders below all assert against their real need.
+pub const server_hello_bytes_max: u16 = 224;
 
 pub fn serverHello(
     out: []u8,
     random: *const [32]u8,
     session_echo: []const u8,
     suite: CipherSuite,
-    x25519_public: *const [32]u8,
+    key_share_group: u16,
+    key_share_public: []const u8,
     selected_psk: ?u16,
 ) []const u8 {
     assert(out.len >= server_hello_bytes_max);
     assert(session_echo.len <= 32);
+    // The share's length is the group's, not the caller's to choose.
+    assert(key_share_public.len == client_hello.groupShareBytes(key_share_group).?);
     if (selected_psk) |index| assert(index < client_hello.psk_identities_max);
     var builder = wire.Builder.init(out);
     const message = handshake.beginMessage(&builder, .server_hello);
@@ -63,9 +68,9 @@ pub fn serverHello(
     }
     builder.putU16(extension_key_share);
     const key_share = builder.markU16();
-    builder.putU16(client_hello.group_x25519);
-    builder.putU16(32);
-    builder.putSlice(x25519_public);
+    builder.putU16(key_share_group);
+    builder.putU16(@intCast(key_share_public.len));
+    builder.putSlice(key_share_public);
     builder.patchU16(key_share);
     builder.putU16(extension_supported_versions);
     const versions = builder.markU16();
@@ -80,7 +85,12 @@ pub fn serverHello(
 
 /// §4.1.4: a HelloRetryRequest is a ServerHello with the magic random and
 /// a key_share carrying only the group the server insists on.
-pub fn helloRetryRequest(out: []u8, session_echo: []const u8, suite: CipherSuite) []const u8 {
+pub fn helloRetryRequest(
+    out: []u8,
+    session_echo: []const u8,
+    suite: CipherSuite,
+    key_share_group: u16,
+) []const u8 {
     assert(out.len >= server_hello_bytes_max);
     assert(session_echo.len <= 32);
     var builder = wire.Builder.init(out);
@@ -94,7 +104,7 @@ pub fn helloRetryRequest(out: []u8, session_echo: []const u8, suite: CipherSuite
     const extensions = builder.markU16();
     builder.putU16(extension_key_share);
     const key_share = builder.markU16();
-    builder.putU16(client_hello.group_x25519);
+    builder.putU16(key_share_group);
     builder.patchU16(key_share);
     builder.putU16(extension_supported_versions);
     const versions = builder.markU16();
@@ -262,6 +272,7 @@ test "serverHello reproduces RFC 8448's traced bytes exactly" {
         traced_random,
         &.{},
         .aes_128_gcm_sha256,
+        client_hello.group_x25519,
         &vectors.server_x25519_public,
         null,
     );
@@ -277,6 +288,7 @@ test "serverHello with a selected PSK reproduces the §4 traced bytes" {
         traced_random,
         &.{},
         .aes_128_gcm_sha256,
+        client_hello.group_x25519,
         &vectors.resumed_server_x25519_public,
         0,
     );
@@ -285,7 +297,7 @@ test "serverHello with a selected PSK reproduces the §4 traced bytes" {
 
 test "helloRetryRequest carries the §4.1.3 magic and the demanded group" {
     var out: [server_hello_bytes_max]u8 = undefined;
-    const encoded = helloRetryRequest(&out, &.{ 0xab, 0xcd }, .chacha20_poly1305_sha256);
+    const encoded = helloRetryRequest(&out, &.{ 0xab, 0xcd }, .chacha20_poly1305_sha256, client_hello.group_x25519);
     try std.testing.expectEqualSlices(u8, &hello_retry_magic, encoded[6..38]);
     // Session echo survives, and the message parses as server_hello.
     try std.testing.expectEqual(@as(u8, 2), encoded[38]);

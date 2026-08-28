@@ -56,13 +56,13 @@ test "README: terminating TLS" {
     var reassembly: [16 * 1024]u8 = undefined;
     var flight: [zssl.Credentials.chain_bytes_max + 1024]u8 = undefined;
 
-    var entropy: [64]u8 = undefined;
+    var entropy: [80]u8 = undefined;
     std.testing.io.random(&entropy);
 
     var server = zssl.ServerHandshake.init(&.{
         .credentials = &credentials,
         .server_random = entropy[0..32].*,
-        .x25519_private = entropy[32..64].*,
+        .key_share_private = entropy[32..80].*,
         .alpn = "http/1.1",
         .reassembly = &reassembly,
         .flight = &flight,
@@ -87,7 +87,7 @@ test "README: terminating TLS" {
 
 test "README: originating TLS" {
     const socket: Socket = .{};
-    var entropy: [64]u8 = undefined;
+    var entropy: [80]u8 = undefined;
     std.testing.io.random(&entropy);
     var out: [zssl.ClientHandshake.out_bytes_min]u8 = undefined;
 

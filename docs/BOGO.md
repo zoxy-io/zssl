@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 221 passed, 0 failed, 6965 declined by the shim (89), floor 221
+bogo: 231 passed, 0 failed, 6918 declined by the shim (89), floor 231
 bogo: PASS
 ```
 
@@ -41,16 +41,17 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**221 passed.** Cases the runner ran end to end and we satisfied —
+**231 passed.** Cases the runner ran end to end and we satisfied —
 including the alert we sent, which BoGo checks by name. 121 drive
-`ClientHandshake` and 100 drive `ServerHandshake`. The server number was
-6 until RSA signing landed; see below.
+`ClientHandshake` and 110 drive `ServerHandshake`. The server number was
+6 until RSA signing landed, and 100 until secp256r1/secp384r1 did; see
+below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
 either gets fixed or gets an entry in `DisabledTests` with a one-line
 reason. There are no silent skips.
 
-**6965 declined** — 88% of the corpus. The shim exited 89, PORTING.md's
+**6918 declined** — 88% of the corpus. The shim exited 89, PORTING.md's
 "unimplemented", and the runner counted the case without running it.
 That number is large enough to be the first thing anyone asks about, so
 here is what it is made of. Counting each case by the *first* thing the
@@ -65,7 +66,7 @@ shim declined:
 | 281 | `-enable-ocsp-stapling` / `-ocsp-response`. |
 | 250 | `-signing-prefs` / `-expect-peer-signature-algorithm`. |
 | 248 | `-new-rpk-credential` — raw public keys. |
-| 208 | A group that is not x25519. |
+| 105 | A group we do not hold, or a `-curves` set our client cannot honour — it offers x25519 alone whatever it is told, and the server cannot be told to accept a narrower set. |
 | 182 | `-accepted-peer-cert-types`. |
 | 167 | `-export-keying-material` — RFC 5705 exporters, which zssl has no API for. |
 | ~1800 | The rest of the flag surface, one flag at a time. |
@@ -74,8 +75,11 @@ Roughly 3400 of those — DTLS, QUIC, client certificates, 0-RTT, ECH,
 compliance policies, X.509 validation — are scope decisions written down
 in DESIGN.md §1 and will never come back. The rest is headroom: the
 largest single wins available are an RFC 5705 exporter (167 cases),
-exposing the peer's negotiated signature algorithm (128), and honouring
-`-signing-prefs` (122).
+exposing the peer's negotiated signature algorithm (128), honouring
+`-signing-prefs` (122), and letting the two machines be *told* which
+groups to use — a server that can be restricted to a subset and a client
+that can offer something other than x25519 would let the rest of the
+`-curves` corpus run against the key exchange that already completes it.
 
 Each decline names its flag on stderr, so a case that later turns into a
 failure says which flag it stumbled on rather than leaving it to
@@ -92,7 +96,11 @@ adversarially tested the client half and almost nothing else — the
 opposite of where a terminating proxy's risk sits.
 
 RSA-PSS signing (DESIGN.md §1) closed that, and the server count went
-from 6 to 100. It is worth being precise about what the fix bought:
+from 6 to 100; secp256r1 and secp384r1 key exchange took it to 110, and
+every TLS 1.3 case BoGo has for those curves — the valid shares, the
+compressed ones, the points off the curve, the truncated and padded ones
+— now passes. The residue those two curves left behind is 37 cases, and
+all 37 are pre-1.3. It is worth being precise about what the fix bought:
 every server-side finding below — both version-tolerance bugs, the PSK
 binder counting, the ClientHello parse strictness — was invisible until
 the server half could run at all. A gate that covers one half of a

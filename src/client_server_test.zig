@@ -17,6 +17,7 @@ const record = @import("record.zig");
 const backend = @import("crypto/backend_openssl.zig");
 const key_schedule = @import("key_schedule.zig");
 const protect = @import("protect.zig");
+const client_hello_mod = @import("client_hello.zig");
 const server_messages = @import("server_messages.zig");
 const transcript = @import("transcript.zig");
 
@@ -26,7 +27,7 @@ const client_x25519_private = [_]u8{0x31} ** 31 ++ [_]u8{0x07};
 /// modulus `verifyRsaPss` accepts, and the smallest openssl will mint.
 /// Throwaway material, never a credential.
 const rsa512_leaf_der = @embedFile("testdata/rsa512-leaf.der");
-const server_x25519_private = [_]u8{0x93} ** 31 ++ [_]u8{0x0e};
+const server_key_share_private = [_]u8{0x93} ** 47 ++ [_]u8{0x0e};
 
 const Buffers = struct {
     client_out: [2 * record.wire_record_bytes_max]u8 = undefined,
@@ -97,7 +98,7 @@ const Harness = struct {
         harness.server = ServerHandshake.init(&.{
             .credentials = &harness.credentials,
             .server_random = .{0x6d} ** 32,
-            .x25519_private = server_x25519_private,
+            .key_share_private = server_key_share_private,
             .alpn = options.server_alpn,
             .reassembly = &harness.server_reassembly,
             .flight = &harness.flight,
@@ -408,7 +409,7 @@ test "the client refuses HelloRetryRequest, structurally" {
     _ = harness.client.start(&buffers.client_out);
 
     var message_buffer: [server_messages.server_hello_bytes_max]u8 = undefined;
-    const retry = server_messages.helloRetryRequest(&message_buffer, &(.{0x44} ** 32), .aes_128_gcm_sha256);
+    const retry = server_messages.helloRetryRequest(&message_buffer, &(.{0x44} ** 32), .aes_128_gcm_sha256, client_hello_mod.group_x25519);
     var wire_buffer: [record.header_bytes + server_messages.server_hello_bytes_max]u8 = undefined;
     record.writeHeader(
         .{ .content_type = .handshake, .length = @intCast(retry.len) },

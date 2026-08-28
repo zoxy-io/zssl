@@ -234,7 +234,7 @@ fn fuzzServerMachine(input: []const u8) !void {
     var server = ServerHandshake.init(&.{
         .credentials = fuzzCredentials(),
         .server_random = @splat(0x5c),
-        .x25519_private = @splat(0x77),
+        .key_share_private = @splat(0x77),
         .alpn = "http/1.1",
         .reassembly = &reassembly,
         .flight = &flight,

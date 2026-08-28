@@ -185,6 +185,222 @@ pub fn x25519Shared(
 }
 
 /// Recover the public half of an X25519 private key.
+/// The key-exchange groups zssl offers, and the sizes each implies.
+/// x25519 is the one every peer has; the two NIST curves are here
+/// because half the TLS test corpora in existence assume secp256r1, and
+/// because a terminating proxy meets clients that offer nothing else.
+pub const Group = enum(u16) {
+    secp256r1 = 0x0017,
+    secp384r1 = 0x0018,
+    x25519 = 0x001d,
+
+    pub fn fromWire(wire: u16) ?Group {
+        return std.enums.fromInt(Group, wire);
+    }
+
+    /// The scalar an embedder supplies. Each curve's own order size —
+    /// never a hash of something shorter, because the entropy policy is
+    /// the embedder's and silently stretching it would take that away.
+    pub fn privateBytes(group: Group) u8 {
+        return switch (group) {
+            .x25519, .secp256r1 => 32,
+            .secp384r1 => 48,
+        };
+    }
+
+    /// What goes on the wire in a KeyShareEntry: a raw u-coordinate for
+    /// x25519, an uncompressed SEC1 point for the NIST curves (§4.2.8.2).
+    pub fn publicBytes(group: Group) u8 {
+        return switch (group) {
+            .x25519 => 32,
+            .secp256r1 => 65,
+            .secp384r1 => 97,
+        };
+    }
+
+    /// The ECDH output §7.4.2 feeds the key schedule: the x-coordinate
+    /// alone, at the curve's field size.
+    pub fn sharedBytes(group: Group) u8 {
+        return switch (group) {
+            .x25519, .secp256r1 => 32,
+            .secp384r1 => 48,
+        };
+    }
+
+    fn curveNid(group: Group) c_int {
+        return switch (group) {
+            .secp256r1 => c.NID_X9_62_prime256v1,
+            .secp384r1 => c.NID_secp384r1,
+            .x25519 => unreachable, // Not an EC group in libcrypto's sense.
+        };
+    }
+
+    fn curveName(group: Group) [:0]const u8 {
+        return switch (group) {
+            // libcrypto's own spelling: P-256 is "prime256v1" there.
+            .secp256r1 => "prime256v1",
+            .secp384r1 => "secp384r1",
+            .x25519 => unreachable, // Not an EC group in libcrypto's sense.
+        };
+    }
+};
+
+pub const group_private_bytes_max: u8 = 48;
+pub const group_public_bytes_max: u8 = 97;
+pub const group_shared_bytes_max: u8 = 48;
+
+/// The public half of `private_key` under `group`, written into `out`.
+pub fn keySharePublic(group: Group, private_key: []const u8, out: []u8) Error![]u8 {
+    assert(private_key.len == group.privateBytes());
+    assert(out.len >= group.publicBytes());
+    if (group == .x25519) {
+        try x25519Public(private_key[0..x25519_key_bytes], out[0..x25519_key_bytes]);
+        return out[0..x25519_key_bytes];
+    }
+    errdefer clearErrorQueue();
+    return ecPublicFromScalar(group, private_key, out);
+}
+
+/// scalar × G, as an uncompressed SEC1 point.
+///
+/// Deliberately the low-level EC API rather than `EVP_PKEY_fromdata`:
+/// importing a private key alone does *not* make the provider compute
+/// the public half, so asking for `OSSL_PKEY_PARAM_PUB_KEY` afterwards
+/// fails. The multiplication is the thing we actually want, and this is
+/// the call that does it.
+fn ecPublicFromScalar(group: Group, private_key: []const u8, out: []u8) Error![]u8 {
+    const ec_group = c.EC_GROUP_new_by_curve_name(group.curveNid()) orelse
+        return error.LibcryptoFailed;
+    defer c.EC_GROUP_free(ec_group);
+    const scalar = c.BN_bin2bn(private_key.ptr, @intCast(private_key.len), null) orelse
+        return error.LibcryptoFailed;
+    defer c.BN_clear_free(scalar);
+    const point = c.EC_POINT_new(ec_group) orelse return error.LibcryptoFailed;
+    defer c.EC_POINT_free(point);
+    if (c.EC_POINT_mul(ec_group, point, scalar, null, null, null) != 1) {
+        return error.LibcryptoFailed;
+    }
+    const written = c.EC_POINT_point2oct(
+        ec_group,
+        point,
+        c.POINT_CONVERSION_UNCOMPRESSED,
+        out.ptr,
+        out.len,
+        null,
+    );
+    if (written != group.publicBytes()) return error.LibcryptoFailed;
+    return out[0..written];
+}
+
+/// §7.4.2's shared secret: X25519's raw output, or the x-coordinate of
+/// the ECDH point. An all-zero result is `IdentityElement`, the abort
+/// §7.4.2 names, and libcrypto refuses a point off the curve for us.
+pub fn keyShareShared(
+    group: Group,
+    private_key: []const u8,
+    peer_public: []const u8,
+    out: []u8,
+) Error![]u8 {
+    assert(private_key.len == group.privateBytes());
+    assert(out.len >= group.sharedBytes());
+    if (group == .x25519) {
+        if (peer_public.len != x25519_key_bytes) return error.IdentityElement;
+        try x25519Shared(
+            private_key[0..x25519_key_bytes],
+            peer_public[0..x25519_key_bytes],
+            out[0..x25519_key_bytes],
+        );
+        return out[0..x25519_key_bytes];
+    }
+    errdefer clearErrorQueue();
+    // A peer point of the wrong length never reaches libcrypto: the
+    // length is the peer's to choose and this is the boundary that
+    // checks it (DESIGN.md §2).
+    if (peer_public.len != group.publicBytes()) return error.IdentityElement;
+    if (peer_public[0] != 0x04) return error.IdentityElement; // §4.2.8.2: uncompressed only.
+
+    const pkey = try ecFromPrivate(group, private_key);
+    defer c.EVP_PKEY_free(pkey);
+    const peer = try ecFromPublic(group, peer_public);
+    defer c.EVP_PKEY_free(peer);
+
+    const ctx = c.EVP_PKEY_CTX_new(pkey, null) orelse return error.LibcryptoFailed;
+    defer c.EVP_PKEY_CTX_free(ctx);
+    if (c.EVP_PKEY_derive_init(ctx) != 1) return error.LibcryptoFailed;
+    if (c.EVP_PKEY_derive_set_peer(ctx, peer) != 1) return error.IdentityElement;
+    var shared_len: usize = out.len;
+    if (c.EVP_PKEY_derive(ctx, out.ptr, &shared_len) != 1) return error.IdentityElement;
+    if (shared_len != group.sharedBytes()) return error.LibcryptoFailed;
+    if (std.mem.allEqual(u8, out[0..shared_len], 0)) return error.IdentityElement;
+    return out[0..shared_len];
+}
+
+/// Build an EC `EVP_PKEY` from a raw scalar. OpenSSL 3's `fromdata`
+/// takes the private key as a BIGNUM and computes the public half, which
+/// is what lets zssl keep its "the embedder supplies the entropy" rule:
+/// nothing here generates a key, it only completes one.
+fn ecFromPrivate(group: Group, private_key: []const u8) Error!*c.EVP_PKEY {
+    const bn = c.BN_bin2bn(private_key.ptr, @intCast(private_key.len), null) orelse
+        return error.LibcryptoFailed;
+    defer c.BN_clear_free(bn);
+    // Both halves, because `fromdata` does not derive the public one from
+    // the private and a keypair selection without it is rejected.
+    var public_buffer: [group_public_bytes_max]u8 = undefined;
+    const public_key = try ecPublicFromScalar(group, private_key, &public_buffer);
+    const builder = c.OSSL_PARAM_BLD_new() orelse return error.LibcryptoFailed;
+    defer c.OSSL_PARAM_BLD_free(builder);
+    const name = group.curveName();
+    if (c.OSSL_PARAM_BLD_push_utf8_string(
+        builder,
+        c.OSSL_PKEY_PARAM_GROUP_NAME,
+        name.ptr,
+        name.len,
+    ) != 1) return error.LibcryptoFailed;
+    if (c.OSSL_PARAM_BLD_push_BN(builder, c.OSSL_PKEY_PARAM_PRIV_KEY, bn) != 1)
+        return error.LibcryptoFailed;
+    if (c.OSSL_PARAM_BLD_push_octet_string(
+        builder,
+        c.OSSL_PKEY_PARAM_PUB_KEY,
+        public_key.ptr,
+        public_key.len,
+    ) != 1) return error.LibcryptoFailed;
+    return pkeyFromBuilder(builder, c.EVP_PKEY_KEYPAIR);
+}
+
+/// The peer's point, as an uncompressed SEC1 octet string. libcrypto
+/// rejects a point that is not on the curve at import, which is where
+/// §4.2.8.2's validation actually happens.
+fn ecFromPublic(group: Group, peer_public: []const u8) Error!*c.EVP_PKEY {
+    const builder = c.OSSL_PARAM_BLD_new() orelse return error.LibcryptoFailed;
+    defer c.OSSL_PARAM_BLD_free(builder);
+    const name = group.curveName();
+    if (c.OSSL_PARAM_BLD_push_utf8_string(
+        builder,
+        c.OSSL_PKEY_PARAM_GROUP_NAME,
+        name.ptr,
+        name.len,
+    ) != 1) return error.LibcryptoFailed;
+    if (c.OSSL_PARAM_BLD_push_octet_string(
+        builder,
+        c.OSSL_PKEY_PARAM_PUB_KEY,
+        peer_public.ptr,
+        peer_public.len,
+    ) != 1) return error.LibcryptoFailed;
+    return pkeyFromBuilder(builder, c.EVP_PKEY_PUBLIC_KEY);
+}
+
+fn pkeyFromBuilder(builder: *c.OSSL_PARAM_BLD, selection: c_int) Error!*c.EVP_PKEY {
+    const params = c.OSSL_PARAM_BLD_to_param(builder) orelse return error.LibcryptoFailed;
+    defer c.OSSL_PARAM_free(params);
+    const ctx = c.EVP_PKEY_CTX_new_from_name(null, "EC", null) orelse
+        return error.LibcryptoFailed;
+    defer c.EVP_PKEY_CTX_free(ctx);
+    if (c.EVP_PKEY_fromdata_init(ctx) != 1) return error.LibcryptoFailed;
+    var pkey: ?*c.EVP_PKEY = null;
+    if (c.EVP_PKEY_fromdata(ctx, &pkey, selection, params) != 1) return error.IdentityElement;
+    return pkey orelse error.LibcryptoFailed;
+}
+
 pub fn x25519Public(
     private_key: *const [x25519_key_bytes]u8,
     out: *[x25519_key_bytes]u8,
@@ -549,6 +765,85 @@ test "signer refuses what policy excludes" {
         "MC4CAQAwBQYDK2VwBCIEIFf+dQTz6cUdWa5TXBWSGCNjZfbWEUxTAKF+bmKlbYzR\n" ++
         "-----END PRIVATE KEY-----\n";
     try std.testing.expectError(error.UnsupportedKey, Signer.fromPem(ed25519_pem, false));
+}
+
+test "P-256 and P-384 key exchange agree with std.crypto and with themselves" {
+    const std_curves = .{
+        .{ Group.secp256r1, std.crypto.ecc.P256 },
+        .{ Group.secp384r1, std.crypto.ecc.P384 },
+    };
+    inline for (std_curves) |pair| {
+        const group: Group = pair[0];
+        const Curve = pair[1];
+        const private_bytes = comptime group.privateBytes();
+
+        // Two scalars an embedder might have handed us. Fixed, because
+        // zssl draws no randomness and neither does its test suite.
+        var alice: [group_private_bytes_max]u8 = undefined;
+        var bob: [group_private_bytes_max]u8 = undefined;
+        for (0..private_bytes) |i| {
+            alice[i] = @intCast((i * 7 + 3) & 0x7f);
+            bob[i] = @intCast((i * 11 + 5) & 0x7f);
+        }
+
+        var alice_public: [group_public_bytes_max]u8 = undefined;
+        var bob_public: [group_public_bytes_max]u8 = undefined;
+        const alice_share = try keySharePublic(group, alice[0..private_bytes], &alice_public);
+        const bob_share = try keySharePublic(group, bob[0..private_bytes], &bob_public);
+        try std.testing.expectEqual(@as(usize, group.publicBytes()), alice_share.len);
+        try std.testing.expectEqual(@as(u8, 0x04), alice_share[0]); // §4.2.8.2: uncompressed.
+
+        // Oracle one: `std.crypto`'s own scalar multiplication, which
+        // shares no line of code with libcrypto's.
+        const expected = try Curve.basePoint.mul(alice[0..private_bytes].*, .big);
+        try std.testing.expectEqualSlices(u8, &expected.toUncompressedSec1(), alice_share);
+
+        // Oracle two: both sides reach the same secret, which is the
+        // property the key schedule actually rests on.
+        var alice_shared: [group_shared_bytes_max]u8 = undefined;
+        var bob_shared: [group_shared_bytes_max]u8 = undefined;
+        const from_alice = try keyShareShared(group, alice[0..private_bytes], bob_share, &alice_shared);
+        const from_bob = try keyShareShared(group, bob[0..private_bytes], alice_share, &bob_shared);
+        try std.testing.expectEqualSlices(u8, from_alice, from_bob);
+        try std.testing.expectEqual(@as(usize, group.sharedBytes()), from_alice.len);
+
+        // And §7.4.2's own arithmetic, taken from std: the shared secret
+        // is the x-coordinate of the product point, nothing more.
+        const peer = try Curve.fromSec1(bob_share);
+        const product = try peer.mul(alice[0..private_bytes].*, .big);
+        try std.testing.expectEqualSlices(
+            u8,
+            &product.affineCoordinates().x.toBytes(.big),
+            from_alice,
+        );
+
+        // Negative space: a point that is not on the curve, a compressed
+        // point, and a truncated one are all refused at the boundary
+        // rather than reaching the key schedule.
+        var bogus: [group_public_bytes_max]u8 = undefined;
+        @memcpy(bogus[0..alice_share.len], alice_share);
+        bogus[alice_share.len - 1] ^= 0xff;
+        try std.testing.expectError(error.IdentityElement, keyShareShared(
+            group,
+            bob[0..private_bytes],
+            bogus[0..alice_share.len],
+            &bob_shared,
+        ));
+        @memcpy(bogus[0..alice_share.len], alice_share);
+        bogus[0] = 0x02; // compressed form, which §4.2.8.2 forbids
+        try std.testing.expectError(error.IdentityElement, keyShareShared(
+            group,
+            bob[0..private_bytes],
+            bogus[0..alice_share.len],
+            &bob_shared,
+        ));
+        try std.testing.expectError(error.IdentityElement, keyShareShared(
+            group,
+            bob[0..private_bytes],
+            alice_share[0 .. alice_share.len - 1],
+            &bob_shared,
+        ));
+    }
 }
 
 test "x25519 matches RFC 8448 and refuses the identity" {

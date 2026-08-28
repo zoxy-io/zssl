@@ -20,6 +20,11 @@ pub const Error = error{
     TrailingBytes,
     MalformedMessage,
     MalformedExtension,
+    /// A KeyShareEntry whose share length is not the one its group fixes
+    /// (§4.2.8.2) — a compressed point where an uncompressed one belongs,
+    /// most often. The value is illegal rather than undecodable, which is
+    /// the difference between illegal_parameter and decode_error.
+    BadKeyShare,
     IllegalCompression,
     SuiteOverflow,
     ExtensionOverflow,
@@ -50,7 +55,31 @@ const extension_psk_key_exchange_modes: u16 = 45;
 const extension_key_share: u16 = 51;
 const tls13_wire_version: u16 = 0x0304;
 
+pub const group_secp256r1: u16 = 0x0017;
+pub const group_secp384r1: u16 = 0x0018;
 pub const group_x25519: u16 = 0x001d;
+
+/// The groups zssl can complete, in the order it prefers them. x25519
+/// first because it is the fastest and the one every modern peer offers;
+/// the NIST curves behind it because a terminating proxy meets clients
+/// that offer nothing else.
+pub const groups_supported = [_]u16{ group_x25519, group_secp256r1, group_secp384r1 };
+
+/// A KeyShareEntry's share length is fixed by its group (§4.2.8.2): a
+/// raw u-coordinate for x25519, an uncompressed SEC1 point otherwise.
+pub fn groupShareBytes(group: u16) ?u16 {
+    return switch (group) {
+        group_x25519 => 32,
+        group_secp256r1 => 65,
+        group_secp384r1 => 97,
+        else => null,
+    };
+}
+
+pub const KeyShareEntry = struct {
+    group: u16,
+    share: []const u8,
+};
 
 pub const ClientHello = struct {
     random: *const [32]u8,
@@ -58,7 +87,11 @@ pub const ClientHello = struct {
     /// The raw u16 suite list, even-length, bounded at parse.
     cipher_suites_wire: []const u8,
     server_name: ?[]const u8 = null,
-    key_share_x25519: ?*const [32]u8 = null,
+    /// The offered shares for groups we can complete, in the order the
+    /// client sent them. Groups we do not hold are skipped rather than
+    /// refused — §4.2.8 lets a client offer whatever it likes.
+    key_shares: [groups_supported.len]KeyShareEntry = undefined,
+    key_share_count: u8 = 0,
     supports_tls13: bool = false,
     /// The inner u16 group list, prefix stripped and validated even.
     supported_groups_wire: ?[]const u8 = null,
@@ -81,6 +114,35 @@ pub const ClientHello = struct {
 
     /// Whether the client's supported_groups names `group` — the fact a
     /// HelloRetryRequest decision rests on (§4.2.7).
+    /// The share this client offered for `group`, if any.
+    pub fn keyShareFor(self: *const ClientHello, group: u16) ?[]const u8 {
+        assert(self.key_share_count <= groups_supported.len);
+        for (self.key_shares[0..self.key_share_count]) |entry| {
+            if (entry.group == group) return entry.share;
+        }
+        return null;
+    }
+
+    /// The first offered share we can complete, in *our* preference
+    /// order rather than the client's — §4.2.8 leaves the choice to the
+    /// server, and a client's ordering is a hint.
+    pub fn preferredKeyShare(self: *const ClientHello) ?KeyShareEntry {
+        assert(self.key_share_count <= groups_supported.len);
+        for (groups_supported) |group| {
+            if (self.keyShareFor(group)) |share| return .{ .group = group, .share = share };
+        }
+        return null;
+    }
+
+    /// The group we would ask for in a HelloRetryRequest: the first we
+    /// hold that the client says it supports, share or no share.
+    pub fn preferredSupportedGroup(self: *const ClientHello) ?u16 {
+        for (groups_supported) |group| {
+            if (self.supportsGroup(group)) return group;
+        }
+        return null;
+    }
+
     pub fn supportsGroup(self: *const ClientHello, group: u16) bool {
         const list = self.supported_groups_wire orelse return false;
         assert(list.len % 2 == 0);
@@ -219,7 +281,7 @@ fn trackedBit(extension_type: u16) ?u6 {
 fn applyExtension(extension_type: u16, data: []const u8, hello: *ClientHello) Error!void {
     switch (extension_type) {
         extension_server_name => hello.server_name = try parseServerName(data),
-        extension_key_share => hello.key_share_x25519 = try parseKeyShare(data),
+        extension_key_share => try parseKeyShare(data, hello),
         extension_supported_versions => hello.supports_tls13 = try parseSupportedVersions(data),
         extension_supported_groups => {
             hello.supported_groups_wire = try parseU16List(data, groups_count_max);
@@ -338,13 +400,13 @@ fn parseServerName(data: []const u8) Error![]const u8 {
     return name;
 }
 
-/// §4.2.8: walk the KeyShareClientHello for an x25519 entry. A duplicate
-/// group is a MUST NOT the client broke; unknown groups pass by.
-fn parseKeyShare(data: []const u8) Error!?*const [32]u8 {
+/// §4.2.8: walk the KeyShareClientHello, keeping the entries for groups
+/// we can complete. A duplicate group is a MUST NOT the client broke;
+/// unknown groups pass by, because offering them is legal.
+fn parseKeyShare(data: []const u8, hello: *ClientHello) Error!void {
     var cursor = Cursor.init(data);
     const list_bytes = try cursor.takeU16();
     if (list_bytes != cursor.remaining()) return error.MalformedExtension;
-    var x25519_share: ?*const [32]u8 = null;
     var entries: u16 = 0;
     while (cursor.remaining() > 0) : (entries += 1) {
         if (entries >= key_share_entries_max) return error.ExtensionOverflow;
@@ -352,14 +414,16 @@ fn parseKeyShare(data: []const u8) Error!?*const [32]u8 {
         const group = try cursor.takeU16();
         const share_bytes = try cursor.takeU16();
         const share = try cursor.takeSlice(share_bytes);
-        if (group == group_x25519) {
-            if (x25519_share != null) return error.MalformedExtension;
-            if (share.len != 32) return error.MalformedExtension;
-            x25519_share = share[0..32];
-        }
+        const expected = groupShareBytes(group) orelse continue;
+        if (hello.keyShareFor(group) != null) return error.MalformedExtension;
+        // A share whose length does not match its group never reaches
+        // the crypto boundary; §4.2.8.2 fixes the length per group.
+        if (share.len != expected) return error.BadKeyShare;
+        assert(hello.key_share_count < groups_supported.len);
+        hello.key_shares[hello.key_share_count] = .{ .group = group, .share = share };
+        hello.key_share_count += 1;
     }
     assert(cursor.remaining() == 0);
-    return x25519_share;
 }
 
 /// §4.2.1: the client's version list; 0x0304 anywhere in it is the offer.
@@ -387,7 +451,12 @@ test "parses RFC 8448's ClientHello field for field" {
     try std.testing.expectEqualSlices(u8, "server", hello.server_name.?);
     try std.testing.expectEqual(@as(usize, 0), hello.legacy_session_id.len);
     try std.testing.expect(hello.supports_tls13);
-    try std.testing.expectEqualSlices(u8, &vectors.client_x25519_public, hello.key_share_x25519.?);
+    try std.testing.expectEqualSlices(
+        u8,
+        &vectors.client_x25519_public,
+        hello.keyShareFor(group_x25519).?,
+    );
+    try std.testing.expectEqual(group_x25519, hello.preferredKeyShare().?.group);
     // The trace offers 0x1301, 0x1303, 0x1302 in that order.
     try std.testing.expect(hello.offersSuite(.aes_128_gcm_sha256));
     try std.testing.expect(hello.offersSuite(.aes_256_gcm_sha384));
