@@ -697,3 +697,88 @@ test "the signing policy is a load-time refusal, not a mid-flight surprise" {
         Credentials.load(rsa_cert, @embedFile("testdata/rsa1024-key.pem"), &storage, false),
     );
 }
+
+test "a protected record that is nothing but its content type is refused, not asserted" {
+    // §5.4: only application_data may carry a zero-length
+    // TLSInnerPlaintext.content. A peer that seals an empty alert or an
+    // empty handshake message is sending unexpected_message — and it
+    // once reached `assert(payload.len >= 1)` instead, which is a remote
+    // abort in any build that keeps assertions on. tlsfuzzer's
+    // `test-tls13-empty-alert` is what found it.
+    //
+    // The forgery is sealed with each machine's genuine session key, so
+    // it arrives at the right sequence number and gets all the way to
+    // the inner content-type switch, which is the code under test.
+    for ([_]record.ContentType{ .alert, .handshake }) |inner| {
+        var buffers: Buffers = .{};
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        try harness.connect(&buffers);
+
+        switch (harness.client.ladder.?) {
+            inline else => |*arm| {
+                const empty = try arm.session.?.send.seal(inner, &.{}, &buffers.client_out);
+                try testing.expectError(
+                    error.UnexpectedMessage,
+                    harness.server.handleRecord(empty, &buffers.server_out),
+                );
+            },
+        }
+        switch (harness.server.ladder.?) {
+            inline else => |*arm| {
+                const empty = try arm.session.?.send.seal(inner, &.{}, &buffers.server_out);
+                try testing.expectError(
+                    error.UnexpectedMessage,
+                    harness.client.handleRecord(empty, &buffers.scratch),
+                );
+            },
+        }
+    }
+
+    // Mid-handshake too, which is a different arm of the same switch:
+    // the client here holds handshake keys and has not seen the server's
+    // flight, so the record is opened by `arm.recv` rather than the
+    // session. tlsfuzzer reaches this state and the `.connected` one by
+    // separate conversations, and so should this.
+    {
+        var buffers: Buffers = .{};
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        const hello = harness.client.start(&buffers.client_out);
+        const flight = try harness.server.handleRecord(hello, &buffers.server_out);
+        const server_hello_record = recordAt(flight.send, 0);
+        _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
+        try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
+
+        var forger = try serverFlightProtector(
+            &client_x25519_private,
+            hello,
+            server_hello_record,
+        );
+        defer forger.deinit();
+        var forged: [record.wire_record_bytes_max]u8 = undefined;
+        const empty = try forger.seal(.alert, &.{}, &forged);
+        try testing.expectError(
+            error.UnexpectedMessage,
+            harness.client.handleRecord(empty, &buffers.scratch),
+        );
+        try testing.expectEqual(ClientHandshake.State.failed, harness.client.state);
+    }
+
+    // The same record with one byte of content is ordinary traffic, so
+    // the guard above cannot be a blanket refusal of short records.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+    try harness.connect(&buffers);
+    switch (harness.client.ladder.?) {
+        inline else => |*arm| {
+            const one = try arm.session.?.send.seal(.application_data, "x", &buffers.client_out);
+            const event = try harness.server.handleRecord(one, &buffers.server_out);
+            try testing.expectEqualSlices(u8, "x", event.application_data);
+        },
+    }
+}

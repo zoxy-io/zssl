@@ -535,6 +535,14 @@ fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: [
                 else => unreachable, // The guard above admits only these two.
             };
             const plaintext = out[0..opened.plaintext_bytes];
+            // §5.4: only application_data may carry a zero-length
+            // TLSInnerPlaintext.content; a handshake or alert record that
+            // is nothing but its content-type byte is unexpected_message.
+            // Here is the only place that can tell — the length on the
+            // wire covers padding this one does not.
+            if (plaintext.len == 0 and opened.content_type != .application_data) {
+                return error.UnexpectedMessage;
+            }
             switch (opened.content_type) {
                 .alert => return self.handlePlaintextAlert(plaintext),
                 .handshake => return self.handleProtectedHandshake(arm, plaintext, out),

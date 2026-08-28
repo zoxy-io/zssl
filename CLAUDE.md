@@ -37,9 +37,12 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
 - `zig fmt --check src interop bogo tlsfuzzer scripts build.zig
   build.zig.zon` — format gate.
 - Run the `tiger-style-reviewer` agent on the working diff before
-  committing a slice (same rule as zoxy). Point it at the
-  security-critical paths of the diff by name; reachable assertions on
-  attacker-controlled input are must-fix findings.
+  committing a slice (same rule as zoxy). Its definition lives in
+  `.claude/agents/tiger-style-reviewer.md`; zoxy's copy remains the
+  source of truth for TIGER_STYLE itself, and this one adds zssl's
+  invariants. Point it at the security-critical paths of the diff by
+  name; reachable assertions on attacker-controlled input are must-fix
+  findings.
 
 ## Invariants (grep-checkable; a reviewer failure if broken)
 
@@ -79,10 +82,13 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
   needs `raw.githubusercontent.com` auth, and the badge would have to go
   static like the BoGo pair.
 - `tlsfuzzer/scripts.json` is the same kind of ledger as
-  `bogo/config.json`, with one difference that matters: 31 of its entries
+  `bogo/config.json`, with one difference that matters: 26 of its entries
   say "not yet triaged", and the gate counts and prints them. That number
   should go *down*. Never add a new untriaged entry when the cause is
-  known, and never let the count grow to make a pin bump green.
+  known, and never let the count grow to make a pin bump green. Triage a
+  script against **both** leaves the gate serves (ECDSA and RSA) before
+  recording a reason: a dozen scripts advertise RSA-PSS alone, and over
+  the wrong leaf they fail their own `sanity` conversation.
 - The BoGo and tlsfuzzer badges in README.md are static and carry the same numbers
   as `passing_floor` and the decline count. They move in the same commit
   the floor does; a badge that disagrees with the gate is worse than no

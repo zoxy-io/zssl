@@ -30,20 +30,53 @@ const tlsfuzzer_commit = "5eebc4464e5197a7f7392fb9acda99cfc32441f7";
 const tlslite_requirement = "tlslite-ng==0.9.0b2";
 const ecdsa_requirement = "ecdsa>=0.15";
 
-/// What the pin above scored on the tree that introduced this gate: 4
-/// scripts, 160 conversations between them. Raise it whenever a fix
-/// moves the number up; a drop is either a regression or a suppression,
-/// and both deserve to stop the build.
-const passing_floor: u32 = 4;
+/// What the pin above scores on this tree: 10 scripts, 238 conversations
+/// between them. Raise it whenever a fix moves the number up; a drop is
+/// either a regression or a suppression, and both deserve to stop the
+/// build.
+const passing_floor: u32 = 10;
 
 const work_dir = "zig-out/tlsfuzzer";
 const checkout_dir = work_dir ++ "/tlsfuzzer";
 const venv_dir = work_dir ++ "/venv";
 const log_path = work_dir ++ "/tlsfuzzer.log";
 
-/// The loopback port the harness binds. Fixed rather than ephemeral
-/// because the scripts are told where to connect on their command line.
-const server_port: u16 = 4433;
+/// The leaves the gate serves, one harness instance each.
+///
+/// Two, because a dozen-odd scripts advertise *only* RSA-PSS signature
+/// algorithms, and a server holding an ECDSA leaf can answer those with
+/// nothing but handshake_failure. That fails the script's own `sanity`
+/// conversation and every case queued behind it, which reads as "the
+/// corpus rejects us" when it is a fixture mismatch and nothing more.
+/// Serving one leaf was costing this gate scripts that had never been
+/// given a chance to fail on their merits.
+///
+/// The ports are fixed rather than ephemeral because the scripts are
+/// told where to connect on their command line.
+const Leaf = struct {
+    name: []const u8,
+    port: u16,
+    cert_path: []const u8,
+    key_path: []const u8,
+};
+
+const leaves = [_]Leaf{
+    .{
+        .name = "ecdsa",
+        .port = 4433,
+        .cert_path = "src/testdata/cert.pem",
+        .key_path = "src/testdata/key.pem",
+    },
+    .{
+        .name = "rsa",
+        .port = 4434,
+        .cert_path = "src/testdata/rsa2048-cert.pem",
+        .key_path = "src/testdata/rsa2048-key.pem",
+    },
+};
+
+/// What a `Run` entry that names no leaf is served.
+const default_leaf = "ecdsa";
 
 /// Generous: a cold run clones the corpus and pip-installs two packages
 /// before a single script runs.
@@ -51,7 +84,7 @@ const watchdog_budget_ns: u64 = 45 * 60 * std.time.ns_per_s;
 
 var watchdog_stage: std.atomic.Value(u8) = .init(0);
 var watchdog_child_pid: std.atomic.Value(i32) = .init(0);
-var watchdog_server_pid: std.atomic.Value(i32) = .init(0);
+var watchdog_server_pids: [leaves.len]std.atomic.Value(i32) = @splat(.init(0));
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
@@ -97,12 +130,8 @@ pub fn main(init: std.process.Init) !u8 {
     );
 
     watchdog_stage.store(4, .release);
-    const server = try startServer(io, arena, options.server_path);
-    defer stopServer(io, server);
-    // The scripts connect the moment they start, so the listener has to
-    // be up before the first one does — and "up" is a line the harness
-    // prints, not a guess at how long it takes.
-    try awaitListening(io, server);
+    const servers = try startServers(io, arena, options.server_path);
+    defer stopServers(io, servers);
 
     watchdog_stage.store(5, .release);
     const outcome = try runScripts(io, arena, venv_python, scripts.run);
@@ -113,6 +142,7 @@ pub fn main(init: std.process.Init) !u8 {
         .{ outcome.passed, outcome.failed, scripts.disabled, passing_floor },
     );
     for (outcome.failures.items) |name| std.debug.print("tlsfuzzer: FAILED {s}\n", .{name});
+    if (!reportDeadHarness(io)) return 1;
     if (outcome.failed >= 1) {
         std.debug.print(
             "tlsfuzzer: FAIL — {d} script(s) we ran and did not satisfy; see {s}\n",
@@ -144,10 +174,13 @@ fn watchdogTask(io: Io) void {
         else => "teardown",
     };
     std.debug.print("tlsfuzzer: FAIL — wedged in: {s}\n", .{name});
-    // Both children, because leaving a listener on a fixed port behind
+    // Every child, because leaving a listener on a fixed port behind
     // makes the *next* run fail for a reason that has nothing to do with
     // the code under test.
-    for ([_]i32{ watchdog_child_pid.load(.acquire), watchdog_server_pid.load(.acquire) }) |pid| {
+    const child = watchdog_child_pid.load(.acquire);
+    if (child != 0) std.posix.kill(child, std.posix.SIG.KILL) catch {};
+    for (&watchdog_server_pids) |*slot| {
+        const pid = slot.load(.acquire);
         if (pid != 0) std.posix.kill(pid, std.posix.SIG.KILL) catch {};
     }
     std.process.exit(1);
@@ -234,6 +267,8 @@ fn ensureVirtualenv(io: Io, arena: std.mem.Allocator, python: []const u8) ![]con
 const Script = struct {
     name: []const u8,
     arguments: []const []const u8,
+    /// Index into `leaves`: which harness this script is pointed at.
+    leaf: usize,
 };
 
 const Scripts = struct {
@@ -246,10 +281,11 @@ const Scripts = struct {
     untriaged: u32,
 };
 
-/// `scripts.json`: a `Run` list of `{name, arguments?}` and a `Disabled`
-/// map from script name to the one-line reason it is not run. The shape
-/// follows tlsfuzzer's own `tests/tlslite-ng.json` closely enough that a
-/// reader of one can read the other.
+/// `scripts.json`: a `Run` list of `{name, arguments?, leaf?}` and a
+/// `Disabled` map from script name to the one-line reason it is not run.
+/// The shape follows tlsfuzzer's own `tests/tlslite-ng.json` closely
+/// enough that a reader of one can read the other; `leaf` is ours, and
+/// names an entry in `leaves` above.
 fn loadScripts(io: Io, arena: std.mem.Allocator, path: []const u8) !Scripts {
     const contents = try readFile(io, arena, path);
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, contents, .{});
@@ -269,7 +305,15 @@ fn loadScripts(io: Io, arena: std.mem.Allocator, path: []const u8) !Scripts {
                 try arguments.append(arena, argument.string);
             }
         }
-        try scripts.append(arena, .{ .name = name.string, .arguments = arguments.items });
+        const leaf_name = if (entry.object.get("leaf")) |value| blk: {
+            if (value != .string) return error.MalformedConfig;
+            break :blk value.string;
+        } else default_leaf;
+        try scripts.append(arena, .{
+            .name = name.string,
+            .arguments = arguments.items,
+            .leaf = try leafIndex(leaf_name),
+        });
     }
     var disabled: u32 = 0;
     var untriaged: u32 = 0;
@@ -291,23 +335,43 @@ fn loadScripts(io: Io, arena: std.mem.Allocator, path: []const u8) !Scripts {
     return .{ .run = scripts.items, .disabled = disabled, .untriaged = untriaged };
 }
 
+/// A `leaf` naming no harness is a typo in the ledger, not a default to
+/// paper over: it would silently point the script at the wrong server.
+fn leafIndex(name: []const u8) !usize {
+    for (&leaves, 0..) |leaf, index| {
+        if (std.mem.eql(u8, leaf.name, name)) return index;
+    }
+    return error.UnknownLeaf;
+}
+
 const Server = struct {
     child: std.process.Child,
     reader: Io.File.Reader,
     buffer: [4096]u8,
 };
 
-fn startServer(io: Io, arena: std.mem.Allocator, server_path: []const u8) !*Server {
+fn startServer(
+    io: Io,
+    arena: std.mem.Allocator,
+    server_path: []const u8,
+    leaf: Leaf,
+    index: usize,
+) !*Server {
+    assert(index < leaves.len);
     const absolute = try absolutePath(io, arena, server_path);
-    const port = try std.fmt.allocPrint(arena, "{d}", .{server_port});
+    const port = try std.fmt.allocPrint(arena, "{d}", .{leaf.port});
     const server = try arena.create(Server);
     server.child = try std.process.spawn(io, .{
-        .argv = &.{ absolute, "--port", port },
+        .argv = &.{
+            absolute,      "--port",       port,
+            "--cert",      leaf.cert_path, "--key",
+            leaf.key_path,
+        },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .pipe,
     });
-    watchdog_server_pid.store(server.child.id orelse 0, .release);
+    watchdog_server_pids[index].store(server.child.id orelse 0, .release);
     server.reader = server.child.stderr.?.reader(io, &server.buffer);
     return server;
 }
@@ -332,9 +396,64 @@ fn awaitListening(io: Io, server: *Server) !void {
     return error.ServerNeverListened;
 }
 
-fn stopServer(io: Io, server: *Server) void {
+/// One harness per leaf, each waited for rather than slept on.
+///
+/// The scripts connect the moment they start, so every listener has to
+/// be up before the first one does — and "up" is a line the harness
+/// prints, not a guess at how long it takes.
+fn startServers(io: Io, arena: std.mem.Allocator, server_path: []const u8) ![leaves.len]*Server {
+    assert(server_path.len >= 1);
+    var servers: [leaves.len]*Server = undefined;
+    for (&leaves, 0..) |leaf, index| {
+        servers[index] = try startServer(io, arena, server_path, leaf, index);
+    }
+    for (servers) |server| try awaitListening(io, server);
+    return servers;
+}
+
+fn stopServers(io: Io, servers: [leaves.len]*Server) void {
+    for (servers, 0..) |server, index| stopServer(io, server, index);
+}
+
+/// True when every harness is still up. A harness that died mid-run
+/// fails every script queued behind it, which reads as "the corpus
+/// rejects us" and is the most expensive way to be told the server
+/// crashed. Said right after the failures are printed, because it
+/// decides what they mean: this gate has already lost one measurement
+/// to that ambiguity.
+fn reportDeadHarness(io: Io) bool {
+    for (&leaves) |leaf| {
+        if (serverIsAccepting(io, leaf)) continue;
+        std.debug.print(
+            "tlsfuzzer: FAIL — the {s}-leaf harness on port {d} died during the run.\n" ++
+                "      The failures above are that crash, not the corpus: every script\n" ++
+                "      queued behind it was answered by nothing. Re-run after fixing it.\n",
+            .{ leaf.name, leaf.port },
+        );
+        return false;
+    }
+    return true;
+}
+
+/// Alive, asked the way the scripts ask.
+///
+/// Not `kill(pid, 0)` and not `child.term`: nothing here reaps the
+/// harness, so a crashed one is a zombie that both of those still call
+/// living. A connect is the property that actually matters — a listener
+/// that is gone refuses it — and the harness is built to survive a peer
+/// that opens a socket and says nothing, since half the corpus does
+/// exactly that.
+fn serverIsAccepting(io: Io, leaf: Leaf) bool {
+    const address: Io.net.IpAddress = .{ .ip4 = .loopback(leaf.port) };
+    const stream = address.connect(io, .{ .mode = .stream }) catch return false;
+    stream.close(io);
+    return true;
+}
+
+fn stopServer(io: Io, server: *Server, index: usize) void {
+    assert(index < leaves.len);
     server.child.kill(io);
-    watchdog_server_pid.store(0, .release);
+    watchdog_server_pids[index].store(0, .release);
 }
 
 const Outcome = struct {
@@ -352,10 +471,14 @@ fn runScripts(
     const log = try Io.Dir.cwd().createFile(io, log_path, .{});
     defer log.close(io);
     const checkout = try absolutePath(io, arena, checkout_dir);
-    const port = try std.fmt.allocPrint(arena, "{d}", .{server_port});
+    var ports: [leaves.len][]const u8 = undefined;
+    for (&leaves, 0..) |leaf, index| {
+        ports[index] = try std.fmt.allocPrint(arena, "{d}", .{leaf.port});
+    }
 
     var outcome: Outcome = .{ .passed = 0, .failed = 0, .failures = .empty };
     for (scripts) |script| {
+        assert(script.leaf < leaves.len);
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(arena, &.{
             venv_python,
@@ -363,7 +486,7 @@ fn runScripts(
             "-h",
             "localhost",
             "-p",
-            port,
+            ports[script.leaf],
         });
         try argv.appendSlice(arena, script.arguments);
         // tlsfuzzer imports itself from the repository root.
@@ -392,7 +515,11 @@ fn runScripts(
             outcome.passed += 1;
         } else {
             outcome.failed += 1;
-            try outcome.failures.append(arena, script.name);
+            try outcome.failures.append(arena, try std.fmt.allocPrint(
+                arena,
+                "{s} ({s} leaf)",
+                .{ script.name, leaves[script.leaf].name },
+            ));
         }
     }
     assert(outcome.passed + outcome.failed == scripts.len);
