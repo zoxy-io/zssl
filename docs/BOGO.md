@@ -209,14 +209,27 @@ name.
 9. **A duplicate extension in the peer's hello is accepted** rather than
    refused, on both sides.
 10. **A PSK offer whose binder list does not match its identity list**,
-    8 cases, and two behaviours rather than one. Two are the alert:
-    `Resume-Server-ExtraPSKBinder` and its sibling draw `decode_error`
-    from `MalformedExtension` where §4.2.11 wants `illegal_parameter`.
-    The other six never reach an alert at all — the runner reports
-    `didResume is false, but we expected the opposite` while wanting the
-    connection *refused*, so those offers are neither resumed nor
-    rejected. The second half was invisible while this read as one
-    late-refusal bug.
+    8 cases, of which only 3 are this finding. `Resume-Server-{Extra
+    PSKBinder,ExtraIdentityNoBinder,BinderWrongLength}` draw
+    `decode_error` out of `MalformedExtension` where §4.2.11 wants
+    `illegal_parameter`, or `decrypt_error` where the binder is merely
+    wrong rather than miscounted.
+
+    The other 5 are the `-SecondBinder` variants, and they are not a
+    defect at all: that suffix forces a HelloRetryRequest
+    (`resumption_tests.go`, "Force a HelloRetryRequest by predicting an
+    empty curve list"), so the corrupt binder rides the *second*
+    ClientHello, and `selectPsk` ignores PSK offers on a retry hello on
+    purpose — the binder there hashes the §4.4.1 surgery transcript,
+    which zssl does not carry. They belong to that scope decision and
+    should move to it when the HRR+PSK path is either carried or
+    written off.
+
+    Recorded because the first reading of this was wrong in the
+    instructive way: the runner says `didResume is false, but we expected
+    the opposite`, which looks like an offer we neither resumed nor
+    refused, and is in fact one we declined by written policy. A symptom
+    is not a cause even when the symptom is precise.
 11. **A resumed session is accepted under a suite the ClientHello did not
     offer.**
 12. **`psk_key_exchange_modes` is not consulted before issuing a
