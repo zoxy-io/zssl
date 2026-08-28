@@ -41,19 +41,20 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**271 passed.** Cases the runner ran end to end and we satisfied —
+**274 passed.** Cases the runner ran end to end and we satisfied —
 including the alert we sent, which BoGo checks by name. 143 drive
-`ClientHandshake` and 128 drive `ServerHandshake`. The server number was
+`ClientHandshake` and 131 drive `ServerHandshake`. The server number was
 6 until RSA signing landed, 100 until secp256r1/secp384r1 did, 110 until
 §9.2's `missing_extension` did, 111 until §5.4's inner-plaintext cap did,
 113 until eight suppressions turned out to be describing bugs that were
 already fixed, 121 until finding 8 was taken apart, 124 until §4.2.9's
-psk_key_exchange_modes was enforced, and 127 until §4.2's duplicate rule
-did. The client number was 121 until §4.2's unsupported_extension
-landed, 134 until finding 4's flood ceilings did, 136 until finding 5
-stopped refusing `user_canceled`, 139 until that same duplicate rule,
-140 until finding 6 split the close in two, and 141 until finding 7
-read the ticket's extension block; see below.
+psk_key_exchange_modes was enforced, 127 until §4.2's duplicate rule
+did, and 128 until §4.2.11's binder rules were told apart. The client
+number was 121 until §4.2's unsupported_extension landed, 134 until
+finding 4's flood ceilings did, 136 until finding 5 stopped refusing
+`user_canceled`, 139 until that same duplicate rule, 140 until finding 6
+split the close in two, and 141 until finding 7 read the ticket's
+extension block; see below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
 either gets fixed or gets an entry in `DisabledTests` with a one-line
@@ -134,11 +135,14 @@ Three bugs, fixed in this slice:
    flight was at least 500 bytes, which a legitimately small ECDSA leaf
    falsifies. The floor is now the encoded chain's own size.
 
-Twelve more were open. Eight are fixed outright — 2, 3, 4, 5, 6, 7, 9
-and 12 — and four still carry ledger entries, 15 suppressed cases
-between them. Two of those four are no longer gaps in the sense the word
-implies: 11 is a documented non-defect and 8 is down to two divergences
-we intend to keep.
+Twelve more were open. Nine are fixed outright — 2, 3, 4, 5, 6, 7, 9, 10
+and 12 — and four still carry ledger entries, 12 suppressed cases
+between them: 4 under finding 1, 5 under 10, 2 under 8 and 1 under 11.
+Only one of those four is a gap in the sense the word implies — finding
+1, the packed post-handshake record. 8 is down to two divergences we
+intend to keep, 11 is a documented non-defect, and finding 10's
+remaining 5 are a scope decision filed under its number rather than an
+open defect, which is why a fixed finding still has entries.
 All twelve keep their numbers rather than being renumbered, because the
 ledger cites them by number.
 
@@ -422,12 +426,35 @@ name.
    The ordering lesson is finding 2's, again: a verdict about framing
    has to be reached before a verdict about content, or the second
    silently answers for the first.
-10. **A PSK offer whose binder list does not match its identity list**,
-    8 cases, of which only 3 are this finding. `Resume-Server-{Extra
-    PSKBinder,ExtraIdentityNoBinder,BinderWrongLength}` draw
-    `decode_error` out of `MalformedExtension` where §4.2.11 wants
-    `illegal_parameter`, or `decrypt_error` where the binder is merely
-    wrong rather than miscounted.
+10. **FIXED — a PSK offer whose binder list does not match its identity
+    list**, 3 of the 8 cases; the other 5 were never this finding and
+    now say so.
+
+    All three drew `decode_error` out of one `MalformedExtension`. The
+    fix is that §4.2.11 describes three different faults, which now
+    answer differently:
+
+    - the two lists both parse and disagree on their length —
+      `Resume-Server-ExtraPSKBinder` has a binder too many,
+      `-ExtraIdentityNoBinder` an identity too many. Nothing is
+      malformed; the hello contradicts itself, which is
+      illegal_parameter and the new `BinderCountMismatch`;
+    - a binder whose length is not an HMAC output's
+      (`-BinderWrongLength`). It cannot be the right MAC for any
+      transcript, so it does not *validate* rather than does not
+      *parse*: §4.2.11.2's decrypt_error, and the new `BadBinder`;
+    - no binder list at all (`-NoPSKBinder`). §4.2.11 writes
+      `binders<33..2^16-1>`, so an empty section is framing that does
+      not parse, and `MalformedExtension` still answers it.
+
+    That third one is why this took three passes. The first fix checked
+    the full 33-byte floor on the section, which is what the grammar
+    says — and swallowed `-BinderWrongLength`, because a short binder
+    makes the section short too. The floor here has to be emptiness
+    alone, with each entry's own length left to the loop that reads it.
+    A grammar transcribed correctly can still be checked in the wrong
+    place, and `-NoPSKBinder` was passing before this slice, so getting
+    it wrong was a regression rather than a miss.
 
     The other 5 are the `-SecondBinder` variants, and they are not a
     defect at all: that suffix forces a HelloRetryRequest
@@ -435,9 +462,9 @@ name.
     empty curve list"), so the corrupt binder rides the *second*
     ClientHello, and `selectPsk` ignores PSK offers on a retry hello on
     purpose — the binder there hashes the §4.4.1 surgery transcript,
-    which zssl does not carry. They belong to that scope decision and
-    should move to it when the HRR+PSK path is either carried or
-    written off.
+    which zssl does not carry. Their ledger entries say that now, rather
+    than pointing at an OPEN GAP that is closed; they move again if the
+    HRR+PSK path is ever carried.
 
     Recorded because the first reading of this was wrong in the
     instructive way: the runner says `didResume is false, but we expected

@@ -29,6 +29,14 @@ pub const Error = error{
     SuiteOverflow,
     ExtensionOverflow,
     DuplicateExtension,
+    /// §4.2.11: the identity list and the binder list disagree on how
+    /// many entries there are. Both lists parse; they contradict each
+    /// other, which is illegal_parameter rather than decode_error.
+    BinderCountMismatch,
+    /// §4.2.11.2: a binder that cannot be an HMAC output for any
+    /// transcript, because its length is not one. It does not validate,
+    /// and §4.2.11.2's verdict for that is decrypt_error.
+    BadBinder,
     PskNotLast,
 };
 
@@ -385,18 +393,36 @@ pub fn parsePskOffer(hello: *const ClientHello) Error!?PskOffer {
 
     const binders_bytes = try cursor.takeU16();
     if (binders_bytes != cursor.remaining()) return error.MalformedExtension;
+    // §4.2.11 writes `binders<33..2^16-1>`, so the list cannot be empty.
+    // Only emptiness is checked here, not the full 33: the floor exists
+    // because one entry is a length byte plus the shortest HMAC, and an
+    // entry that is present but the wrong length is a *binder* fault
+    // rather than a framing one — the loop below answers that with
+    // `BadBinder` and decrypt_error. Checking 33 here would swallow it,
+    // which is what BoGo's `Resume-Server-BinderWrongLength` caught.
+    // `Resume-Server-NoPSKBinder` is the case this line is for.
+    if (binders_bytes == 0) return error.MalformedExtension;
     offer.binders_section_bytes = binders_bytes + 2;
     var binders_seen: u8 = 0;
     while (cursor.remaining() > 0) : (binders_seen += 1) {
-        if (binders_seen == offer.count) return error.MalformedExtension;
+        // §4.2.11: "Each entry in the binders list is computed as an HMAC
+        // over a transcript hash", one per identity. A list that outruns
+        // the identities is not malformed framing — it parses — it is a
+        // hello whose two lists disagree, which is an illegal parameter.
+        if (binders_seen == offer.count) return error.BinderCountMismatch;
         assert(binders_seen < offer.count);
         const binder_bytes = try cursor.takeByte();
-        // §4.2.11.2: a binder is an HMAC output — 32 or 48 here.
-        if (binder_bytes != 32 and binder_bytes != 48) return error.MalformedExtension;
+        // §4.2.11.2: a binder is an HMAC output, so 32 or 48 here. A
+        // different length cannot be the right HMAC for any transcript,
+        // which makes it a binder that does not validate rather than a
+        // binder that does not parse — decrypt_error, the same verdict
+        // §4.2.11.2 gives one that simply fails to match.
+        if (binder_bytes != 32 and binder_bytes != 48) return error.BadBinder;
         offer.binders[binders_seen] = try cursor.takeSlice(binder_bytes);
     }
-    // §4.2.11: one binder per identity, exactly.
-    if (binders_seen != offer.count) return error.MalformedExtension;
+    // §4.2.11: one binder per identity, exactly. The other direction of
+    // the same disagreement — identities the binder list never answers.
+    if (binders_seen != offer.count) return error.BinderCountMismatch;
     assert(offer.count >= 1);
     return offer;
 }
@@ -531,4 +557,95 @@ test "rejects what the grammar forbids" {
     try std.testing.expectEqual(@as(u8, 1), bad_compression[47]);
     bad_compression[48] = 0x01;
     try std.testing.expectError(error.IllegalCompression, parse(&bad_compression));
+}
+
+test "§4.2.11: the three ways a PSK offer's two lists can be wrong" {
+    // Negative space for finding 10. §4.2.11 describes three distinct
+    // faults that read alike and are not alike, and each one that was
+    // collapsed into a single verdict cost a case in BoGo. All three are
+    // driven here so a plain `zig build test` proves them — BoGo is an
+    // oracle that can SKIP, and these have to hold without it.
+    const random = [_]u8{0} ** 32;
+
+    // One PSK extension body: `identities` then `binders`, both length
+    // prefixed, built so each case differs in exactly one place.
+    const build = struct {
+        fn offer(out: []u8, identities: u8, binder_lengths: []const u8) []const u8 {
+            var b = wire.Builder.init(out);
+            // Each entry is a 2-byte length, the identity itself, and a
+            // 4-byte obfuscated age.
+            const identity = "ticket";
+            const entry_bytes = 2 + identity.len + 4;
+            b.putU16(@intCast(@as(usize, identities) * entry_bytes));
+            for (0..identities) |_| {
+                b.putU16(identity.len);
+                b.putSlice(identity);
+                b.putU32(0);
+            }
+            var binders_bytes: usize = 0;
+            for (binder_lengths) |n| binders_bytes += 1 + @as(usize, n);
+            b.putU16(@intCast(binders_bytes));
+            for (binder_lengths) |n| {
+                b.putByte(n);
+                for (0..n) |_| b.putByte(0xbb);
+            }
+            return b.written();
+        }
+    };
+
+    var buffer: [512]u8 = undefined;
+    const Case = struct {
+        name: []const u8,
+        identities: u8,
+        binders: []const u8,
+        want: anyerror,
+    };
+    for ([_]Case{
+        // Both lists parse and contradict each other. Nothing here is
+        // malformed, which is why it is not decode_error.
+        .{ .name = "binder too many", .identities = 1, .binders = &.{ 32, 32 }, .want = error.BinderCountMismatch },
+        .{ .name = "identity too many", .identities = 2, .binders = &.{32}, .want = error.BinderCountMismatch },
+        // A length no HMAC this suite set produces. It cannot be the
+        // right MAC for any transcript, so it does not validate.
+        .{ .name = "short binder", .identities = 1, .binders = &.{31}, .want = error.BadBinder },
+        .{ .name = "long binder", .identities = 1, .binders = &.{33}, .want = error.BadBinder },
+        // No binder list at all: §4.2.11's `binders<33..2^16-1>` has a
+        // floor, so an empty section is framing that does not parse.
+        // This is the regression test. Folding it into the count
+        // mismatch above broke `Resume-Server-NoPSKBinder`, and checking
+        // the literal 33-byte floor on the *section* instead swallowed
+        // the short-binder case — a grammar transcribed correctly and
+        // checked in the wrong place.
+        .{ .name = "no binders", .identities = 1, .binders = &.{}, .want = error.MalformedExtension },
+    }) |case| {
+        const body = build.offer(&buffer, case.identities, case.binders);
+        const hello: ClientHello = .{
+            .random = &random,
+            .legacy_session_id = &.{},
+            .cipher_suites_wire = &.{},
+            .pre_shared_key_wire = body,
+        };
+        std.testing.expectError(case.want, parsePskOffer(&hello)) catch |err| {
+            std.debug.print("case '{s}' did not refuse as expected\n", .{case.name});
+            return err;
+        };
+    }
+
+    // The shape all four of those are measured against: one identity,
+    // one binder of an HMAC's length, accepted.
+    for ([_]u8{ 32, 48 }) |hash_bytes| {
+        const body = build.offer(&buffer, 1, &.{hash_bytes});
+        const hello: ClientHello = .{
+            .random = &random,
+            .legacy_session_id = &.{},
+            .cipher_suites_wire = &.{},
+            .pre_shared_key_wire = body,
+        };
+        const offer = (try parsePskOffer(&hello)).?;
+        try std.testing.expectEqual(@as(u8, 1), offer.count);
+        try std.testing.expectEqual(@as(usize, hash_bytes), offer.binders[0].len);
+        // The transcript truncation binder verification depends on: the
+        // section's own bytes plus its two-byte length.
+        try std.testing.expectEqual(@as(u16, hash_bytes + 3), offer.binders_section_bytes);
+    }
 }

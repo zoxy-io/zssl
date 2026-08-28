@@ -9,7 +9,8 @@
     ],
     ":DIGEST_CHECK_FAILED:": [
       "zssl:DecryptError",
-      "zssl:MalformedExtension"
+      "zssl:MalformedExtension",
+      "zssl:BadBinder"
     ],
     ":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:": [
       "zssl:AuthenticationFailed",
@@ -169,7 +170,7 @@
       "zssl:PskNotLast"
     ],
     ":PSK_IDENTITY_BINDER_COUNT_MISMATCH:": [
-      "zssl:MalformedExtension"
+      "zssl:BinderCountMismatch"
     ],
     ":DUPLICATE_KEY_SHARE:": [
       "zssl:MalformedExtension"
@@ -608,15 +609,12 @@
     "Resume-Client-TLS1-TLS1-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Resume-Client-TLS11-TLS11-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Resume-Client-TLS12-TLS12-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "Resume-Server-BinderWrongLength": "OPEN GAP: a PSK offer whose binder list does not match its identity list is refused late, as a malformed extension rather than at the count. docs/BOGO.md, finding 10.",
-    "Resume-Server-BinderWrongLength-SecondBinder": "OPEN GAP: a PSK offer whose binder list does not match its identity list is refused late, as a malformed extension rather than at the count. docs/BOGO.md, finding 10.",
+    "Resume-Server-BinderWrongLength-SecondBinder": "SCOPE: the -SecondBinder suffix forces a HelloRetryRequest, so the corrupt binder rides the second ClientHello \u2014 and `selectPsk` declines PSK offers on a retry hello by written policy, because the binder there hashes \u00a74.4.1's reconstructed transcript which zssl does not carry. Not a defect; the HRR+PSK scope decision. docs/BOGO.md, finding 10.",
     "Resume-Server-CipherNotPreferred": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "Resume-Server-ExtraIdentityNoBinder": "OPEN GAP: a PSK offer whose binder list does not match its identity list is refused late, as a malformed extension rather than at the count. docs/BOGO.md, finding 10.",
-    "Resume-Server-ExtraIdentityNoBinder-SecondBinder": "OPEN GAP: a PSK offer whose binder list does not match its identity list is refused late, as a malformed extension rather than at the count. docs/BOGO.md, finding 10.",
-    "Resume-Server-ExtraPSKBinder": "OPEN GAP: a PSK offer whose binder list does not match its identity list is refused late, as a malformed extension rather than at the count. docs/BOGO.md, finding 10.",
-    "Resume-Server-ExtraPSKBinder-SecondBinder": "OPEN GAP: a PSK offer whose binder list does not match its identity list is refused late, as a malformed extension rather than at the count. docs/BOGO.md, finding 10.",
-    "Resume-Server-InvalidPSKBinder-SecondBinder": "OPEN GAP: a PSK offer whose binder list does not match its identity list is refused late, as a malformed extension rather than at the count. docs/BOGO.md, finding 10.",
-    "Resume-Server-NoPSKBinder-SecondBinder": "OPEN GAP: a PSK offer whose binder list does not match its identity list is refused late, as a malformed extension rather than at the count. docs/BOGO.md, finding 10.",
+    "Resume-Server-ExtraIdentityNoBinder-SecondBinder": "SCOPE: the -SecondBinder suffix forces a HelloRetryRequest, so the corrupt binder rides the second ClientHello \u2014 and `selectPsk` declines PSK offers on a retry hello by written policy, because the binder there hashes \u00a74.4.1's reconstructed transcript which zssl does not carry. Not a defect; the HRR+PSK scope decision. docs/BOGO.md, finding 10.",
+    "Resume-Server-ExtraPSKBinder-SecondBinder": "SCOPE: the -SecondBinder suffix forces a HelloRetryRequest, so the corrupt binder rides the second ClientHello \u2014 and `selectPsk` declines PSK offers on a retry hello by written policy, because the binder there hashes \u00a74.4.1's reconstructed transcript which zssl does not carry. Not a defect; the HRR+PSK scope decision. docs/BOGO.md, finding 10.",
+    "Resume-Server-InvalidPSKBinder-SecondBinder": "SCOPE: the -SecondBinder suffix forces a HelloRetryRequest, so the corrupt binder rides the second ClientHello \u2014 and `selectPsk` declines PSK offers on a retry hello by written policy, because the binder there hashes \u00a74.4.1's reconstructed transcript which zssl does not carry. Not a defect; the HRR+PSK scope decision. docs/BOGO.md, finding 10.",
+    "Resume-Server-NoPSKBinder-SecondBinder": "SCOPE: the -SecondBinder suffix forces a HelloRetryRequest, so the corrupt binder rides the second ClientHello \u2014 and `selectPsk` declines PSK offers on a retry hello by written policy, because the binder there hashes \u00a74.4.1's reconstructed transcript which zssl does not carry. Not a defect; the HRR+PSK scope decision. docs/BOGO.md, finding 10.",
     "Resume-Server-NoTickets-TLS1-TLS1-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Resume-Server-NoTickets-TLS1-TLS11-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Resume-Server-NoTickets-TLS1-TLS12-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",

@@ -881,6 +881,7 @@ fn alertFor(err: anyerror) ?alert.Description {
         error.PskNotLast,
         error.BadKeyShare,
         error.NonMinimalEncoding,
+        error.BinderCountMismatch,
         => .illegal_parameter,
         // A well-formed message larger than the reassembly space the
         // embedder handed us. That is our capacity, not the peer's
@@ -903,8 +904,14 @@ fn alertFor(err: anyerror) ?alert.Description {
         error.TrailingBytes,
         => .decode_error,
         // §4.4.3 names decrypt_error for a Finished or CertificateVerify
-        // that does not check out — both, and only both.
-        error.DecryptError, error.BadSignature => .decrypt_error,
+        // that does not check out. §4.2.11.2 defines a PSK binder as
+        // computed "in the same way as the Finished message", so a
+        // binder that cannot match is the same kind of failure and gets
+        // the same alert. That last step is this library's reading
+        // rather than something the RFC states: §6.2 scopes
+        // decrypt_error to a failed cryptographic operation "including"
+        // a Finished, which admits the binder without naming it.
+        error.DecryptError, error.BadSignature, error.BadBinder => .decrypt_error,
         error.BadCertificate => .bad_certificate,
         // RFC 7301 §3.2 gives no_application_protocol to the *server* with
         // nothing in common to select. A client meeting a selection it
