@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 234 passed, 0 failed, 6918 declined by the shim (89), floor 234
+bogo: 242 passed, 0 failed, 6918 declined by the shim (89), floor 242
 bogo: PASS
 ```
 
@@ -41,12 +41,13 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**234 passed.** Cases the runner ran end to end and we satisfied —
+**242 passed.** Cases the runner ran end to end and we satisfied —
 including the alert we sent, which BoGo checks by name. 121 drive
-`ClientHandshake` and 113 drive `ServerHandshake`. The server number was
+`ClientHandshake` and 121 drive `ServerHandshake`. The server number was
 6 until RSA signing landed, 100 until secp256r1/secp384r1 did, 110 until
-§9.2's `missing_extension` did, and 111 until §5.4's inner-plaintext cap
-did; see below.
+§9.2's `missing_extension` did, 111 until §5.4's inner-plaintext cap did,
+and 113 until eight suppressions turned out to be describing bugs that
+were already fixed; see below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
 either gets fixed or gets an entry in `DisabledTests` with a one-line
@@ -129,8 +130,15 @@ Three bugs, fixed in this slice:
 
 Twelve more were open and eleven remain — 3 is now fixed, and is kept in
 place below rather than renumbered, because the ledger cites these by
-number. Each of the eleven is an entry in the ledger citing this list, 52
-suppressed cases between them:
+number. Each of the eleven is an entry in the ledger citing this list, 44
+suppressed cases between them.
+
+Those 44 are what survived being *measured*. Every OPEN GAP entry was
+lifted at once and the corpus run in full: 8 of the 52 passed outright,
+all of them under finding 8, none of them a regression anywhere else.
+The got-versus-want the runner printed for the other 44 is what the
+descriptions below now say, rather than what anyone inferred from a case
+name.
 
 1. **Only one post-handshake message per record.**
    `handlePostHandshake` refuses a non-empty assembler, so two
@@ -172,20 +180,43 @@ suppressed cases between them:
    rather than as §6.1's half-close.
 7. **NewSessionTicket extension bodies are not checked** for a minimal
    encoding.
-8. **A handful of alert choices differ from BoringSSL's** — trailing data
-   after a Certificate answers `bad_certificate` where `decode_error` is
-   the better reading, among others. The largest single group at 19
-   cases, and the least interesting: we refuse, for the right reason,
-   with the wrong description. `MissingKeyShare-Server-TLS13` left this
-   group when tlsfuzzer's `keyshare-omitted` showed the cause was not a
-   description at all: §9.2's `missing_extension` was never being sent,
-   because an omitted `key_share` was read as an empty one. See
-   docs/TLSFUZZER.md, finding 6.
+8. **Some alert choices differ from BoringSSL's** — trailing data after a
+   Certificate answers `bad_certificate` where `decode_error` is the
+   better reading, and a malformed alert answers `decode_error` where
+   §6.1 wants `illegal_parameter`. 11 cases, down from 19, and no longer
+   describable as "the least interesting".
+
+   This entry has been wrong three times, which is the useful part.
+   `MissingKeyShare-Server-TLS13` left it when tlsfuzzer's
+   `keyshare-omitted` showed §9.2's `missing_extension` was never sent at
+   all (docs/TLSFUZZER.md, finding 6). Eight more left it when the group
+   was measured: `TrailingDataWithFinished-{,Resume-}Server`,
+   `TrailingMessageData-TLS13-ClientFinished`,
+   `WrongMessageType-TLS13-ClientFinished`,
+   `UnexpectedClientEncryptedExtensions-{New,Old}` and
+   `CurveTest-Invalid-{Pad,Truncate}KeyShare-Server-X25519` all pass now,
+   with no change made for them. And one of the 11 that remain wants
+   `missing extension` where we send `handshake_failure` — another
+   missing behaviour sitting in a bucket labelled cosmetic.
+
+   The common thread is worth naming: an alert the peer cannot read looks
+   exactly like an alert with the wrong description. Five of the eight
+   sit in the window the §4.4.4 fix repaired (docs/TLSFUZZER.md, finding
+   5), where the server sealed with handshake keys the peer had already
+   moved past. This bucket is where that class of bug goes to hide, so
+   nothing should be filed here without the runner's got-versus-want
+   quoted beside it.
 9. **A duplicate extension in the peer's hello is accepted** rather than
    refused, on both sides.
-10. **A PSK offer whose binder list does not match its identity list** is
-    refused late, as a malformed extension, rather than at the count
-    §4.2.11 specifies.
+10. **A PSK offer whose binder list does not match its identity list**,
+    8 cases, and two behaviours rather than one. Two are the alert:
+    `Resume-Server-ExtraPSKBinder` and its sibling draw `decode_error`
+    from `MalformedExtension` where §4.2.11 wants `illegal_parameter`.
+    The other six never reach an alert at all — the runner reports
+    `didResume is false, but we expected the opposite` while wanting the
+    connection *refused*, so those offers are neither resumed nor
+    rejected. The second half was invisible while this read as one
+    late-refusal bug.
 11. **A resumed session is accepted under a suite the ClientHello did not
     offer.**
 12. **`psk_key_exchange_modes` is not consulted before issuing a

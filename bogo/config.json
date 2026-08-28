@@ -357,7 +357,6 @@
     "CurveTest-Invalid-PadKeyShare-Server-X25519-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "CurveTest-Invalid-PadKeyShare-Server-X25519-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "CurveTest-Invalid-PadKeyShare-Server-X25519-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "CurveTest-Invalid-PadKeyShare-Server-X25519-TLS13": "OPEN GAP: we refuse this, with a different alert than BoringSSL sends. docs/BOGO.md, finding 8.",
     "CurveTest-Invalid-TruncateKeyShare-Client-X25519-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "CurveTest-Invalid-TruncateKeyShare-Client-X25519-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "CurveTest-Invalid-TruncateKeyShare-Client-X25519-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -370,7 +369,6 @@
     "CurveTest-Invalid-TruncateKeyShare-Server-X25519-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "CurveTest-Invalid-TruncateKeyShare-Server-X25519-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "CurveTest-Invalid-TruncateKeyShare-Server-X25519-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "CurveTest-Invalid-TruncateKeyShare-Server-X25519-TLS13": "OPEN GAP: we refuse this, with a different alert than BoringSSL sends. docs/BOGO.md, finding 8.",
     "CurveTest-Server-P-256-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "CurveTest-Server-P-256-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "CurveTest-Server-P-256-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -844,11 +842,9 @@
     "TrailingDataWithFinished-Resume-Server-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TrailingDataWithFinished-Resume-Server-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TrailingDataWithFinished-Resume-Server-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "TrailingDataWithFinished-Resume-Server-TLS13": "OPEN GAP: we refuse this, with a different alert than BoringSSL sends. docs/BOGO.md, finding 8.",
     "TrailingDataWithFinished-Server-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TrailingDataWithFinished-Server-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TrailingDataWithFinished-Server-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "TrailingDataWithFinished-Server-TLS13": "OPEN GAP: we refuse this, with a different alert than BoringSSL sends. docs/BOGO.md, finding 8.",
     "TrailingMessageData-CertificateRequest-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TrailingMessageData-ClientFinished-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TrailingMessageData-ClientKeyExchange-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -859,7 +855,6 @@
     "TrailingMessageData-ServerHelloDone-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TrailingMessageData-ServerKeyExchange-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TrailingMessageData-TLS13-CertificateRequest-TLS": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",
-    "TrailingMessageData-TLS13-ClientFinished-TLS": "OPEN GAP: we refuse this, with a different alert than BoringSSL sends. docs/BOGO.md, finding 8.",
     "TrailingMessageData-TLS13-EncryptedExtensions-TLS": "OPEN GAP: we refuse this, with a different alert than BoringSSL sends. docs/BOGO.md, finding 8.",
     "TrailingMessageData-TLS13-ServerCertificate-TLS": "OPEN GAP: we refuse this, with a different alert than BoringSSL sends. docs/BOGO.md, finding 8.",
     "TrailingMessageData-TLS13-ServerCertificateVerify-TLS": "OPEN GAP: we refuse this, with a different alert than BoringSSL sends. docs/BOGO.md, finding 8.",
@@ -870,8 +865,6 @@
     "Unclean-Shutdown": "OPEN GAP: a close_notify retires the machine, so no close_notify can be sent back. docs/BOGO.md, finding 6.",
     "Unclean-Shutdown-Alert": "OPEN GAP: a close_notify retires the machine, so no close_notify can be sent back. docs/BOGO.md, finding 6.",
     "UnencryptedEncryptedExtensions": "OPEN GAP: we refuse this, with a different alert than BoringSSL sends. docs/BOGO.md, finding 8.",
-    "UnexpectedClientEncryptedExtensions-New-TLS-TLS13": "OPEN GAP: we refuse this, with a different alert than BoringSSL sends. docs/BOGO.md, finding 8.",
-    "UnexpectedClientEncryptedExtensions-Old-TLS-TLS13": "OPEN GAP: we refuse this, with a different alert than BoringSSL sends. docs/BOGO.md, finding 8.",
     "UnknownCipher": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "UnknownCurve": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "UnknownCurve-HelloRetryRequest-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
@@ -913,7 +906,6 @@
     "WrongMessageType-ServerFinished-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "WrongMessageType-ServerHello-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "WrongMessageType-ServerHelloDone-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "WrongMessageType-ServerKeyExchange-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "WrongMessageType-TLS13-ClientFinished-TLS": "OPEN GAP: we refuse this, with a different alert than BoringSSL sends. docs/BOGO.md, finding 8."
+    "WrongMessageType-ServerKeyExchange-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated."
   }
 }
