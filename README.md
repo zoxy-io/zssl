@@ -253,20 +253,17 @@ are worth:
 
 | Oracle | Status | Details |
 | --- | --- | --- |
-| **BoGo** | [![bogo passing](https://img.shields.io/badge/bogo-261%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | [docs/BOGO.md](docs/BOGO.md) — BoringSSL's hostile-peer corpus |
-| **tlsfuzzer** | [![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-15%2F57%20scripts-yellow)](docs/TLSFUZZER.md) | [docs/TLSFUZZER.md](docs/TLSFUZZER.md) — tlslite-ng, against our server |
-| **RFC 8448** | — | [`src/rfc8448_test.zig`](src/rfc8448_test.zig) — the traced bytes, exactly |
-| **OpenSSL** | — | [`interop/main.zig`](interop/main.zig) — three legs, ECDSA and RSA |
-| **`std.crypto.tls`** | — | [`src/std_interop_test.zig`](src/std_interop_test.zig) — a second stack |
-| **Fuzzing** | — | [`src/fuzz_test.zig`](src/fuzz_test.zig) — nine targets, never a panic |
+| [**BoGo**](docs/BOGO.md) | [![bogo passing](https://img.shields.io/badge/bogo-261%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | Hostile-peer corpus; checks *which* alert we send |
+| [**tlsfuzzer**](docs/TLSFUZZER.md) | [![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-15%2F57%20scripts-yellow)](docs/TLSFUZZER.md) | A third implementation, driving our *server* |
+| [**RFC 8448**](src/rfc8448_test.zig) | — | The RFC's traced bytes, reproduced exactly |
+| [**OpenSSL**](interop/main.zig) | — | Three legs against a real `openssl` binary |
+| [**`std.crypto.tls`**](src/std_interop_test.zig) | — | A second stack, in memory, both directions |
+| [**Fuzzing**](src/fuzz_test.zig) | — | Nine targets: a value or an error, never a panic |
 
-The two adversarial gates are worth their place for different reasons.
-BoGo checks not merely that we refuse a hostile peer but *which alert we
-send*, at a pinned commit, across 134 client and 127 server cases.
-tlsfuzzer drives our server through 1261 scripted conversations from a
-third implementation, including every plaintext length from 1 to 2^14,
-serving an ECDSA leaf and an RSA one because a dozen of its scripts
-advertise RSA-PSS alone.
+Both adversarial gates run at a pinned commit. BoGo covers 134 client and
+127 server cases; tlsfuzzer covers 1261 conversations, among them every
+plaintext length from 1 to 2^14, served over an ECDSA leaf and an RSA one
+because a dozen of its scripts advertise RSA-PSS alone.
 
 Plus directed tests for the things that only break under adversity —
 fragmented ClientHellos, tampered Finished messages, corrupted binders,
