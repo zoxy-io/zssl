@@ -14,8 +14,8 @@ concurrency:
 
 env:
   ZIG_VERSION: 0.16.0
-  # The version whose output was verified locally; kcov 38 (the only
-  # Ubuntu package) reports 0% for this project.
+  # The version whose output is verified locally, so CI measures with
+  # the same tool rather than whatever an archive happens to carry.
   KCOV_VERSION: v43
 
 jobs:
@@ -67,12 +67,16 @@ jobs:
   # that branch through its endpoint API. The only credential involved is
   # the token GitHub already hands the job.
   coverage:
-    # kcov is built from a pinned tag rather than installed from apt. Two
-    # reasons, both learned the hard way: it is packaged only for jammy
-    # (absent from noble onward, and upstream ships no prebuilt binary),
-    # and the jammy package is kcov 38, which reported 0% for this
-    # project where kcov 43 reports 97%. Building the version that was
-    # actually verified is what makes the number mean anything.
+    # kcov is built from a pinned tag rather than installed from apt,
+    # because it is packaged only for jammy — absent from noble onward,
+    # and upstream ships no prebuilt binary — and because pinning the
+    # version keeps CI on the one whose output gets verified locally.
+    #
+    # It is *not* here because of a version bug. An earlier commit
+    # message blamed kcov 38 for the 0% badge; that was a hypothesis
+    # stated as fact, and it was wrong. kcov 43 reported 0% too. The
+    # cause was the include pattern in build.zig matching no files on
+    # Linux, and that is fixed there.
     runs-on: ubuntu-latest
     permissions:
       contents: write

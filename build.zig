@@ -35,13 +35,17 @@ pub fn build(b: *std.Build) void {
     // directly. Scoped to `src/`: libcrypto is vendored C we do not
     // write, and the test fixtures are data.
     //
-    // kcov is a Linux tool. On macOS this step will not find it, which
-    // is why CI is where the number comes from.
+    // The patterns have no leading slash on purpose. kcov matches them
+    // against the path as DWARF records it, and that is not the same
+    // shape everywhere: macOS carried absolute paths, so `/src/` worked
+    // there, while Linux recorded them relative to the compilation
+    // directory and `/src/` matched *nothing* — a 0% badge from a run
+    // that instrumented zero files. Without the slash both shapes match.
     const coverage_run = b.addSystemCommand(&.{
         "kcov",
         "--clean",
-        "--include-pattern=/src/",
-        "--exclude-pattern=/src/testdata/,/zig-pkg/,/.zig-cache/",
+        "--include-pattern=src/",
+        "--exclude-pattern=src/testdata/,zig-pkg/,.zig-cache/",
     });
     // The build system owns the output directory rather than kcov: kcov
     // creates its target but not the target's parent, and nothing else in
