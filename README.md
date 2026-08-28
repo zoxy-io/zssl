@@ -251,28 +251,26 @@ real-OpenSSL gate; `zig build bogo` and `zig build tlsfuzzer` run the two
 adversarial ones. Six kinds of evidence, in rough order of how much they
 are worth:
 
-| Oracle | What it proves |
-| --- | --- |
-| **BoGo**<br>[![bogo passing](https://img.shields.io/badge/bogo-261%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | BoringSSL's own hostile-peer runner, at a pinned commit, drives `bogo/shim.zig` through the corpus and checks not only that we refuse but *which alert we send*. 261 cases pass (134 client, 127 server), 0 fail, 6918 are declined by the shim as out of scope, and 715 are suppressed by name with a one-line reason each. A floor on the passing count is what stops a suppression from being quiet — and the two badges are a pair on purpose, because a bare "261 passing" reads as a coverage claim when 6918 cases were never run at all. |
-| **tlsfuzzer**<br>[![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-15%2F57%20scripts-yellow)](docs/TLSFUZZER.md) | A third implementation — Python over tlslite-ng — driving our *server* through scripted conversations, at a pinned commit. 15 of 57 TLS 1.3 scripts run and pass, 1261 conversations between them: every plaintext length from 1 to 2^14, and 150 that abort the connection at every point in the handshake. The gate serves two leaves, ECDSA and RSA, because a dozen scripts advertise RSA-PSS alone and a single-leaf harness could only answer them with handshake_failure. 42 scripts are disabled and 18 of those are not yet triaged: a debt the gate prints on every run rather than burying. |
-| **RFC 8448** replay | The key schedule, binder chain and record layer produce the RFC's traced bytes exactly — secrets, flights and ServerHello re-encoded byte for byte. |
-| **OpenSSL interop** | Three legs. `openssl s_client` completes against our server, with openssl's own X.509 verifying our certificate. Our client completes against `openssl s_server -rev` and opens the echo it seals back — twice, once against an ECDSA certificate and once against an RSA-2048 one openssl mints on the spot, since those are different verification paths. Each client leg asserts the leaf key type it meant to exercise, so the RSA leg cannot quietly pass on an ECDSA certificate, and both drive the `chain_verifier` seam and assert it saw the chain. |
-| **`std.crypto.tls`** | A second independent implementation completes a full in-memory handshake, in both directions, and exchanges data. |
-| **Fuzzing** | Nine targets over every parser and both state machines: arbitrary peer bytes yield a value or an error, never a panic. |
+| Oracle | Badges | Details |
+| --- | --- | --- |
+| **BoGo** | [![bogo passing](https://img.shields.io/badge/bogo-261%20passing-brightgreen)](docs/BOGO.md) [![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | [docs/BOGO.md](docs/BOGO.md) — BoringSSL's own hostile-peer runner, at a pinned commit, driving `bogo/shim.zig`. It checks not merely that we refuse but *which alert we send*. 134 client and 127 server cases pass, 0 fail, 715 are suppressed by name with a one-line reason each. The badges are a pair on purpose: the passing figure alone reads as a coverage claim that 6918 declined cases cannot support. |
+| **tlsfuzzer** | [![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-15%2F57%20scripts-yellow)](docs/TLSFUZZER.md) | [docs/TLSFUZZER.md](docs/TLSFUZZER.md) — a third implementation, Python over tlslite-ng, driving our *server* through scripted conversations at a pinned commit. 1261 conversations, including every plaintext length from 1 to 2^14. It serves an ECDSA and an RSA leaf, because a dozen scripts advertise RSA-PSS alone. 18 of the 42 disabled scripts are not yet triaged — a debt the gate prints on every run. |
+| **RFC 8448 replay** | — | [`src/rfc8448_test.zig`](src/rfc8448_test.zig) — the key schedule, binder chain and record layer reproduce the RFC's traced bytes exactly, from vectors generated out of the RFC text rather than transcribed. |
+| **OpenSSL interop** | — | [`interop/main.zig`](interop/main.zig) — three legs against a real `openssl` binary: its client against our server with its own X.509 verifying us, and our client against its server on an ECDSA leaf and on an RSA-2048 one. Each leg asserts the key type it meant to exercise, so the RSA leg cannot quietly pass on an ECDSA certificate. |
+| **`std.crypto.tls`** | — | [`src/std_interop_test.zig`](src/std_interop_test.zig) — a second independent implementation completes a full in-memory handshake, in both directions, and exchanges data. |
+| **Fuzzing** | — | [`src/fuzz_test.zig`](src/fuzz_test.zig) — nine targets over every parser and both state machines: arbitrary peer bytes yield a value or an error, never a panic. |
 
 Plus directed tests for the things that only break under adversity —
 fragmented ClientHellos, tampered Finished messages, corrupted binders,
 inverted flights, sequence exhaustion.
 
-The gaps, stated plainly: BoGo's own count of what it never ran is far
-larger than what it ran — 6918 cases against 261 — and the nine
-laxities it did find are still open. [docs/BOGO.md](docs/BOGO.md) has
-both, by name.
-
-tlsfuzzer's gate is thinner still and says so: 15 of 57 scripts run, and
-18 of the 42 disabled ones are not yet triaged into a scope decision or a
-defect. [docs/TLSFUZZER.md](docs/TLSFUZZER.md) carries that debt in the
-open, and the gate prints it on every run.
+The gaps, stated plainly. Both adversarial gates decline far more than
+they run, and both say so in their own badge rather than behind it: BoGo
+never ran 6918 of its cases, and tlsfuzzer runs 15 scripts of 57. Nine
+findings still sit on BoGo's ledger and 18 tlsfuzzer scripts are not yet
+triaged into a scope decision or a defect. Every one of those is named,
+with a reason, in the two documents above — and a floor on each passing
+count is what stops a suppression from being quiet.
 
 ## Development
 
