@@ -11,6 +11,73 @@ const assert = std.debug.assert;
 
 pub const Error = error{Truncated};
 
+pub const DuplicateError = error{DuplicateExtension};
+
+/// §4.2: "There MUST NOT be more than one extension of the same type in
+/// a given extension block." Applied to the whole block before any of it
+/// is acted on.
+///
+/// A pre-pass rather than a check folded into the caller's loop, and the
+/// difference is observable rather than stylistic. A loop that refuses
+/// the first extension it does not recognise never reaches the second
+/// copy, so a peer sending one bogus type twice draws
+/// unsupported_extension where §4.2 wants decode_error — which is
+/// exactly what BoGo's `DuplicateExtensionClient-TLS-TLS13` measured
+/// here. BoringSSL reaches the same conclusion with its own pre-pass,
+/// `checkDuplicateExtensions`.
+///
+/// The rule has no carve-out for types the reader does not recognise,
+/// and reading one in was the other half of the same finding: a
+/// duplicate we would have ignored anyway is still a duplicate, because
+/// §4.2 is about the block being well formed rather than about what its
+/// contents mean.
+///
+/// `capacity` bounds the scan. A block with more entries than that is
+/// left alone here and refused by the caller's own loop, which every
+/// caller bounds with an overflow error of its own — so an over-long
+/// block is still refused, just not by this function.
+pub fn refuseDuplicateExtensions(comptime capacity: u16, block: []const u8) (Error || DuplicateError)!void {
+    var cursor = Cursor.init(block);
+    var seen: [capacity]u16 = undefined;
+    var count: u16 = 0;
+    while (cursor.remaining() > 0) {
+        if (count == capacity) return;
+        assert(count < capacity);
+        const extension_type = try cursor.takeU16();
+        _ = try cursor.takeSlice(try cursor.takeU16());
+        for (seen[0..count]) |earlier| {
+            if (earlier == extension_type) return error.DuplicateExtension;
+        }
+        seen[count] = extension_type;
+        count += 1;
+    }
+    assert(cursor.remaining() == 0);
+}
+
+test "a repeated extension type is refused, whether or not it is known" {
+    // key_share, then supported_versions: an ordinary pair.
+    try refuseDuplicateExtensions(8, &.{ 0, 51, 0, 0, 0, 43, 0, 0 });
+    // The same known type twice.
+    try std.testing.expectError(
+        error.DuplicateExtension,
+        refuseDuplicateExtensions(8, &.{ 0, 51, 0, 0, 0, 51, 0, 0 }),
+    );
+    // A type no parser here knows, twice — 0xffff is what BoGo sends,
+    // and the whole point is that not recognising it changes nothing.
+    try std.testing.expectError(
+        error.DuplicateExtension,
+        refuseDuplicateExtensions(8, &.{ 0xff, 0xff, 0, 0, 0xff, 0xff, 0, 0 }),
+    );
+    // Separated by an unrelated extension, which is how BoGo places the
+    // pair: first and last rather than adjacent.
+    try std.testing.expectError(
+        error.DuplicateExtension,
+        refuseDuplicateExtensions(8, &.{ 0xff, 0xff, 0, 0, 0, 43, 0, 0, 0xff, 0xff, 0, 0 }),
+    );
+    // Truncated framing is the cursor's answer, not a duplicate verdict.
+    try std.testing.expectError(error.Truncated, refuseDuplicateExtensions(8, &.{ 0, 51, 0 }));
+}
+
 pub const Cursor = struct {
     bytes: []const u8,
     index: usize,
@@ -22,6 +89,13 @@ pub const Cursor = struct {
     pub fn remaining(self: *const Cursor) usize {
         assert(self.index <= self.bytes.len);
         return self.bytes.len - self.index;
+    }
+
+    /// Everything not yet taken, without taking it. For a caller that
+    /// must look over a whole block before acting on any of it.
+    pub fn rest(self: *const Cursor) []const u8 {
+        assert(self.index <= self.bytes.len);
+        return self.bytes[self.index..];
     }
 
     pub fn takeByte(self: *Cursor) Error!u8 {

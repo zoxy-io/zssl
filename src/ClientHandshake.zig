@@ -169,7 +169,8 @@ pub const Event = union(enum) {
 };
 
 pub const Error = backend.Error || protect.Error || session_keys.Error ||
-    handshake.Assembler.Error || alert.Error || wire.Error || flood.Error || error{
+    handshake.Assembler.Error || alert.Error || wire.Error || wire.DuplicateError ||
+    flood.Error || error{
     UnexpectedMessage,
     /// The ServerHello broke a rule: bad echo, unknown suite, missing or
     /// wrong supported_versions, a PSK we never offered.
@@ -418,6 +419,7 @@ fn readServerHelloExtensions(self: *ClientHandshake, body: *wire.Cursor) Error!S
     const extensions_bytes = try body.takeU16();
     if (extensions_bytes != body.remaining()) return error.BadServerHello;
     var result: ServerHelloExtensions = .{ .server_share = null, .tls13_selected = false };
+    try wire.refuseDuplicateExtensions(8, body.rest());
     var extensions_seen: u8 = 0;
     while (body.remaining() > 0) : (extensions_seen += 1) {
         if (extensions_seen == 8) return error.BadServerHello;
@@ -556,6 +558,14 @@ fn checkEncryptedExtensions(self: *ClientHandshake, body: []const u8) Error!void
     // §6.2 calls that decode_error: the message could not be decoded,
     // rather than arriving at the wrong moment.
     if (extensions_bytes != cursor.remaining()) return error.MalformedMessage;
+    // §4.2's duplicate rule is about the block being well formed, so it
+    // is answered over the whole block before the question of whether we
+    // asked for any of it. The other order collapses decode_error into
+    // unsupported_extension — the loop refuses the first unrecognised
+    // copy and never reaches the second — which is the same trap the
+    // server_name ack below documents, and is what BoGo's
+    // `DuplicateExtensionClient-TLS-TLS13` measured.
+    try wire.refuseDuplicateExtensions(8, cursor.rest());
     var extensions_seen: u8 = 0;
     while (cursor.remaining() > 0) : (extensions_seen += 1) {
         if (extensions_seen == 8) return error.UnexpectedMessage;

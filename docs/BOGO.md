@@ -41,17 +41,18 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**266 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. 139 drive
-`ClientHandshake` and 127 drive `ServerHandshake`. The server number was
+**268 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. 140 drive
+`ClientHandshake` and 128 drive `ServerHandshake`. The server number was
 6 until RSA signing landed, 100 until secp256r1/secp384r1 did, 110 until
 §9.2's `missing_extension` did, 111 until §5.4's inner-plaintext cap did,
 113 until eight suppressions turned out to be describing bugs that were
-already fixed, 121 until finding 8 was taken apart, and 124 until
-§4.2.9's psk_key_exchange_modes was enforced. The client number
-was 121 until §4.2's unsupported_extension landed, 134 until finding 4's
-flood ceilings did, and 136 until finding 5 stopped refusing
-`user_canceled`; see below.
+already fixed, 121 until finding 8 was taken apart, 124 until §4.2.9's
+psk_key_exchange_modes was enforced, and 127 until §4.2's duplicate rule
+did. The client number was 121 until §4.2's unsupported_extension
+landed, 134 until finding 4's flood ceilings did, 136 until finding 5
+stopped refusing `user_canceled`, and 139 until that same duplicate
+rule; see below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
 either gets fixed or gets an entry in `DisabledTests` with a one-line
@@ -132,10 +133,10 @@ Three bugs, fixed in this slice:
    flight was at least 500 bytes, which a legitimately small ECDSA leaf
    falsifies. The floor is now the encoded chain's own size.
 
-Twelve more were open. Five are fixed outright — 2, 3, 4, 5 and 12 —
-and seven still carry ledger entries, 20 suppressed cases between them.
-Two of those seven are no longer gaps in the sense the word implies: 11
-is a documented non-defect and 8 is down to two divergences we intend to
+Twelve more were open. Six are fixed outright — 2, 3, 4, 5, 9 and 12 —
+and six still carry ledger entries, 18 suppressed cases between them.
+Two of those six are no longer gaps in the sense the word implies: 11 is
+a documented non-defect and 8 is down to two divergences we intend to
 keep.
 All twelve keep their numbers rather than being renumbered, because the
 ledger cites them by number.
@@ -324,8 +325,34 @@ name.
    a panic, a missing check and a misclassified error all look identical
    from outside — the runner just says the description differs. Nothing
    is filed here without the got-versus-want quoted beside it.
-9. **A duplicate extension in the peer's hello is accepted** rather than
-   refused, on both sides.
+9. **FIXED — a duplicate extension in the peer's hello was accepted**
+   rather than refused, on both sides. §4.2 is one sentence: "There MUST
+   NOT be more than one extension of the same type in a given extension
+   block." The one-line description hid two different bugs, and only
+   running the cases separated them.
+
+   Server side, we accepted the hello outright. The parser policed
+   duplicates through a `trackedBit` bitset covering the eight
+   extensions it understood, and a comment reasoned that "a duplicate we
+   would ignore anyway is not this parser's fight" — which sounds right
+   and is not what §4.2 says. BoGo duplicates type `0xffff` precisely
+   because nobody recognises it. The rule is about the block being well
+   formed, not about what its contents mean, so every type is tracked
+   now and the bitset is gone.
+
+   Client side, we answered unsupported_extension where §6.2 wants
+   decode_error. The check was folded into the parse loop, and the loop
+   refuses the first extension it does not recognise — so it returned on
+   the first `0xffff` and never reached the second. BoGo places the pair
+   first and last in the block for exactly this reason. The rule is now
+   a pre-pass over the whole block before any of it is acted on, which
+   is also how BoringSSL does it (`checkDuplicateExtensions`), and it
+   covers all three blocks zssl reads: ClientHello, ServerHello and
+   EncryptedExtensions.
+
+   The ordering lesson is finding 2's, again: a verdict about framing
+   has to be reached before a verdict about content, or the second
+   silently answers for the first.
 10. **A PSK offer whose binder list does not match its identity list**,
     8 cases, of which only 3 are this finding. `Resume-Server-{Extra
     PSKBinder,ExtraIdentityNoBinder,BinderWrongLength}` draw

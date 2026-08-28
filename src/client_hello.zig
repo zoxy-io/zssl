@@ -257,8 +257,11 @@ fn parseBody(body: []const u8) Error!ClientHello {
 }
 
 fn parseExtensions(extensions_bytes: []const u8, hello: *ClientHello) Error!void {
+    // §4.2 over the whole block first: a duplicate is a fault in the
+    // block, and deciding it inside the loop below would let whichever
+    // extension came first answer for it instead.
+    try wire.refuseDuplicateExtensions(extensions_count_max, extensions_bytes);
     var cursor = Cursor.init(extensions_bytes);
-    var seen_types = std.StaticBitSet(64).initEmpty();
     var count: u16 = 0;
     while (cursor.remaining() > 0) : (count += 1) {
         if (count >= extensions_count_max) return error.ExtensionOverflow;
@@ -268,30 +271,9 @@ fn parseExtensions(extensions_bytes: []const u8, hello: *ClientHello) Error!void
         const extension_type = try cursor.takeU16();
         const data_bytes = try cursor.takeU16();
         const data = try cursor.takeSlice(data_bytes);
-        if (trackedBit(extension_type)) |bit| {
-            if (seen_types.isSet(bit)) return error.DuplicateExtension;
-            seen_types.set(bit);
-        }
         try applyExtension(extension_type, data, hello);
     }
     assert(cursor.remaining() == 0);
-}
-
-/// The extensions whose duplication we police, mapped to bitset slots.
-/// Unknown types (GREASE among them) answer null and may repeat — a
-/// duplicate we would ignore anyway is not this parser's fight.
-fn trackedBit(extension_type: u16) ?u6 {
-    return switch (extension_type) {
-        extension_server_name => 0,
-        extension_signature_algorithms => 1,
-        extension_alpn => 2,
-        extension_pre_shared_key => 3,
-        extension_supported_versions => 4,
-        extension_psk_key_exchange_modes => 5,
-        extension_key_share => 6,
-        extension_supported_groups => 7,
-        else => null,
-    };
 }
 
 /// RFC 7301 §3.1: a list of length-prefixed names, each at least one
