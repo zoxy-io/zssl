@@ -124,6 +124,33 @@ jobs:
           name: coverage-report
           path: zig-out/coverage
           if-no-files-found: ignore
+      # Two guesses at the 0% badge were wrong, so this measures instead
+      # of reasoning: if the filtered report is empty, run kcov again with
+      # no filter at all and print the source paths it *can* see. That
+      # says whether the include pattern is wrong or the debug info is,
+      # which is the fork the two wrong guesses were about.
+      - name: diagnose an empty report
+        if: always()
+        run: |
+          set -uo pipefail
+          file=$(find zig-out/coverage -name coverage.json -print -quit || true)
+          [ -n "$file" ] || exit 0
+          [ "$(jq -r '.files|length' "$file")" = "0" ] || exit 0
+          echo "filtered report has 0 files; re-running kcov unfiltered" >&2
+          binary=$(find .zig-cache -type f -name test -perm -u+x | head -1)
+          echo "test binary: ${binary:-<not found>}" >&2
+          [ -n "$binary" ] || exit 0
+          file "$binary" >&2 || true
+          kcov --clean /tmp/kcov-unfiltered "$binary" >/dev/null 2>&1 || true
+          bare=$(find /tmp/kcov-unfiltered -name coverage.json -print -quit || true)
+          if [ -z "$bare" ]; then
+            echo "unfiltered run produced no report either — debug info, not the pattern" >&2
+            exit 0
+          fi
+          jq -r '{files:(.files|length), percent_covered}' "$bare" >&2
+          echo "--- paths kcov sees, as DWARF records them ---" >&2
+          jq -r '.files[].file' "$bare" | head -25 >&2
+
       - name: read the percentage
         id: pct
         run: |

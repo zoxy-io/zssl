@@ -249,22 +249,10 @@ real-OpenSSL gate; `zig build bogo` and `zig build tlsfuzzer` run the two
 adversarial ones. Six kinds of evidence, in rough order of how much they
 are worth:
 
-[![bogo passing](https://img.shields.io/badge/bogo-231%20passing-brightgreen)](docs/BOGO.md)
-[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers)
-[![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-4%2F57%20scripts-yellow)](docs/TLSFUZZER.md)
-
-The BoGo badges are deliberately a pair, and they live here rather than
-in the header because they need this table beside them. A single "231
-passing" would read as a coverage claim, and 6918 cases were never run at
-all — the second badge is there so the first cannot be quoted alone. The
-tlsfuzzer badge carries its denominator for the same reason: 4 of 57
-scripts is the honest shape of that gate today. All three are static, and
-move in the same commit as the floors they report.
-
 | Oracle | What it proves |
 | --- | --- |
-| **BoGo** | BoringSSL's own hostile-peer runner, at a pinned commit, drives `bogo/shim.zig` through the corpus and checks not only that we refuse but *which alert we send*. 231 cases pass (121 client, 110 server), 0 fail, 6918 are declined by the shim as out of scope, and 745 are suppressed by name with a one-line reason each. A floor on the passing count is what stops a suppression from being quiet. |
-| **tlsfuzzer** | A third implementation — Python over tlslite-ng — driving our *server* through scripted conversations, at a pinned commit. 4 of 57 TLS 1.3 scripts run and pass, 160 conversations between them, 150 of those aborting the connection at every point in the handshake. 53 scripts are disabled and 31 of those are not yet triaged: a debt the gate prints on every run rather than burying. |
+| **BoGo**<br>[![bogo passing](https://img.shields.io/badge/bogo-231%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | BoringSSL's own hostile-peer runner, at a pinned commit, drives `bogo/shim.zig` through the corpus and checks not only that we refuse but *which alert we send*. 231 cases pass (121 client, 110 server), 0 fail, 6918 are declined by the shim as out of scope, and 745 are suppressed by name with a one-line reason each. A floor on the passing count is what stops a suppression from being quiet — and the two badges are a pair on purpose, because a bare "231 passing" reads as a coverage claim when 6918 cases were never run at all. |
+| **tlsfuzzer**<br>[![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-4%2F57%20scripts-yellow)](docs/TLSFUZZER.md) | A third implementation — Python over tlslite-ng — driving our *server* through scripted conversations, at a pinned commit. 4 of 57 TLS 1.3 scripts run and pass, 160 conversations between them, 150 of those aborting the connection at every point in the handshake. 53 scripts are disabled and 31 of those are not yet triaged: a debt the gate prints on every run rather than burying. |
 | **RFC 8448** replay | The key schedule, binder chain and record layer produce the RFC's traced bytes exactly — secrets, flights and ServerHello re-encoded byte for byte. |
 | **OpenSSL interop** | Three legs. `openssl s_client` completes against our server, with openssl's own X.509 verifying our certificate. Our client completes against `openssl s_server -rev` and opens the echo it seals back — twice, once against an ECDSA certificate and once against an RSA-2048 one openssl mints on the spot, since those are different verification paths. Each client leg asserts the leaf key type it meant to exercise, so the RSA leg cannot quietly pass on an ECDSA certificate, and both drive the `chain_verifier` seam and assert it saw the chain. |
 | **`std.crypto.tls`** | A second independent implementation completes a full in-memory handshake, in both directions, and exchanges data. |
