@@ -818,6 +818,11 @@ fn alertFor(err: anyerror) ?alert.Description {
         error.EmptyFragment,
         error.BadInnerPlaintext,
         error.UnexpectedRecordType,
+        // §5.1/§4.6.3 flood ceilings. §6.2 has no alert for "you are
+        // spending my time and delivering nothing", and unexpected_message
+        // is the closest and what BoringSSL sends for both.
+        error.TooManyEmptyRecords,
+        error.TooManyKeyUpdates,
         => .unexpected_message,
         // Not a TLS record at all — the same answer BoringSSL gives an
         // HTTP request that arrived on the TLS port.
@@ -865,7 +870,7 @@ fn alertFor(err: anyerror) ?alert.Description {
         error.BadAlpn => .illegal_parameter,
         // Our side broke, not theirs.
         error.SequenceExhausted,
-        error.TooManyKeyUpdates,
+        error.RotationsExhausted,
         error.LibcryptoFailed,
         error.DeterministicNonceUnsupported,
         error.SignatureInvalid,

@@ -18,10 +18,21 @@ pub const Direction = enum { transmit, receive };
 /// A generous ceiling on generations per connection: each rotation resets
 /// the record sequence space, so nothing legitimate approaches this — but
 /// a peer requesting updates in a loop must hit a wall, not a spin.
+///
+/// This is not the limit that stops a KeyUpdate flood; `flood.Guard`
+/// does that, 32 consecutive updates in. A connection reaches this one
+/// only by rotating legitimately, interleaved with real traffic, tens of
+/// thousands of times — which is why exhausting it is our budget ending
+/// rather than the peer misbehaving, and why the two carry different
+/// errors and different alerts.
 pub const rotations_max: u32 = 1 << 16;
 
 pub const Error = protect.Error || error{
-    TooManyKeyUpdates,
+    /// No further generation can be derived: `rotations_max` is spent.
+    /// Named for the budget rather than for the peer, beside
+    /// `protect.Error.SequenceExhausted`, because an embedder reading
+    /// this has run out of room and has not been attacked.
+    RotationsExhausted,
     /// A KeyUpdate whose body breaks §4.6.3's one-byte grammar.
     IllegalKeyUpdate,
 };
@@ -83,7 +94,7 @@ pub fn SessionKeys(comptime suite: CipherSuite) type {
         ) Error!void {
             assert(!std.mem.allEqual(u8, secret, 0));
             assert(protector.sequence <= protect.records_per_key_max);
-            if (self.rotations == rotations_max) return error.TooManyKeyUpdates;
+            if (self.rotations == rotations_max) return error.RotationsExhausted;
             self.rotations += 1;
             var next: [hash_bytes]u8 = undefined;
             @import("hkdf.zig").Hkdf(CipherSuite.HashType(suite)).expandLabel(secret, "traffic upd", &.{}, &next);
@@ -205,5 +216,5 @@ test "the rotation ceiling is an error, not a spin" {
     var keys = try Keys.init(&secret, &secret);
     defer keys.deinit();
     keys.rotations = rotations_max;
-    try std.testing.expectError(error.TooManyKeyUpdates, keys.rotateTransmit());
+    try std.testing.expectError(error.RotationsExhausted, keys.rotateTransmit());
 }

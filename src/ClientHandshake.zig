@@ -36,6 +36,7 @@ const der_bounds = @import("der_bounds.zig");
 const cipher_suite = @import("cipher_suite.zig");
 const client_hello = @import("client_hello.zig");
 const client_messages = @import("client_messages.zig");
+const flood = @import("flood.zig");
 const handshake = @import("handshake.zig");
 const key_schedule = @import("key_schedule.zig");
 const ktls = @import("ktls.zig");
@@ -51,6 +52,10 @@ state: State,
 config: Config,
 assembler: handshake.Assembler,
 ladder: ?Ladder,
+/// §5.1 and §4.6.3 flood ceilings: consecutive empty records and
+/// consecutive KeyUpdates, both bounded so a peer cannot buy unbounded
+/// work with records that deliver nothing. See flood.zig.
+flood_guard: flood.Guard,
 ccs_seen: u8,
 /// Whether our own compatibility ChangeCipherSpec has gone out. D.4
 /// puts it before the client's first *protected* record, which is the
@@ -164,7 +169,7 @@ pub const Event = union(enum) {
 };
 
 pub const Error = backend.Error || protect.Error || session_keys.Error ||
-    handshake.Assembler.Error || alert.ParseError || wire.Error || error{
+    handshake.Assembler.Error || alert.ParseError || wire.Error || flood.Error || error{
     UnexpectedMessage,
     /// The ServerHello broke a rule: bad echo, unknown suite, missing or
     /// wrong supported_versions, a PSK we never offered.
@@ -218,6 +223,7 @@ pub fn init(config: *const Config) ClientHandshake {
         .config = config.*,
         .assembler = handshake.Assembler.init(config.reassembly),
         .ladder = null,
+        .flood_guard = .{},
         .ccs_seen = 0,
         .ccs_sent = false,
         .hello_storage = undefined,
@@ -452,6 +458,12 @@ fn handleProtectedRecord(self: *ClientHandshake, wire_record: []const u8, out: [
                 else => unreachable,
             };
             const plaintext = out[0..opened.plaintext_bytes];
+            // §5.1/§4.6.3 flood ceilings, counted on every opened
+            // record so that padding-only and empty ones — the cheapest
+            // thing a peer can send us — are bounded before they are
+            // dispatched. `content_type` decides only what counts as
+            // progress; see flood.zig.
+            try self.flood_guard.observeRecord(plaintext.len, opened.content_type);
             // §5.4: only application_data may carry a zero-length
             // TLSInnerPlaintext.content; a handshake or alert record that
             // is nothing but its content-type byte is unexpected_message.
@@ -758,6 +770,9 @@ fn handlePostHandshake(self: *ClientHandshake, arm: anytype, out: []u8) Error!Ev
     switch (message.messageType() orelse return error.UnexpectedMessage) {
         .new_session_ticket => return .{ .ticket = try parseTicket(message.body()) },
         .key_update => {
+            // Counted before the rotation, because deriving the next
+            // generation is the work a flood is buying (flood.zig).
+            try self.flood_guard.observeKeyUpdate();
             const response = try arm.session.?.processKeyUpdate(message.body(), out);
             if (response) |sealed| return .{ .send = sealed };
             return .none;

@@ -41,15 +41,16 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**261 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. 134 drive
+**263 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. 136 drive
 `ClientHandshake` and 127 drive `ServerHandshake`. The server number was
 6 until RSA signing landed, 100 until secp256r1/secp384r1 did, 110 until
 §9.2's `missing_extension` did, 111 until §5.4's inner-plaintext cap did,
 113 until eight suppressions turned out to be describing bugs that were
 already fixed, 121 until finding 8 was taken apart, and 124 until
 §4.2.9's psk_key_exchange_modes was enforced. The client number
-was 121 until §4.2's unsupported_extension landed; see below.
+was 121 until §4.2's unsupported_extension landed, and 134 until finding
+4's flood ceilings did; see below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
 either gets fixed or gets an entry in `DisabledTests` with a one-line
@@ -130,9 +131,9 @@ Three bugs, fixed in this slice:
    flight was at least 500 bytes, which a legitimately small ECDSA leaf
    falsifies. The floor is now the encoded chain's own size.
 
-Twelve more were open. Three are fixed outright — 2, 3 and 12 — and nine
-still carry ledger entries, 25 suppressed cases between them. Two of
-those nine are no longer gaps in the sense the word implies: 11 is a
+Twelve more were open. Four are fixed outright — 2, 3, 4 and 12 — and
+eight still carry ledger entries, 23 suppressed cases between them. Two
+of those eight are no longer gaps in the sense the word implies: 11 is a
 documented non-defect and 8 is down to two divergences we intend to keep.
 All twelve keep their numbers rather than being renumbered, because the
 ledger cites them by number.
@@ -197,9 +198,42 @@ name.
    nobody could act on it, and DESIGN.md §5 described a cap the code did
    not have. A finding is a measurement or it is a guess with a case
    number attached.
-4. **No bound on empty application records or on KeyUpdates** within a
-   session. BoringSSL caps both; our KeyUpdate ceiling is far above the
-   count that should end a connection.
+4. **FIXED — no bound on empty application records or on KeyUpdates**
+   within a session. Both are the same attack: a record that is legal,
+   costs a decryption, and returns nothing an embedder can act on. §5.1
+   permits an empty application_data record and §4.6.3 puts no limit on
+   how many KeyUpdates a peer may send, so nothing in RFC 8446 caps
+   either and the limit is policy. `src/flood.zig` now holds both, at
+   BoringSSL's numbers because BoGo is what measures them: 32
+   consecutive of either, the 33rd ends the connection with
+   unexpected_message.
+
+   *Consecutive* is the whole of it, and the two counters reset on
+   different things. Any record carrying content clears the empty-record
+   count, because a byte arrived at all. Only *application* bytes clear
+   the KeyUpdate count, because a KeyUpdate answered by a KeyUpdate is
+   still no progress — which is also why an empty application record
+   does not clear it. A peer interleaving real traffic never approaches
+   either ceiling, and a long-lived connection may legitimately send far
+   more than 32 KeyUpdates in total.
+
+   The pre-existing `rotations_max` (1 << 16) was not this limit and is
+   not a substitute for it: it is our own generation budget, reachable
+   only by rotating legitimately tens of thousands of times. It was
+   called `TooManyKeyUpdates`, which is what made the two look like one
+   thing, and is now `RotationsExhausted` — named for the budget, beside
+   `SequenceExhausted`, and still an internal_error rather than a
+   verdict about the peer. `TooManyKeyUpdates` now means what BoringSSL's
+   `:TOO_MANY_KEY_UPDATES:` means.
+
+   One case moved that was not the finding. `TooManyChangeCipherSpec-`
+   `{Server,Client}-TLS13` expects `:TOO_MANY_EMPTY_FRAGMENTS:`, because
+   BoringSSL counts the handshake's dummy ChangeCipherSpec records into
+   the same counter. zssl does not reach that counter: `ccs_seen_max` is
+   2, so the stricter §5 window rule fires first and answers
+   `UnexpectedMessage`. Same alert on the wire, different error name, so
+   the ErrorMap carries both — which is what that table is for, and the
+   reason those two cases are not silently re-suppressed.
 5. **Every non-close_notify alert is fatal**, including the
    warning-level `user_canceled` that §6.1 leaves legal and that JDK 11
    sends in the wild.

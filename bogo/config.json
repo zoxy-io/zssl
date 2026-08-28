@@ -108,7 +108,7 @@
     ],
     ":KEY_UPDATE_NOT_ALLOWED:": [
       "zssl:IllegalKeyUpdate",
-      "zssl:TooManyKeyUpdates"
+      "zssl:RotationsExhausted"
     ],
     ":CANNOT_PARSE_LEAF_CERT:": [
       "zssl:BadCertificate",
@@ -142,6 +142,7 @@
       "zssl:UnexpectedMessage"
     ],
     ":TOO_MANY_EMPTY_FRAGMENTS:": [
+      "zssl:TooManyEmptyRecords",
       "zssl:UnexpectedMessage"
     ],
     ":ENCRYPTED_LENGTH_TOO_LONG:": [
@@ -179,6 +180,9 @@
     ],
     ":MISSING_EXTENSION:": [
       "zssl:MissingExtension"
+    ],
+    ":TOO_MANY_KEY_UPDATES:": [
+      "zssl:TooManyKeyUpdates"
     ]
   },
   "DisabledTests": {
@@ -637,7 +641,6 @@
     "SecondServerHelloNoVersion-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
     "SecondServerHelloWrongVersion-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
     "SendBogusAlertType": "OPEN GAP: an alert whose level byte is 0x42 draws decode_error from us and illegal_parameter from BoringSSL. AlertLevel is an open enum and TLS 1.3 deprecates the field, so neither answer is mandated; we refuse rather than guess, and read a field we cannot interpret as \u00a76.2's decode_error. docs/BOGO.md, finding 8.",
-    "SendEmptyRecords": "OPEN GAP: no bound on empty records or on KeyUpdates within a session. docs/BOGO.md, finding 4.",
     "SendEmptySessionTicket-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "SendSNIWarningAlert": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "SendUnsolicitedOCSPOnCertificate-TLS13": "OCSP stapling: not implemented.",
@@ -828,7 +831,6 @@
     "TolerateServerNameAck-TLS-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TolerateServerNameAck-TLS-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TolerateServerNameAck-TLS-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "TooManyKeyUpdates": "OPEN GAP: no bound on empty records or on KeyUpdates within a session. docs/BOGO.md, finding 4.",
     "TrailingDataWithFinished-Client-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TrailingDataWithFinished-Client-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TrailingDataWithFinished-Client-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
