@@ -1,7 +1,7 @@
 # zssl
 
 [![ci](https://github.com/zoxy-io/zssl/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/ci.yml)
-[![coverage](https://codecov.io/gh/zoxy-io/zssl/branch/main/graph/badge.svg)](https://codecov.io/gh/zoxy-io/zssl)
+[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzoxy-io%2Fzssl%2Fbadges%2Fcoverage.json)](https://github.com/zoxy-io/zssl/actions/workflows/ci.yml)
 [![bogo passing](https://img.shields.io/badge/bogo-221%20passing-brightgreen)](docs/BOGO.md)
 [![bogo declined](https://img.shields.io/badge/bogo-6965%20declined-lightgrey)](docs/BOGO.md#the-three-numbers)
 

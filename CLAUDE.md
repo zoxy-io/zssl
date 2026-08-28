@@ -66,6 +66,13 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
   a one-line reason, and one that reads "OPEN GAP" points at a numbered
   finding in docs/BOGO.md. Never add an entry without a reason, and never
   lower `passing_floor` to make a run green.
+- The coverage badge is served from this repository, not a third party:
+  the `coverage` job writes `coverage.json` to an orphan `badges` branch
+  and shields.io reads it through its endpoint API, so the only
+  credential involved is the `GITHUB_TOKEN` the job already has. Note
+  that this only renders while the repository is public — a private repo
+  needs `raw.githubusercontent.com` auth, and the badge would have to go
+  static like the BoGo pair.
 - The two BoGo badges in README.md are static and carry the same numbers
   as `passing_floor` and the decline count. They move in the same commit
   the floor does; a badge that disagrees with the gate is worse than no

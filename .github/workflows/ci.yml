@@ -59,8 +59,14 @@ jobs:
           path: zig-out/bogo/bogo.log
           if-no-files-found: ignore
 
+  # Coverage without a third party: kcov produces the number, CI writes it
+  # to an orphan `badges` branch in this repository, and shields.io reads
+  # that branch through its endpoint API. The only credential involved is
+  # the token GitHub already hands the job.
   coverage:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -70,8 +76,65 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y kcov
       - name: coverage
         run: zig build coverage
-      - uses: codecov/codecov-action@v5
+      # The whole report, always — the badge is a summary and this is the
+      # thing you actually read when the summary moves.
+      - name: upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          directory: zig-out/coverage
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+          name: coverage-report
+          path: zig-out/coverage
+          if-no-files-found: ignore
+      - name: read the percentage
+        id: pct
+        run: |
+          set -euo pipefail
+          # kcov writes one coverage.json per instrumented binary.
+          file=$(find zig-out/coverage -name coverage.json -print -quit)
+          if [ -z "$file" ]; then
+            echo "no coverage.json under zig-out/coverage" >&2
+            find zig-out/coverage -maxdepth 2 >&2 || true
+            exit 1
+          fi
+          pct=$(jq -r '.percent_covered // empty' "$file")
+          # A file that exists with the field renamed would otherwise
+          # publish a badge reading "null%", which is worse than no badge.
+          case "$pct" in
+            ''|*[!0-9.]*)
+              echo "no numeric percent_covered in $file" >&2
+              jq -r 'keys' "$file" >&2 || cat "$file" >&2
+              exit 1
+              ;;
+          esac
+          echo "percent=$pct" >> "$GITHUB_OUTPUT"
+          echo "coverage: $pct%"
+      # Only on a push to main: a pull request from a fork cannot write
+      # here, and a per-PR number would only make the badge flicker.
+      - name: publish the badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          PCT: ${{ steps.pct.outputs.percent }}
+        run: |
+          set -euo pipefail
+          # Green above 80, yellow above 60, red below. The thresholds are
+          # a reading aid, not a gate — the gates are `test` and `bogo`.
+          # `if` rather than `awk ... && colour=`, because under `set -e` a
+          # failing test at the head of an `&&` list ends the job.
+          colour=red
+          if awk "BEGIN{exit !($PCT >= 60)}"; then colour=yellow; fi
+          if awk "BEGIN{exit !($PCT >= 80)}"; then colour=brightgreen; fi
+          printf '{"schemaVersion":1,"label":"coverage","message":"%.1f%%","color":"%s"}\n' \
+            "$PCT" "$colour" > /tmp/coverage.json
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # An orphan branch carrying one file: it shares no history with
+          # main, so it cannot be mistaken for a code branch. Clearing the
+          # index rather than deleting the worktree — everything else stays
+          # untracked and simply never enters the commit, which keeps a
+          # stray `rm -rf` out of a job that holds a write token.
+          git checkout --orphan badges
+          git rm -rf --cached . >/dev/null
+          cp /tmp/coverage.json coverage.json
+          git add coverage.json
+          git commit -m "coverage: $PCT%" --quiet
+          git push --force origin badges
