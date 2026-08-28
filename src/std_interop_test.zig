@@ -194,5 +194,7 @@ test "std.crypto.tls.Client: full handshake and data, no shared code" {
     var received: [64]u8 = undefined;
     const received_bytes = try client.reader.readSliceShort(&received);
     try testing.expectEqualSlices(u8, "zssl greets std", received[0..received_bytes]);
-    try testing.expectEqual(ServerHandshake.State.closed, server.state);
+    // Our write side only: std's client never answers with a
+    // close_notify of its own, so the read side stays open (§6.1).
+    try testing.expectEqual(ServerHandshake.State.close_sent, server.state);
 }

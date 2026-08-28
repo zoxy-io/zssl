@@ -72,9 +72,61 @@ pub const State = enum(u8) {
     awaiting_retry_client_hello,
     awaiting_finished,
     connected,
+    /// §6.1 closes one direction at a time, so a close is two states
+    /// before it is one. We sent close_notify: our write side is done
+    /// and nothing further may go out, but the peer's records still
+    /// arrive and the embedder still needs to read them — its own
+    /// close_notify above all, which is the only way an orderly
+    /// shutdown can be told from a truncated one.
+    close_sent,
+    /// The peer sent close_notify: our read side is done, and we may
+    /// still write. Answering with a close_notify of our own is the
+    /// ordinary thing to do from here, and asserting `.connected` in
+    /// `sendClose` used to make that an abort.
+    close_received,
+    /// Both directions closed.
     closed,
     failed,
 };
+
+/// §6.1's two halves, asked rather than pattern-matched. Every entry
+/// point below is gated on one of these instead of on `.connected`,
+/// which is what finding 6 was: a single `.closed` state cannot say
+/// which direction closed, so it said both and closed neither properly.
+pub fn writable(self: *const ServerHandshake) bool {
+    return self.state == .connected or self.state == .close_received;
+}
+
+pub fn readable(self: *const ServerHandshake) bool {
+    return self.state == .connected or self.state == .close_sent;
+}
+
+/// Where a close_notify leaves us, by which direction closed *and*
+/// whether there was a live connection to half-close at all.
+///
+/// The second half is load-bearing. `writable()` and `readable()` are
+/// read as "the keys for that direction exist", and every write entry
+/// point unwraps `ladder.?` behind one of them. A close_notify arriving
+/// before the session keys do — a plaintext one as the first record on
+/// the wire, say — has no half to keep open: there is nothing to read
+/// with and nothing to send with. Half-closing there would make
+/// `writable()` true over a null ladder, and the embedder doing the
+/// ordinary thing next would abort the process on peer input.
+fn afterCloseSent(self: *const ServerHandshake) State {
+    return switch (self.state) {
+        .connected => .close_sent,
+        .close_received => .closed,
+        else => .closed,
+    };
+}
+
+fn afterCloseReceived(self: *const ServerHandshake) State {
+    return switch (self.state) {
+        .connected => .close_received,
+        .close_sent => .closed,
+        else => .closed,
+    };
+}
 
 pub const Config = struct {
     credentials: *const Credentials,
@@ -228,7 +280,13 @@ pub fn handleRecord(self: *ServerHandshake, wire_record: []const u8, out: []u8) 
             // that state from a protected close_notify is with the
             // peer's Finished already behind us, and a machine in it
             // may still be fed records.
-            if (self.state == .connected or self.state == .closed) return error.UnexpectedMessage;
+            switch (self.state) {
+                // Every state at or past the peer's Finished. §5 puts
+                // the window's far edge there, and a half-closed
+                // connection is well past it.
+                .connected, .close_sent, .close_received, .closed => return error.UnexpectedMessage,
+                else => {},
+            }
             if (self.ccs_seen == ccs_seen_max) return error.UnexpectedMessage;
             self.ccs_seen += 1;
             return .none;
@@ -245,7 +303,7 @@ fn handlePlaintextAlert(self: *ServerHandshake, payload: []const u8) Error!Event
     const parsed = try alert.parse(payload);
     switch (alert.disposition(parsed)) {
         .close => {
-            self.state = .closed;
+            self.state = self.afterCloseReceived();
             return .closed;
         },
         // §6.1's user_canceled, which real peers send and this library
@@ -619,8 +677,11 @@ fn selectAlpn(self: *const ServerHandshake, hello: *const client_hello.ClientHel
 }
 
 fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: []u8) Error!Event {
+    // Readable, not connected: §6.1 leaves the read side open after our
+    // own close_notify, and closing it there is what made a truncated
+    // shutdown indistinguishable from an orderly one.
     switch (self.state) {
-        .awaiting_finished, .connected => {},
+        .awaiting_finished, .connected, .close_sent => {},
         else => return error.UnexpectedMessage,
     }
     assert(self.ladder != null);
@@ -636,8 +697,8 @@ fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: [
         inline else => |*arm| {
             const opened = switch (self.state) {
                 .awaiting_finished => try arm.recv.?.open(wire_record, out),
-                .connected => try arm.session.?.recv.open(wire_record, out),
-                else => unreachable, // The guard above admits only these two.
+                .connected, .close_sent => try arm.session.?.recv.open(wire_record, out),
+                else => unreachable, // The guard above admits only these three.
             };
             const plaintext = out[0..opened.plaintext_bytes];
             // §5.1/§4.6.3 flood ceilings, counted on every opened
@@ -658,7 +719,10 @@ fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: [
                 .alert => return self.handlePlaintextAlert(plaintext),
                 .handshake => return self.handleProtectedHandshake(arm, plaintext, out),
                 .application_data => {
-                    if (self.state != .connected) return error.UnexpectedMessage;
+                    // Readable, not connected: our own close_notify
+                    // shuts the write side, and the peer is entitled to
+                    // keep sending until it closes its own (§6.1).
+                    if (!self.readable()) return error.UnexpectedMessage;
                     return .{ .application_data = plaintext };
                 },
                 .change_cipher_spec => return error.UnexpectedMessage,
@@ -673,7 +737,7 @@ fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []c
     assert(plaintext.len >= 1);
     try self.assembler.push(plaintext);
     const message = (try self.assembler.next()) orelse return .none;
-    if (self.state == .connected) {
+    if (self.state != .awaiting_finished) {
         // §4.6.3 is the only post-handshake message a server hears; a
         // client has no tickets to send and no certificates to update.
         if (message.messageType() != .key_update) return error.UnexpectedMessage;
@@ -693,12 +757,18 @@ fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []c
 /// decrypted plaintext was already copied into the assembler, so `out`
 /// is free to carry any response.
 fn handleKeyUpdate(self: *ServerHandshake, arm: anytype, message: handshake.Message, out: []u8) Error!Event {
-    assert(self.state == .connected);
+    assert(self.readable());
     assert(arm.session != null);
     // Counted before the rotation, because deriving the next generation
     // is the work a flood is buying (flood.zig).
     try self.flood_guard.observeKeyUpdate();
     const response = try arm.session.?.processKeyUpdate(message.body(), out);
+    // §6.1: "any data received after a closure alert has been received
+    // MUST be ignored" is the peer's rule, and ours is the mirror — we
+    // sent close_notify, so nothing further goes out, including a
+    // KeyUpdate the peer asked us to send back. Our receive side still
+    // rotated, which is what lets us keep reading to its close_notify.
+    if (self.state == .close_sent) return .none;
     if (response) |sealed| return .{ .send = sealed };
     return .none;
 }
@@ -706,7 +776,7 @@ fn handleKeyUpdate(self: *ServerHandshake, arm: anytype, message: handshake.Mess
 /// §4.6.3, send side. `request_update` asks the peer to rotate too — the
 /// lever for §5.5 sequence-budget hygiene.
 pub fn sendKeyUpdate(self: *ServerHandshake, request_update: bool, out: []u8) Error![]const u8 {
-    assert(self.state == .connected);
+    assert(self.writable());
     assert(out.len >= record.header_bytes + handshake.header_bytes + 1 + 256);
     errdefer self.state = .failed;
     switch (self.ladder.?) {
@@ -718,7 +788,7 @@ pub fn sendKeyUpdate(self: *ServerHandshake, request_update: bool, out: []u8) Er
 /// failed-on-error guarantee covers this entry point too: a seal failure
 /// (sequence exhaustion included) retires the machine.
 pub fn sendApplicationData(self: *ServerHandshake, bytes: []const u8, out: []u8) Error![]const u8 {
-    assert(self.state == .connected);
+    assert(self.writable());
     assert(bytes.len <= record.plaintext_bytes_max);
     errdefer self.state = .failed;
     switch (self.ladder.?) {
@@ -729,13 +799,13 @@ pub fn sendApplicationData(self: *ServerHandshake, bytes: []const u8, out: []u8)
 /// Seal a close_notify and mark the machine closed (or failed, if even
 /// that cannot be sealed).
 pub fn sendClose(self: *ServerHandshake, out: []u8) Error![]const u8 {
-    assert(self.state == .connected);
+    assert(self.writable());
     errdefer self.state = .failed;
     const bytes = alert.encode(.close_notify);
     switch (self.ladder.?) {
         inline else => |*arm| {
             const sealed = try arm.session.?.send.seal(.alert, &bytes, out);
-            self.state = .closed;
+            self.state = self.afterCloseSent();
             return sealed;
         },
     }
@@ -759,7 +829,13 @@ pub fn sendAlert(self: *ServerHandshake, description: alert.Description, out: []
     // close_notify with one of its own is doing the ordinary thing. The
     // send protector outlives the peer's alert, so the seal still works.
     const body = alert.encode(description);
-    self.state = if (description == .close_notify) .closed else .failed;
+    // A close_notify here closes our write side on the same terms as
+    // `sendClose`; anything else retires the machine outright.
+    if (description == .close_notify) {
+        self.state = self.afterCloseSent();
+    } else {
+        self.state = .failed;
+    }
     if (self.ladder) |*ladder| switch (ladder.*) {
         inline else => |*arm| {
             // Application keys first: once they exist the handshake
@@ -802,7 +878,7 @@ pub fn resumptionPsk(
     ticket_nonce: []const u8,
     out: *[cipher_suite.hash_bytes_max]u8,
 ) []const u8 {
-    assert(self.state == .connected);
+    assert(self.writable());
     assert(ticket_nonce.len >= 1);
     assert(ticket_nonce.len <= 255);
     switch (self.ladder.?) {
@@ -832,7 +908,7 @@ pub fn sendNewSessionTicket(
     params: *const NewSessionTicketParams,
     out: []u8,
 ) Error![]const u8 {
-    assert(self.state == .connected);
+    assert(self.writable());
     assert(params.ticket.len >= 1);
     assert(params.ticket.len <= server_messages.ticket_bytes_max);
     // §4.2.9: a ticket incompatible with every mode the client advertised
@@ -871,6 +947,8 @@ pub const Direction = session_keys.Direction;
 /// Reflects the current §4.6.3 generation — export after any KeyUpdate,
 /// never before.
 pub fn exportKeyMaterial(self: *const ServerHandshake, direction: Direction) ktls.KeyMaterial {
+    // Not `writable()`: handing a half-closed connection to the kernel
+    // would hand it a direction that is already over.
     assert(self.state == .connected);
     switch (self.ladder.?) {
         inline else => |*arm| return arm.session.?.exportMaterial(direction),

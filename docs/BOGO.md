@@ -41,8 +41,8 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**268 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. 140 drive
+**269 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. 141 drive
 `ClientHandshake` and 128 drive `ServerHandshake`. The server number was
 6 until RSA signing landed, 100 until secp256r1/secp384r1 did, 110 until
 §9.2's `missing_extension` did, 111 until §5.4's inner-plaintext cap did,
@@ -51,8 +51,8 @@ already fixed, 121 until finding 8 was taken apart, 124 until §4.2.9's
 psk_key_exchange_modes was enforced, and 127 until §4.2's duplicate rule
 did. The client number was 121 until §4.2's unsupported_extension
 landed, 134 until finding 4's flood ceilings did, 136 until finding 5
-stopped refusing `user_canceled`, and 139 until that same duplicate
-rule; see below.
+stopped refusing `user_canceled`, 139 until that same duplicate rule,
+and 140 until finding 6 split the close in two; see below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
 either gets fixed or gets an entry in `DisabledTests` with a one-line
@@ -133,11 +133,11 @@ Three bugs, fixed in this slice:
    flight was at least 500 bytes, which a legitimately small ECDSA leaf
    falsifies. The floor is now the encoded chain's own size.
 
-Twelve more were open. Six are fixed outright — 2, 3, 4, 5, 9 and 12 —
-and six still carry ledger entries, 18 suppressed cases between them.
-Two of those six are no longer gaps in the sense the word implies: 11 is
-a documented non-defect and 8 is down to two divergences we intend to
-keep.
+Twelve more were open. Seven are fixed outright — 2, 3, 4, 5, 6, 9 and
+12 — and five still carry ledger entries, 17 suppressed cases between
+them. Two of those five are no longer gaps in the sense the word
+implies: 11 is a documented non-defect and 8 is down to two divergences
+we intend to keep.
 All twelve keep their numbers rather than being renumbered, because the
 ledger cites them by number.
 
@@ -154,6 +154,14 @@ name.
    which both Go and OpenSSL emit — is `UnexpectedMessage`. Legal, common,
    and refused. This one needs the event surface to grow a way to drain
    more than one event per record.
+
+   Four cases now, not three. `Shutdown-Shim-KeyUpdate-TLS-Sync-`
+   `PackHandshake` joined when finding 6 made the shim read after its
+   own close_notify instead of returning: the case was passing because
+   nothing looked at it, and looking found this gap rather than a new
+   one. Its `-TLS-Sync` and `-SplitHandshakeRecords` siblings still
+   pass, which is what isolates the cause to packing rather than to the
+   shutdown path.
 2. **FIXED — the client accepted extensions it never offered.**
    `checkEncryptedExtensions` looked at ALPN and skipped everything
    else, so a server could hand our client any extension it liked and we
@@ -263,9 +271,49 @@ name.
    `ssl_process_alert` before its reset runs, which reads like an
    accident of control flow and is load-bearing. An alert is never
    progress; a test pins it for all three counters.
-6. **A close_notify retires the machine**, so an embedder cannot answer
-   it with one of its own — zssl models a close as ending the session
-   rather than as §6.1's half-close.
+6. **FIXED — a close_notify retired the machine**, so an embedder could
+   not answer it with one of its own. §6.1 closes one direction at a
+   time and zssl modelled a close as ending the session, which is one
+   state where the protocol has two.
+
+   Both halves were broken by the same missing distinction. After the
+   *peer's* close_notify an embedder could not reply with its own —
+   `sendClose` asserted `.connected`, so answering was an abort rather
+   than an error. After *our* close_notify we stopped reading, so a
+   stream that simply stopped could not be told from one that closed
+   cleanly, which is the difference between a shutdown and a truncation
+   attack.
+
+   `.closed` is now three states: `close_sent`, `close_received`, and
+   `closed` for both. Every entry point asks `writable()` or
+   `readable()` instead of comparing against `.connected`, which is
+   where the old model kept leaking — the §5 ChangeCipherSpec window,
+   the protected-record guard, and the application_data branch each had
+   their own `== .connected` and each meant something slightly
+   different by it. One of those was still wrong after the first pass,
+   and the scenario test caught it: a peer is entitled to keep sending
+   application data until it closes its own direction.
+
+   One thing §6.1 forbids that the new states make reachable: a
+   KeyUpdate asking for one back, arriving after our close_notify.
+   Nothing goes out after that alert, so the response is dropped while
+   the receive side still rotates — which is what lets us read on to
+   the peer's close.
+
+   `bogo/shim.zig` grew the other half. It used to send close_notify
+   and return, so `-check-close-notify` was never consulted and those
+   cases passed vacuously; it now reads on until the peer closes.
+   Getting that right needed both shapes of "the peer went away": a
+   clean end of stream, and a reset, which is what a peer that closes
+   without draining actually produces.
+
+   Two ErrorMap entries carry the verdicts, because BoGo names them in
+   BoringSSL's vocabulary. `Unexpected SSL_shutdown result: -1 != 1` is
+   our `NoCloseNotify`, and `:SSLV3_ALERT_DECOMPRESSION_FAILURE:` is our
+   `PeerAlert` — which is worth noticing as a limit rather than a
+   translation: zssl reports *that* the peer sent a fatal alert and
+   never *which*, so an embedder needing the description does not have
+   it.
 7. **NewSessionTicket extension bodies are not checked** for a minimal
    encoding.
 8. **Two alert choices we mean to keep**, down from 19. What was here

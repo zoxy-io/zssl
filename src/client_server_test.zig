@@ -615,7 +615,8 @@ test "sendAlert: encrypted once keys exist, plaintext before, and the peer reads
         defer harness.deinit();
         try harness.connect(&buffers);
         const sealed = harness.server.sendAlert(.close_notify, &buffers.server_out);
-        try testing.expectEqual(ServerHandshake.State.closed, harness.server.state);
+        // Our write side only (§6.1): the client has not closed back.
+        try testing.expectEqual(ServerHandshake.State.close_sent, harness.server.state);
         const event = try harness.client.handleRecord(sealed, &buffers.scratch);
         try testing.expectEqual(std.meta.activeTag(event), .closed);
     }
@@ -1043,7 +1044,9 @@ test "§5: a ChangeCipherSpec outside its window is unexpected_message" {
         const bye = harness.client.sendAlert(.close_notify, &buffers.client_out);
         const event = try harness.server.handleRecord(bye, &buffers.server_out);
         try testing.expectEqual(std.meta.activeTag(event), .closed);
-        try testing.expectEqual(ServerHandshake.State.closed, harness.server.state);
+        // The read side, and the §5 window is shut either way — a
+        // half-closed connection is well past the peer's Finished.
+        try testing.expectEqual(ServerHandshake.State.close_received, harness.server.state);
         try testing.expectError(
             error.UnexpectedMessage,
             harness.server.handleRecord(&ccs, &buffers.server_out),
@@ -1174,5 +1177,193 @@ test "§6.1: user_canceled is ignored and bounded, other warnings are refused" {
                 );
             },
         }
+    }
+}
+
+test "§6.1: a close closes one direction, and the peer may answer" {
+    // Finding 6. A single `.closed` state could not say *which*
+    // direction had closed, so it said both: after the peer's
+    // close_notify an embedder could not answer with one of its own
+    // (`sendClose` asserted `.connected`, so answering was an abort),
+    // and after its own it could not read on to find out whether the
+    // peer had closed cleanly or the stream had simply been cut.
+    var buffers: Buffers = .{};
+
+    // Server closes first. Its write side shuts; its read side does not.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        try harness.connect(&buffers);
+
+        const bye = try harness.server.sendClose(&buffers.server_out);
+        try testing.expectEqual(ServerHandshake.State.close_sent, harness.server.state);
+        try testing.expect(!harness.server.writable());
+        try testing.expect(harness.server.readable());
+
+        // The client reads it, and its own halves move the other way.
+        const seen = try harness.client.handleRecord(bye, &buffers.scratch);
+        try testing.expectEqual(std.meta.activeTag(seen), .closed);
+        try testing.expectEqual(ClientHandshake.State.close_received, harness.client.state);
+        try testing.expect(harness.client.writable());
+        try testing.expect(!harness.client.readable());
+
+        // Answering is the ordinary thing to do from here, and is what
+        // used to abort. Both machines end fully closed.
+        const answer = try harness.client.sendClose(&buffers.client_out);
+        try testing.expectEqual(ClientHandshake.State.closed, harness.client.state);
+        const done = try harness.server.handleRecord(answer, &buffers.server_out);
+        try testing.expectEqual(std.meta.activeTag(done), .closed);
+        try testing.expectEqual(ServerHandshake.State.closed, harness.server.state);
+        try testing.expect(!harness.server.readable());
+        try testing.expect(!harness.server.writable());
+    }
+
+    // The half-close is what lets an orderly shutdown be told from a
+    // truncated one: after our close_notify the peer's records still
+    // arrive, so an alert instead of a close is legible rather than
+    // silence. `Unclean-Shutdown-Alert` is the case.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        try harness.connect(&buffers);
+        _ = try harness.server.sendClose(&buffers.server_out);
+        try testing.expectEqual(ServerHandshake.State.close_sent, harness.server.state);
+        switch (harness.client.ladder.?) {
+            inline else => |*arm| {
+                const angry = try arm.session.?.send.seal(.alert, &.{ 2, 30 }, &buffers.client_out);
+                try testing.expectError(
+                    error.PeerAlert,
+                    harness.server.handleRecord(angry, &buffers.server_out),
+                );
+            },
+        }
+    }
+
+    // Application data still flows the open way. The peer closed its
+    // write side; ours is untouched, which is the whole point of §6.1
+    // being two directions rather than one switch.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        try harness.connect(&buffers);
+        const bye = try harness.client.sendClose(&buffers.client_out);
+        _ = try harness.server.handleRecord(bye, &buffers.server_out);
+        try testing.expectEqual(ServerHandshake.State.close_received, harness.server.state);
+        const late = try harness.server.sendApplicationData("still here", &buffers.server_out);
+        const event = try harness.client.handleRecord(late, &buffers.scratch);
+        try testing.expectEqualStrings("still here", event.application_data);
+    }
+
+    // And a record arriving after the peer's close_notify is refused:
+    // our read side is shut, whatever our write side is doing.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        try harness.connect(&buffers);
+        switch (harness.client.ladder.?) {
+            inline else => |*arm| {
+                const bye = try harness.client.sendClose(&buffers.client_out);
+                _ = try harness.server.handleRecord(bye, &buffers.server_out);
+                const late = try arm.session.?.send.seal(.application_data, "too late", &buffers.client_out);
+                try testing.expectError(
+                    error.UnexpectedMessage,
+                    harness.server.handleRecord(late, &buffers.server_out),
+                );
+            },
+        }
+    }
+}
+
+test "§6.1: a close before there is a connection closes the machine, not half of it" {
+    // The half-close model has a precondition its two predicates do not
+    // state: `writable()` and `readable()` are read as "the keys for
+    // that direction exist", because every write entry point unwraps
+    // `ladder.?` behind one. Half-closing before the session keys exist
+    // makes them lie, and the embedder doing the ordinary next thing —
+    // answering a close with a close — then aborts the process on one
+    // record of peer input. The review caught this; these pin it.
+    var buffers: Buffers = .{};
+
+    // A plaintext close_notify as the very first record on the wire,
+    // before any ClientHello. There is no ladder to half-close.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        const bye = [_]u8{ 21, 3, 3, 0, 2, 1, 0 };
+        const event = try harness.server.handleRecord(&bye, &buffers.server_out);
+        try testing.expectEqual(std.meta.activeTag(event), .closed);
+        try testing.expectEqual(ServerHandshake.State.closed, harness.server.state);
+        try testing.expect(harness.server.ladder == null);
+        // Both false, so `sendClose`'s `ladder.?` is unreachable.
+        try testing.expect(!harness.server.writable());
+        try testing.expect(!harness.server.readable());
+    }
+
+    // Our own close_notify before the handshake, which `sendAlert`
+    // documents as callable in every state. It must not open a read
+    // side there is no key for.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        _ = harness.server.sendAlert(.close_notify, &buffers.server_out);
+        try testing.expectEqual(ServerHandshake.State.closed, harness.server.state);
+        try testing.expect(!harness.server.readable());
+        // A protected record now is refused rather than opened against
+        // a session that does not exist.
+        const protected = [_]u8{ 23, 3, 3, 0, 1, 0 };
+        try testing.expectError(
+            error.UnexpectedMessage,
+            harness.server.handleRecord(&protected, &buffers.server_out),
+        );
+    }
+
+    // Mid-handshake: the ladder exists but the session keys do not.
+    // This is the narrower version of the same trap.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        const hello = harness.client.start(&buffers.client_out);
+        _ = try harness.server.handleRecord(hello, &buffers.server_out);
+        try testing.expectEqual(ServerHandshake.State.awaiting_finished, harness.server.state);
+        _ = harness.server.sendAlert(.close_notify, &buffers.server_out);
+        try testing.expectEqual(ServerHandshake.State.closed, harness.server.state);
+        try testing.expect(!harness.server.readable());
+        try testing.expect(!harness.server.writable());
+    }
+
+    // And a failed machine stays unusable: a close_notify must not
+    // revive it into a state that admits records again.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        _ = harness.server.sendAlert(.internal_error, &buffers.server_out);
+        try testing.expectEqual(ServerHandshake.State.failed, harness.server.state);
+        _ = harness.server.sendAlert(.close_notify, &buffers.server_out);
+        try testing.expectEqual(ServerHandshake.State.closed, harness.server.state);
+        try testing.expect(!harness.server.readable());
+        try testing.expect(!harness.server.writable());
+    }
+
+    // The client half of the first case, since both roles unwrap the
+    // same optional behind the same predicate.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        _ = harness.client.start(&buffers.client_out);
+        const bye = [_]u8{ 21, 3, 3, 0, 2, 1, 0 };
+        const event = try harness.client.handleRecord(&bye, &buffers.scratch);
+        try testing.expectEqual(std.meta.activeTag(event), .closed);
+        try testing.expectEqual(ClientHandshake.State.closed, harness.client.state);
+        try testing.expect(!harness.client.writable());
+        try testing.expect(!harness.client.readable());
     }
 }

@@ -113,11 +113,22 @@ test "full 1-RTT: ALPN, app data both ways, kTLS export, clean close" {
     const receive = harness.server.exportKeyMaterial(.receive);
     try testing.expectEqualSlices(u8, &client.transmit_keys.key, receive.key[0..receive.key_bytes]);
 
-    // Clean shutdown, client first.
+    // Clean shutdown, client first — and clean means both directions.
+    // §6.1 closes one at a time, so the server's read side goes first
+    // and its write side is still open, which is what lets it answer.
     const close_record = try client.sendClose(&client_out);
     const close_event = try harness.server.handleRecord(close_record, &server_out);
     try testing.expectEqual(std.meta.activeTag(close_event), .closed);
+    try testing.expectEqual(ServerHandshake.State.close_received, harness.server.state);
+    try testing.expect(harness.server.writable());
+    try testing.expect(!harness.server.readable());
+
+    // Answering is the ordinary thing to do, and used to be an abort.
+    _ = try harness.server.sendClose(&server_out);
     try testing.expectEqual(ServerHandshake.State.closed, harness.server.state);
+    try testing.expect(!harness.server.writable()); // Both halves of the round trip, with two real handshakes on either
+    // end, live in client_server_test.zig — the reference client here is
+    // a test peer rather than a second implementation of §6.1.
 }
 
 test "a ClientHello fragmented across three records reassembles" {

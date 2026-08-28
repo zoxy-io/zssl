@@ -715,6 +715,45 @@ const Pump = struct {
         return err;
     }
 
+    /// After our own close_notify. §6.1 closes one direction at a time,
+    /// so the read side is still open and the peer's answer still
+    /// arrives — its close_notify, or an alert instead of one, or
+    /// nothing at all. Which of those counts as a failure is the case's
+    /// call, and `-check-close-notify` is how BoGo says so: a stream
+    /// that merely stopped is a truncation, not an orderly shutdown.
+    ///
+    /// Nothing this loop reads produces a reply. §6.1 forbids sending
+    /// after close_notify, and the machine already returns `.none`
+    /// rather than a KeyUpdate response once its write side is shut.
+    fn awaitPeerClose(pump: *Pump, machine: anytype, connection: *const Connection) !void {
+        var records_seen: u32 = 0;
+        while (records_seen < records_per_phase_max) : (records_seen += 1) {
+            const one = pump.nextRecord() catch |err| switch (err) {
+                // Both shapes of "the peer went away". A clean end of
+                // stream is one; a reset is the other, and it is what a
+                // peer that closes without draining what we just wrote
+                // actually produces. Neither carried a close_notify,
+                // and that — rather than which errno it arrived as — is
+                // the only question `-check-close-notify` asks.
+                error.PeerClosed, error.ReadFailed => {
+                    if (connection.check_close_notify) return error.NoCloseNotify;
+                    return;
+                },
+                else => return err,
+            };
+            // No `abort` here: an alert cannot go back out after our
+            // close_notify, so the error is reported and nothing is
+            // written. `Unclean-Shutdown-Alert` is the case that reads
+            // it.
+            const event = machine.handleRecord(one, &pump.out) catch |err| {
+                pump.linger();
+                return err;
+            };
+            if (event == .closed) return;
+        }
+        return error.TooManyRecords;
+    }
+
     /// Read what the peer still had in flight, then let the socket go.
     /// Closing on top of an unread window is a reset, and a peer whose
     /// write is cut short reports a broken pipe rather than the alert we
@@ -743,7 +782,7 @@ const Pump = struct {
         }
         if (connection.shim_shuts_down) {
             try pump.write(try machine.sendClose(&pump.out));
-            return;
+            return pump.awaitPeerClose(machine, connection);
         }
 
         var records_seen: u32 = 0;
@@ -772,11 +811,10 @@ const Pump = struct {
                     ) catch |err| return pump.abort(machine, err);
                     try pump.write(sealed);
                 },
-                // A peer's close_notify retires the machine inside
-                // `handleRecord`, so there is nothing left to answer
-                // with: zssl models a close as ending the session, not
-                // as the half-close §6.1 permits. The socket close is
-                // the whole of our reply.
+                // The peer closed its write side. §6.1 leaves ours
+                // open and an embedder may answer, which zssl now
+                // models — but BoGo's cases here do not ask for a
+                // reply, so the socket close is still the whole of it.
                 .closed => return,
                 .send => |bytes| try pump.write(bytes),
                 .none => {},
