@@ -6,8 +6,8 @@ on:
   pull_request:
 
 # A push that lands while an earlier run is still going supersedes it:
-# the BoGo job takes minutes and there is no value in finishing a run
-# for a commit that is already history.
+# the two adversarial jobs take minutes each and there is no value in
+# finishing a run for a commit that is already history.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -19,9 +19,11 @@ env:
   KCOV_VERSION: v43
 
 jobs:
-  # The gates CLAUDE.md names, minus BoGo, which is slow enough to want
-  # its own job. ReleaseSafe is run because it is what releases ship and
-  # assertions stay on there.
+  # The gates CLAUDE.md names that need nothing fetched. The two
+  # adversarial ones each want their own job: they pin a third-party
+  # corpus, so they need network on a cold run and minutes on a warm one.
+  # ReleaseSafe is run because it is what releases ship and assertions
+  # stay on there.
   gates:
     runs-on: ubuntu-latest
     steps:
@@ -62,6 +64,50 @@ jobs:
           path: zig-out/bogo/bogo.log
           if-no-files-found: ignore
 
+  # tlsfuzzer's scripts against our server. Its own job for the same
+  # reasons BoGo has one: a pinned checkout to fetch, an interpreter to
+  # find, and a corpus that takes long enough to be worth running beside
+  # the fast gates rather than behind them.
+  #
+  # This job is why the floor in tlsfuzzer/run.zig means anything. Until
+  # it existed the gate ran only on whichever machine last happened to
+  # run it, so a regression in the ledger — a lowered floor, a script
+  # quietly disabled — reached main green.
+  tlsfuzzer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      # The checkout and the virtualenv, keyed on the file that carries
+      # the pin and the requirements. A pin bump misses the cache and
+      # refetches, which is exactly when it should.
+      - name: cache the pinned corpus
+        uses: actions/cache@v4
+        with:
+          path: zig-out/tlsfuzzer
+          key: tlsfuzzer-${{ hashFiles('tlsfuzzer/run.zig') }}-${{ runner.os }}
+      # The runner's own python3 rather than a pinned one: the gate
+      # builds a virtualenv holding tlsfuzzer's pinned tlslite-ng, so the
+      # interpreter is the only loose variable and tlsfuzzer supports the
+      # range ubuntu-latest ships.
+      #
+      # Deliberately not `|| [ $? -eq 2 ]`, which is how the interop step
+      # tolerates its SKIP. Exit 2 here means no python3 or no network,
+      # and on this runner both are present — so a 2 is an infrastructure
+      # failure, and swallowing it would turn the gate off silently. That
+      # is the one thing every ledger policy in this repo exists to stop.
+      - name: tlsfuzzer
+        run: zig build tlsfuzzer
+      - name: upload the script log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlsfuzzer-log
+          path: zig-out/tlsfuzzer/tlsfuzzer.log
+          if-no-files-found: ignore
+
   # Coverage without a third party: kcov produces the number, CI writes it
   # to an orphan `badges` branch in this repository, and shields.io reads
   # that branch through its endpoint API. The only credential involved is
@@ -74,9 +120,18 @@ jobs:
     #
     # It is *not* here because of a version bug. An earlier commit
     # message blamed kcov 38 for the 0% badge; that was a hypothesis
-    # stated as fact, and it was wrong. kcov 43 reported 0% too. The
-    # cause was the include pattern in build.zig matching no files on
-    # Linux, and that is fixed there.
+    # stated as fact, and it was wrong. kcov 43 reported 0% too.
+    #
+    # So was the guess that replaced it — that the include pattern
+    # matched no files — which this comment asserted until the
+    # diagnostic step below actually measured. kcov saw 888 files, every
+    # one of them vendored OpenSSL C and not one of them Zig: the
+    # self-hosted x86_64 backend, Zig's Debug default on Linux, emits
+    # DWARF kcov cannot map, while the C beside it goes through clang
+    # and maps fine. macOS defaults to LLVM, which is why the same
+    # command measured 97% locally and hid it. `zig build coverage`
+    # builds its own test binary with `use_llvm = true`; `zig build
+    # test` is untouched.
     runs-on: ubuntu-latest
     permissions:
       contents: write
