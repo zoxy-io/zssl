@@ -276,15 +276,27 @@ three documents name every one, with a reason.
 
 ## Development
 
+Most of the gates below shell out to something Zig does not bring:
+`interop` to a real `openssl` binary, `bogo` to a Go toolchain,
+`tlsfuzzer` to a python3, both of those to `git` for their pinned
+checkouts, `tlsanvil` to a Docker daemon, and `coverage` to kcov. Each
+degrades to a readable SKIP when its tool is missing — and a SKIP is not
+a failure, so an incomplete toolchain turns gates off quietly.
+[devenv](https://devenv.sh) supplies every one of them that is a binary:
+install it alongside [direnv](https://direnv.net), run `direnv allow`,
+and the pinned shell loads on `cd`. Without direnv, `devenv shell` does
+the same by hand. The Docker daemon TLS-Anvil needs is yours to run.
+
 ```sh
 zig build test                          # the suite
 zig build test -Doptimize=ReleaseSafe   # the mode releases ship
 zig build interop                       # against a real openssl binary
 zig build bogo                          # against BoringSSL's BoGo runner
 zig build tlsfuzzer                     # against tlsfuzzer's scripts
+zig build tlsanvil                      # against TLS-Anvil's RFC-derived corpus
 zig build tlsfuzzer-server -- --port 4433   # that server alone, to hand-drive
 zig build coverage                      # line coverage, needs kcov (Linux)
-zig fmt --check src interop bogo tlsfuzzer scripts build.zig build.zig.zon
+zig fmt --check src interop bogo tlsanvil tlsfuzzer scripts build.zig build.zig.zon
 ```
 
 RFC 8448 vectors are generated, never transcribed:

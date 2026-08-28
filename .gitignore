@@ -4,3 +4,9 @@ zig-out/
 # output, never vendored: build.zig.zon's content hash is the record of
 # what we build against.
 /zig-pkg/
+
+# direnv / devenv working state (.envrc, devenv.nix, devenv.yaml and
+# devenv.lock are tracked; what they generate is not).
+.direnv/
+.devenv*
+devenv.local.nix

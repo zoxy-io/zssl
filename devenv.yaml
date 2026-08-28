@@ -1,0 +1,8 @@
+# devenv inputs (https://devenv.sh/inputs/). The same nixpkgs branch the
+# sibling zoxy checkout pins, so both trees resolve the same zig_0_16 —
+# one toolchain per binary is the rule build.zig.zon already states about
+# libcrypto, and a dev shell that disagreed with zoxy's would be the same
+# class of drift. The exact revision lands in devenv.lock.
+inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixos-unstable
