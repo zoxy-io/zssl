@@ -1,117 +1,24 @@
-name: ci
+name: coverage
 
+# Coverage without a third party: kcov produces the number, this workflow
+# writes it to an orphan `badges` branch in this repository, and
+# shields.io reads that branch through its endpoint API. The only
+# credential involved is the token GitHub already hands the job.
 on:
   push:
     branches: [main]
   pull_request:
 
-# A push that lands while an earlier run is still going supersedes it:
-# the two adversarial jobs take minutes each and there is no value in
-# finishing a run for a commit that is already history.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  ZIG_VERSION: 0.16.0
   # The version whose output is verified locally, so CI measures with
   # the same tool rather than whatever an archive happens to carry.
   KCOV_VERSION: v43
 
 jobs:
-  # The gates CLAUDE.md names that need nothing fetched. The two
-  # adversarial ones each want their own job: they pin a third-party
-  # corpus, so they need network on a cold run and minutes on a warm one.
-  # ReleaseSafe is run because it is what releases ship and assertions
-  # stay on there.
-  gates:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-      - name: format
-        run: zig fmt --check src interop bogo tlsfuzzer scripts build.zig build.zig.zon
-      - name: test
-        run: zig build test
-      - name: test (ReleaseSafe)
-        run: zig build test -Doptimize=ReleaseSafe
-      - name: interop
-        # Exit 2 is the gate's own SKIP; ubuntu ships an openssl that
-        # speaks 1.3, so it should not fire, and a SKIP is not a failure.
-        run: zig build interop || [ $? -eq 2 ]
-
-  # BoringSSL's adversarial runner. Fetches the pinned checkout on first
-  # run, so this job is the one that needs network and Go.
-  bogo:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-      - name: bogo
-        run: zig build bogo
-      - name: upload the runner log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bogo-log
-          path: zig-out/bogo/bogo.log
-          if-no-files-found: ignore
-
-  # tlsfuzzer's scripts against our server. Its own job for the same
-  # reasons BoGo has one: a pinned checkout to fetch, an interpreter to
-  # find, and a corpus that takes long enough to be worth running beside
-  # the fast gates rather than behind them.
-  #
-  # This job is why the floor in tlsfuzzer/run.zig means anything. Until
-  # it existed the gate ran only on whichever machine last happened to
-  # run it, so a regression in the ledger — a lowered floor, a script
-  # quietly disabled — reached main green.
-  tlsfuzzer:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-      # The checkout and the virtualenv, keyed on the file that carries
-      # the pin and the requirements. A pin bump misses the cache and
-      # refetches, which is exactly when it should.
-      - name: cache the pinned corpus
-        uses: actions/cache@v4
-        with:
-          path: zig-out/tlsfuzzer
-          key: tlsfuzzer-${{ hashFiles('tlsfuzzer/run.zig') }}-${{ runner.os }}
-      # The runner's own python3 rather than a pinned one: the gate
-      # builds a virtualenv holding tlsfuzzer's pinned tlslite-ng, so the
-      # interpreter is the only loose variable and tlsfuzzer supports the
-      # range ubuntu-latest ships.
-      #
-      # Deliberately not `|| [ $? -eq 2 ]`, which is how the interop step
-      # tolerates its SKIP. Exit 2 here means no python3 or no network,
-      # and on this runner both are present — so a 2 is an infrastructure
-      # failure, and swallowing it would turn the gate off silently. That
-      # is the one thing every ledger policy in this repo exists to stop.
-      - name: tlsfuzzer
-        run: zig build tlsfuzzer
-      - name: upload the script log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tlsfuzzer-log
-          path: zig-out/tlsfuzzer/tlsfuzzer.log
-          if-no-files-found: ignore
-
-  # Coverage without a third party: kcov produces the number, CI writes it
-  # to an orphan `badges` branch in this repository, and shields.io reads
-  # that branch through its endpoint API. The only credential involved is
-  # the token GitHub already hands the job.
   coverage:
     # kcov is built from a pinned tag rather than installed from apt,
     # because it is packaged only for jammy — absent from noble onward,
@@ -137,9 +44,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
+      - uses: ./.github/actions/zig
       - name: cache kcov
         id: kcov-cache
         uses: actions/cache@v4

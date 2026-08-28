@@ -1,0 +1,31 @@
+name: bogo
+
+# BoringSSL's adversarial runner. Fetches the pinned checkout on first
+# run, so this workflow is the one that needs network and Go.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bogo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/zig
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: bogo
+        run: zig build bogo
+      - name: upload the runner log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bogo-log
+          path: zig-out/bogo/bogo.log
+          if-no-files-found: ignore

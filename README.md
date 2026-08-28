@@ -1,7 +1,8 @@
 # zssl
 
-[![ci](https://github.com/zoxy-io/zssl/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/ci.yml)
-[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzoxy-io%2Fzssl%2Fbadges%2Fcoverage.json)](https://github.com/zoxy-io/zssl/actions/workflows/ci.yml)
+[![test](https://github.com/zoxy-io/zssl/actions/workflows/test.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/test.yml)
+[![fmt](https://github.com/zoxy-io/zssl/actions/workflows/fmt.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fmt.yml)
+[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzoxy-io%2Fzssl%2Fbadges%2Fcoverage.json)](https://github.com/zoxy-io/zssl/actions/workflows/coverage.yml)
 
 A sans-I/O TLS 1.3 library in Zig, over libcrypto primitives.
 
@@ -252,17 +253,18 @@ everything else runs on every build.
 
 | Oracle | Status | Details |
 | --- | --- | --- |
-| [**BoGo**](docs/BOGO.md) | [![bogo passing](https://img.shields.io/badge/bogo-261%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | Hostile-peer corpus; checks *which* alert we send |
-| [**tlsfuzzer**](docs/TLSFUZZER.md) | [![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-15%2F57%20scripts-yellow)](docs/TLSFUZZER.md) | A third implementation, driving our *server* |
-| [**RFC 8448**](src/rfc8448_test.zig) | `zig build test` | The RFC's traced bytes, reproduced exactly |
-| [**OpenSSL**](interop/main.zig) | `zig build interop` | Three legs against a real `openssl` binary |
-| [**`std.crypto.tls`**](src/std_interop_test.zig) | `zig build test` | A second stack, in memory, both directions |
-| [**Fuzzing**](src/fuzz_test.zig) | `zig build test` | Nine targets: a value or an error, never a panic |
+| [**BoGo**](docs/BOGO.md) | [![bogo](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml)<br>[![bogo passing](https://img.shields.io/badge/bogo-261%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | Hostile-peer corpus; checks *which* alert we send |
+| [**tlsfuzzer**](docs/TLSFUZZER.md) | [![tlsfuzzer](https://github.com/zoxy-io/zssl/actions/workflows/tlsfuzzer.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/tlsfuzzer.yml)<br>[![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-15%2F57%20scripts-yellow)](docs/TLSFUZZER.md) | A third implementation, driving our *server* |
+| [**RFC 8448**](src/rfc8448_test.zig) | [![rfc8448](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml) | The RFC's traced bytes, reproduced exactly |
+| [**OpenSSL**](interop/main.zig) | [![interop](https://github.com/zoxy-io/zssl/actions/workflows/interop.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/interop.yml) | Three legs against a real `openssl` binary |
+| [**`std.crypto.tls`**](src/std_interop_test.zig) | [![std.crypto.tls](https://github.com/zoxy-io/zssl/actions/workflows/std-interop.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/std-interop.yml) | A second stack, in memory, both directions |
+| [**Fuzzing**](src/fuzz_test.zig) | [![fuzz](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml) | Nine targets: a value or an error, never a panic |
 
-A badge means the gate holds a passing count against a floor, so a
-regression or a quiet suppression stops the build. The rows carrying a
-command instead are pass/fail suites with no floor to hold: they run on
-every build, and the `ci` badge at the top of this file is their status.
+Every row is its own CI workflow, so the first badge is that workflow's
+last result and the rows run in parallel. BoGo and tlsfuzzer carry a
+second kind of badge underneath: a counted one, because those two gates
+hold a passing count against a floor, and a regression or a quiet
+suppression has to stop the build rather than merely be visible.
 
 Both adversarial gates run at a pinned commit. BoGo covers 134 client and
 127 server cases; tlsfuzzer covers 1261 conversations, among them every

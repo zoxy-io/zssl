@@ -1,0 +1,52 @@
+name: tlsfuzzer
+
+# tlsfuzzer's scripts against our server. Its own workflow for the same
+# reasons BoGo has one: a pinned checkout to fetch, an interpreter to
+# find, and a corpus that takes minutes.
+#
+# This workflow is why the floor in tlsfuzzer/run.zig means anything.
+# Until it existed the gate ran only on whichever machine last happened
+# to run it, so a regression in the ledger — a lowered floor, a script
+# quietly disabled — reached main green.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tlsfuzzer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/zig
+      # The checkout and the virtualenv, keyed on the file that carries
+      # the pin and the requirements. A pin bump misses the cache and
+      # refetches, which is exactly when it should.
+      - name: cache the pinned corpus
+        uses: actions/cache@v4
+        with:
+          path: zig-out/tlsfuzzer
+          key: tlsfuzzer-${{ hashFiles('tlsfuzzer/run.zig') }}-${{ runner.os }}
+      # The runner's own python3 rather than a pinned one: the gate
+      # builds a virtualenv holding tlsfuzzer's pinned tlslite-ng, so the
+      # interpreter is the only loose variable and tlsfuzzer supports the
+      # range ubuntu-latest ships.
+      #
+      # Deliberately not `|| [ $? -eq 2 ]`, which is how the interop step
+      # tolerates its SKIP. Exit 2 here means no python3 or no network,
+      # and on this runner both are present — so a 2 is an infrastructure
+      # failure, and swallowing it would turn the gate off silently. That
+      # is the one thing every ledger policy in this repo exists to stop.
+      - name: tlsfuzzer
+        run: zig build tlsfuzzer
+      - name: upload the script log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlsfuzzer-log
+          path: zig-out/tlsfuzzer/tlsfuzzer.log
+          if-no-files-found: ignore

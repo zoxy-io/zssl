@@ -1,0 +1,22 @@
+name: std-interop
+
+# One workflow per check, so each carries its own badge and its own
+# result. They share `.github/actions/zig`, which is where the toolchain
+# version lives — nine copies of a version string would drift.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  std-interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/zig
+      - name: std.crypto.tls
+        run: zig build test-std-interop

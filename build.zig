@@ -28,6 +28,50 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{ .root_module = zssl_module });
     const module_tests = b.addRunArtifact(unit_tests);
 
+    // One step per oracle that lives in the suite, so each can carry its
+    // own CI workflow and its own badge.
+    //
+    // Split by *file* rather than by `filters`, deliberately. A
+    // compile-time filter that matches nothing still builds, runs zero
+    // tests and exits 0 — a green badge over an empty run, which is the
+    // one failure this tree treats as worse than a red one. A file either
+    // holds tests or does not compile. (Zig 0.16 has no runtime
+    // `--test-filter`; its test runner panics on the argument.)
+    //
+    // `zig build test` still runs everything through `src/root.zig`, and
+    // remains the authority. These are windows onto it, not a partition
+    // of it.
+    const Suite = struct { step: []const u8, file: []const u8, blurb: []const u8 };
+    const suites = [_]Suite{
+        .{
+            .step = "test-rfc8448",
+            .file = "src/rfc8448_test.zig",
+            .blurb = "RFC 8448's traced bytes, replayed",
+        },
+        .{
+            .step = "test-std-interop",
+            .file = "src/std_interop_test.zig",
+            .blurb = "A handshake against std.crypto.tls",
+        },
+        .{
+            .step = "test-fuzz",
+            .file = "src/fuzz_test.zig",
+            .blurb = "Fuzz targets over parsers and both machines",
+        },
+    };
+    for (suites) |suite| {
+        const suite_module = b.createModule(.{
+            .root_source_file = b.path(suite.file),
+            .target = target,
+            .optimize = optimize,
+        });
+        suite_module.link_libc = true;
+        suite_module.linkLibrary(libcrypto);
+        const suite_tests = b.addTest(.{ .root_module = suite_module });
+        const suite_run = b.addRunArtifact(suite_tests);
+        b.step(suite.step, suite.blurb).dependOn(&suite_run.step);
+    }
+
     // A second build of the same tests, for kcov only.
     //
     // `use_llvm` is the whole point. Zig's self-hosted x86_64 backend is
