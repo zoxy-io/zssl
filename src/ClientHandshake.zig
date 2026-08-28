@@ -93,6 +93,16 @@ const leaf_public_key_bytes_max: u16 = 560;
 
 const LeafKeyKind = enum { none, ecdsa, rsa };
 
+/// draft-ietf-tls-tlsflags. Not a flag zssl acts on — the extension is
+/// validated and dropped — but §4.6.1's block is checked rather than
+/// skipped, so its grammar has to be known.
+const extension_tls_flags: u16 = 62;
+
+/// A NewSessionTicket's extension block is short by nature: early data,
+/// flags, and whatever a future draft adds. The bound is a refusal, not
+/// an invariant.
+const ticket_extensions_max: u16 = 16;
+
 pub const State = enum(u8) {
     idle,
     awaiting_server_hello,
@@ -253,6 +263,13 @@ pub const Error = backend.Error || protect.Error || session_keys.Error ||
     DecryptError,
     /// The server selected an ALPN protocol we did not offer (RFC 7301).
     BadAlpn,
+    /// A field that parses but is not minimally encoded, where its
+    /// grammar demands that it be — a NewSessionTicket flag list ending
+    /// in a zero byte. Well-framed and still wrong, so §6.2's
+    /// illegal_parameter rather than decode_error.
+    NonMinimalEncoding,
+    /// More extensions in a block than the bound above admits.
+    ExtensionOverflow,
     PeerAlert,
 };
 
@@ -869,6 +886,55 @@ fn handlePostHandshake(self: *ClientHandshake, arm: anytype, out: []u8) Error!Ev
     }
 }
 
+/// §4.6.1's `extensions<0..2^16-2>` on a NewSessionTicket. zssl uses
+/// none of them — no early data, no resumption_across_names — but a
+/// block we ignore is not a block we may leave unread: an extension
+/// whose body does not parse is a malformed message whether or not its
+/// meaning would have changed anything, and skipping the block was
+/// finding 7.
+///
+/// §4.2's duplicate rule applies to this block like any other, so the
+/// same pre-pass finding 9 added runs here first.
+fn checkTicketExtensions(block: []const u8) Error!void {
+    try wire.refuseDuplicateExtensions(ticket_extensions_max, block);
+    var cursor = wire.Cursor.init(block);
+    var seen: u16 = 0;
+    while (cursor.remaining() > 0) : (seen += 1) {
+        if (seen == ticket_extensions_max) return error.ExtensionOverflow;
+        assert(seen < ticket_extensions_max);
+        const extension_type = try cursor.takeU16();
+        const data = try cursor.takeSlice(try cursor.takeU16());
+        // Only the ones with a grammar we can hold them to. An unknown
+        // extension's body is opaque by definition and there is nothing
+        // to check it against.
+        if (extension_type == extension_tls_flags) try checkTlsFlags(data);
+    }
+    assert(cursor.remaining() == 0);
+}
+
+/// The `tls_flags` extension: `flags<1..255>`, one bit per flag, and the
+/// encoding must be minimal — a trailing zero byte carries no flag and
+/// so must not be there. From draft-ietf-tls-tlsflags, and cited without
+/// a section number on purpose: what this was actually written against
+/// is BoringSSL's `flagSet.unmarshalExtensionValue`
+/// (`ssl/test/runner/handshake_messages.go`), which is the oracle that
+/// checks it and is pinned by digest in bogo/run.zig.
+///
+/// The two refusals answer differently on purpose, which is what BoGo
+/// measures. An empty or over-long list is framing that does not parse:
+/// §6.2's decode_error. A list that parses but ends in a zero byte is
+/// well-framed and says something the grammar forbids, which is an
+/// illegal parameter rather than a decode failure.
+fn checkTlsFlags(data: []const u8) Error!void {
+    var cursor = wire.Cursor.init(data);
+    const flag_bytes = try cursor.takeByte();
+    if (flag_bytes == 0) return error.MalformedExtension;
+    const flags = try cursor.takeSlice(flag_bytes);
+    if (cursor.remaining() != 0) return error.MalformedExtension;
+    assert(flags.len >= 1);
+    if (flags[flags.len - 1] == 0) return error.NonMinimalEncoding;
+}
+
 fn parseTicket(body: []const u8) Error!Ticket {
     var cursor = wire.Cursor.init(body);
     var ticket: Ticket = undefined;
@@ -886,8 +952,9 @@ fn parseTicket(body: []const u8) Error!Ticket {
     if (ticket_bytes == 0) return error.MalformedMessage;
     ticket.ticket = try cursor.takeSlice(ticket_bytes);
     const extensions_bytes = try cursor.takeU16();
-    _ = try cursor.takeSlice(extensions_bytes);
+    const extensions = try cursor.takeSlice(extensions_bytes);
     if (cursor.remaining() != 0) return error.MalformedMessage;
+    try checkTicketExtensions(extensions);
     assert(ticket.nonce.len >= 1);
     assert(ticket.ticket.len >= 1);
     return ticket;
@@ -1141,4 +1208,72 @@ fn ArmOf(comptime suite: CipherSuite) type {
             return builder.written();
         }
     };
+}
+
+test "§4.6.1: a NewSessionTicket's extension block is checked, not skipped" {
+    // Finding 7. zssl acts on none of these extensions, and a block we
+    // ignore was a block we left unread — an extension whose body does
+    // not parse is a malformed message whether or not its meaning would
+    // have changed anything.
+    //
+    // The two refusals differ on purpose. Framing that does not parse is
+    // decode_error; a flag list that parses and then ends in a zero byte
+    // is well-framed and says something draft-ietf-tls-tlsflags forbids,
+    // which is an illegal parameter.
+    const tls_flags: u16 = 62;
+
+    // A NewSessionTicket carrying exactly one extension, built in a
+    // fixed buffer — this tree has no allocator and its tests do not
+    // get one either.
+    const build = struct {
+        fn ticket(out: []u8, extension_type: u16, body: []const u8) []const u8 {
+            var b = wire.Builder.init(out);
+            b.putU32(7200); // lifetime
+            b.putU32(0); // age_add
+            b.putByte(1); // ticket_nonce<1>
+            b.putByte(0);
+            b.putU16(1); // ticket<1>
+            b.putByte(0xaa);
+            b.putU16(@intCast(4 + body.len)); // extensions<>
+            b.putU16(extension_type);
+            b.putU16(@intCast(body.len));
+            b.putSlice(body);
+            return b.written();
+        }
+    };
+
+    var buffer: [64]u8 = undefined;
+    const Case = struct { name: []const u8, body: []const u8, want: anyerror };
+    for ([_]Case{
+        // flags<1..255> with a zero-length list.
+        .{ .name = "empty", .body = &.{0}, .want = error.MalformedExtension },
+        // A set flag followed by a padding byte that carries none.
+        .{ .name = "non-minimal", .body = &.{ 2, 0x02, 0x00 }, .want = error.NonMinimalEncoding },
+        // The length prefix disagreeing with what follows it.
+        .{ .name = "trailing", .body = &.{ 1, 0x02, 0x99 }, .want = error.MalformedExtension },
+        .{ .name = "truncated", .body = &.{ 2, 0x02 }, .want = error.Truncated },
+    }) |case| {
+        const bytes = build.ticket(&buffer, tls_flags, case.body);
+        std.testing.expectError(case.want, parseTicket(bytes)) catch |err| {
+            std.debug.print("case '{s}' did not refuse as expected\n", .{case.name});
+            return err;
+        };
+    }
+
+    // A well-formed list is accepted, including bits we do not know: an
+    // unknown flag is not a malformed one, which is what BoGo's
+    // `UnknownTicketFlags` cases say and what this must not break.
+    {
+        const bytes = build.ticket(&buffer, tls_flags, &.{ 2, 0x01, 0x80 });
+        const parsed = try parseTicket(bytes);
+        try std.testing.expectEqual(@as(u32, 7200), parsed.lifetime_s);
+    }
+
+    // An extension zssl has no grammar for is opaque by definition, and
+    // its body is left alone rather than guessed at.
+    {
+        const bytes = build.ticket(&buffer, 0xbaad, &.{ 0xde, 0xad, 0xbe, 0xef });
+        const parsed = try parseTicket(bytes);
+        try std.testing.expectEqual(@as(u32, 7200), parsed.lifetime_s);
+    }
 }

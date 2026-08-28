@@ -382,6 +382,7 @@ fn alertFor(err: anyerror) ?zssl.alert.Description {
         error.IllegalCompression,
         error.PskNotLast,
         error.BadKeyShare,
+        error.NonMinimalEncoding,
         => .illegal_parameter,
         error.MalformedAlert,
         error.BadAlert,

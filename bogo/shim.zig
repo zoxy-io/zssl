@@ -880,6 +880,7 @@ fn alertFor(err: anyerror) ?alert.Description {
         error.IllegalCompression,
         error.PskNotLast,
         error.BadKeyShare,
+        error.NonMinimalEncoding,
         => .illegal_parameter,
         // A well-formed message larger than the reassembly space the
         // embedder handed us. That is our capacity, not the peer's

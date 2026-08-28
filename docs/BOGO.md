@@ -41,8 +41,8 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**269 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. 141 drive
+**271 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. 143 drive
 `ClientHandshake` and 128 drive `ServerHandshake`. The server number was
 6 until RSA signing landed, 100 until secp256r1/secp384r1 did, 110 until
 §9.2's `missing_extension` did, 111 until §5.4's inner-plaintext cap did,
@@ -52,7 +52,8 @@ psk_key_exchange_modes was enforced, and 127 until §4.2's duplicate rule
 did. The client number was 121 until §4.2's unsupported_extension
 landed, 134 until finding 4's flood ceilings did, 136 until finding 5
 stopped refusing `user_canceled`, 139 until that same duplicate rule,
-and 140 until finding 6 split the close in two; see below.
+140 until finding 6 split the close in two, and 141 until finding 7
+read the ticket's extension block; see below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
 either gets fixed or gets an entry in `DisabledTests` with a one-line
@@ -133,9 +134,9 @@ Three bugs, fixed in this slice:
    flight was at least 500 bytes, which a legitimately small ECDSA leaf
    falsifies. The floor is now the encoded chain's own size.
 
-Twelve more were open. Seven are fixed outright — 2, 3, 4, 5, 6, 9 and
-12 — and five still carry ledger entries, 17 suppressed cases between
-them. Two of those five are no longer gaps in the sense the word
+Twelve more were open. Eight are fixed outright — 2, 3, 4, 5, 6, 7, 9
+and 12 — and four still carry ledger entries, 15 suppressed cases
+between them. Two of those four are no longer gaps in the sense the word
 implies: 11 is a documented non-defect and 8 is down to two divergences
 we intend to keep.
 All twelve keep their numbers rather than being renumbered, because the
@@ -314,8 +315,28 @@ name.
    translation: zssl reports *that* the peer sent a fatal alert and
    never *which*, so an embedder needing the description does not have
    it.
-7. **NewSessionTicket extension bodies are not checked** for a minimal
-   encoding.
+7. **FIXED — NewSessionTicket extension bodies were not checked** for a
+   minimal encoding. §4.6.1's `extensions` block was read as a length
+   and skipped, which is not the same as ignoring it: zssl acts on none
+   of these extensions, but an extension whose body does not parse is a
+   malformed message whether or not its meaning would have changed
+   anything. The block is walked now, and each extension with a grammar
+   we know is held to it. An unknown one stays opaque — there is nothing
+   to check it against, and BoGo's `UnknownTicketFlags` cases say so.
+
+   `tls_flags` (draft-ietf-tls-tlsflags, extension 62) is the one with a
+   grammar: `flags<1..255>`, one bit per flag, minimally encoded. The
+   two refusals answer differently, which is the part worth measuring
+   rather than assuming. An empty or over-long list is framing that does
+   not parse — §6.2's decode_error, `TLS13-Client-EmptyTicketFlags`. A
+   list that parses and then ends in a zero byte is well framed and says
+   something the grammar forbids, so it is an illegal parameter rather
+   than a decode failure: `TLS13-Client-NonminimalTicketFlags`, and the
+   new `NonMinimalEncoding` carries it.
+
+   §4.2's duplicate rule applies to this block like any other, so
+   finding 9's pre-pass runs here too — a fourth extension block, and
+   the reason that check went into `wire` rather than into a parser.
 8. **Two alert choices we mean to keep**, down from 19. What was here
    was never one finding, and the label cost four slices:
 
