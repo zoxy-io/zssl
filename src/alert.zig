@@ -1,6 +1,14 @@
-//! TLS alerts (RFC 8446 §6): two bytes, and in 1.3 the level byte carries
-//! no information the description doesn't — every alert but close_notify
-//! and user_canceled is fatal by definition, whatever level it claims.
+//! TLS alerts (RFC 8446 §6): two bytes, of which the description does
+//! nearly all the work. TLS 1.3 deprecates the level byte and §6 makes
+//! every alert but close_notify and user_canceled fatal whatever level
+//! it claims — so for those, the level tells a reader nothing.
+//!
+//! `user_canceled` is the exception, and it is not a small one:
+//! `disposition` tolerates it at warning level and treats it as fatal at
+//! fatal level, because §6.1 leaves it legal as a *signal* and a peer
+//! sending it fatally is aborting. Reading the level as decoration there
+//! would discard a peer's abort. This comment used to say the byte
+//! carried no information at all, which was true until that arrived.
 
 const std = @import("std");
 const assert = std.debug.assert;

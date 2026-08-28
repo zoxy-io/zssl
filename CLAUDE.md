@@ -87,9 +87,24 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
   TLS 1.3-only server, so that count comes from the tool and is not ours
   to maintain.
 - `bogo/config.json` is a **ledger**: every `DisabledTests` entry carries
-  a one-line reason, and one that reads "OPEN GAP" points at a numbered
-  finding in docs/BOGO.md. Never add an entry without a reason, and never
-  lower `passing_floor` to make a run green.
+  a one-line reason. Most are by-design exclusions — a version we do not
+  speak, a feature DESIGN.md §1 puts out of scope — and those are plain
+  prose. An entry that cites a numbered finding in docs/BOGO.md opens
+  with a marker saying which kind of thing it is:
+
+  - **OPEN GAP** — a defect we intend to fix.
+  - **SCOPE** — the case needs a capability we have decided not to
+    carry, so it is waiting on that decision rather than on a fix.
+  - **KEEP** — we refuse the input exactly as BoGo wants and differ only
+    in which alert we send, having argued ours is the better answer.
+  - **Not a defect** — the case encodes the runner's own policy rather
+    than a requirement.
+
+  Only the first is a gap, so `grep 'OPEN GAP'` is the count of what is
+  actually open. Keep it that way: a case that turns out to be a scope
+  decision or a divergence gets re-marked rather than left overstating
+  itself. Never add an entry without a reason, and never lower
+  `passing_floor` to make a run green.
 - The coverage badge is served from this repository, not a third party:
   the `coverage` job writes `coverage.json` to an orphan `badges` branch
   and shields.io reads it through its endpoint API, so the only

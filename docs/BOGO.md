@@ -374,7 +374,12 @@ name.
      `UnknownContentType` rather than the catch-all for a record that
      never yielded a type at all.
 
-   The two that remain are genuine disagreements, and we keep our answer:
+   The two that remain are genuine disagreements, and we keep our
+   answer. Their ledger entries read "KEEP" rather than "OPEN GAP",
+   because nothing here is unfixed: both cases refuse the input exactly
+   as BoGo wants, and only the alert description differs. Reserving
+   "OPEN GAP" for defects is what lets `grep 'OPEN GAP'` be the count of
+   what is actually open.
 
    - `SendBogusAlertType` sends an alert whose level byte is 0x42. We
      answer decode_error, BoringSSL illegal_parameter. Neither is
