@@ -782,3 +782,42 @@ test "a protected record that is nothing but its content type is refused, not as
         },
     }
 }
+
+test "an alert the server sends before the client's Finished is readable by the client" {
+    // §4.4.4: the server's write keys become application keys the moment
+    // its Finished goes out — that is what makes 0.5-RTT data legal — and
+    // the client installs its application *read* keys as soon as it has
+    // verified that Finished. So the window between the server's Finished
+    // and the client's is served by application keys in both directions.
+    //
+    // A server that keeps sealing with its handshake protector through
+    // that window sends alerts its peer cannot open. That matters most
+    // for the one alert this state exists to send: the refusal of a
+    // client Finished that does not verify.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+
+    // Drive the handshake until the client is connected, but never hand
+    // the client's Finished to the server: that is the window.
+    const hello = harness.client.start(&buffers.client_out);
+    const flight = try harness.server.handleRecord(hello, &buffers.server_out);
+    var index: usize = 0;
+    var count: u8 = 0;
+    while (index < flight.send.len) : (count += 1) {
+        try testing.expect(count < 8);
+        const one = recordAt(flight.send, index);
+        _ = try harness.client.handleRecord(one, &buffers.scratch);
+        index += one.len;
+    }
+    try testing.expectEqual(ClientHandshake.State.connected, harness.client.state);
+    try testing.expectEqual(ServerHandshake.State.awaiting_finished, harness.server.state);
+
+    const sealed = harness.server.sendAlert(.decrypt_error, &buffers.server_out);
+    try testing.expect(sealed.len >= 1);
+    try testing.expectError(
+        error.PeerAlert,
+        harness.client.handleRecord(sealed, &buffers.scratch),
+    );
+}

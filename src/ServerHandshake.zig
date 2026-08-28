@@ -121,6 +121,11 @@ pub const Error = backend.SignError || protect.Error || handshake.Assembler.Erro
     UnexpectedMessage,
     /// No common cipher suite, group, or signature scheme (§4.1.1).
     HandshakeFailure,
+    /// A ClientHello negotiating TLS 1.3 that omits an extension §9.2
+    /// makes mandatory — `supported_groups` or `key_share`. Distinct
+    /// from HandshakeFailure, which is an extension that is present and
+    /// offers nothing we hold.
+    MissingExtension,
     /// The client offered ALPN and nothing on it matched (RFC 7301 §3.2).
     NoApplicationProtocol,
     /// The client's second ClientHello broke an HRR rule (§4.1.4).
@@ -247,6 +252,26 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
     }
 
     assert(self.state == .awaiting_client_hello);
+    // §9.2: a ClientHello negotiating TLS 1.3 over (EC)DHE must carry
+    // both `supported_groups` and `key_share`, and a server receiving one
+    // that does not "MUST abort the handshake with a missing_extension
+    // alert". A hello carrying `supported_groups` is attempting (EC)DHE,
+    // so one without `key_share` has forgotten half of it.
+    //
+    // Omission is the error. An *empty* `client_shares`, or one holding
+    // only groups we skip, is the legal §4.2.8 way to ask the server to
+    // choose, and earns the HelloRetryRequest below — the two are
+    // indistinguishable by `key_share_count` alone, which is why the
+    // parser records presence separately and why this sits ahead of the
+    // retry path.
+    //
+    // Neither extension present is a different case: a client not
+    // offering (EC)DHE at all, which §9.2 does not reach. zssl requires
+    // (EC)DHE in every mode (DESIGN §6), so that refusal is a
+    // handshake_failure, and the branch below produces it.
+    if (hello.supported_groups_wire != null and !hello.has_key_share) {
+        return error.MissingExtension;
+    }
     if (hello.preferredKeyShare()) |offered| {
         // §4.2.8 leaves the choice to us among what the client sent.
         self.key_share_group = backend.Group.fromWire(offered.group).?;
@@ -425,7 +450,7 @@ fn acceptClientHello(
             if (first_flight) builder.putSlice(&server_messages.change_cipher_spec_record);
             const sealed = try arm.send.?.seal(.handshake, flight, builder.bytes[builder.index..]);
             builder.index += sealed.len;
-            arm.finishFlight();
+            try arm.finishFlight();
             self.state = .awaiting_finished;
             return .{ .send = builder.written() };
         },
@@ -903,14 +928,38 @@ fn LadderOf(comptime suite: CipherSuite) type {
 
         /// The server flight is fully in the transcript: pin the hash the
         /// client's Finished must MAC, move to master, stage the
-        /// application traffic keys (§7.1's derivation point).
-        fn finishFlight(self: *Self) void {
+        /// application traffic keys (§7.1's derivation point), and put
+        /// the send side onto them.
+        ///
+        /// That last step is §4.4.4: the server's write keys become
+        /// application keys the moment its Finished goes out — which is
+        /// what makes 0.5-RTT data legal — and the client installs its
+        /// application *read* keys as soon as it has verified that
+        /// Finished. A server still sealing with the handshake protector
+        /// in that window sends records its peer cannot open, and the
+        /// record this window exists to send is an alert: the refusal of
+        /// a client Finished that does not verify. tlsfuzzer's
+        /// `test-tls13-empty-alert` reports it as a bad record MAC.
+        ///
+        /// The receive side keeps its handshake protector, because the
+        /// client's Finished is still sealed with the client's handshake
+        /// keys.
+        fn finishFlight(self: *Self) protect.Error!void {
             assert(self.schedule != null);
             assert(self.schedule.?.stage == .handshake);
+            assert(self.send != null);
             self.finished_hash = self.transcriptHash();
             self.schedule.?.advanceToMaster();
             self.client_application_traffic = self.schedule.?.deriveAt(.master, "c ap traffic", &self.finished_hash);
             self.server_application_traffic = self.schedule.?.deriveAt(.master, "s ap traffic", &self.finished_hash);
+            const transmit_keys = Schedule.trafficKeys(&self.server_application_traffic);
+            const application_send = try protect.Protector.init(suite, &transmit_keys.key, &transmit_keys.iv);
+            // Only swapped once the new one exists, so a failure here
+            // leaves a machine that can still seal its own alert. The
+            // handshake protector has nothing left to write: the flight
+            // was its last record.
+            self.send.?.deinit();
+            self.send = application_send;
         }
 
         fn verifyClientFinished(self: *const Self, message: handshake.Message) bool {
@@ -933,6 +982,15 @@ fn LadderOf(comptime suite: CipherSuite) type {
             assert(self.schedule != null);
             assert(self.schedule.?.stage == .master);
             assert(self.session == null);
+            // The session's send protector is built from the same secret
+            // `finishFlight` already keyed `send` with, so reaching here
+            // with that protector used would restart its nonce sequence
+            // under a key that had seen one. It cannot: the only writer
+            // in that window is `sendAlert`, which retires the machine to
+            // `failed` or `closed`, and neither state admits the client
+            // Finished that calls this. The assertion is what keeps that
+            // true as the code moves.
+            assert(self.send.?.sequence == 0);
             self.transcript.update(finished_message.bytes);
             // §7.1: resumption_master derives from the transcript through
             // the client Finished — this is the only window it exists in.

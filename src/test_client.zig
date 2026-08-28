@@ -38,6 +38,11 @@ pub const Options = struct {
     /// not on the curve — the parser admits it and the key exchange must
     /// be what refuses it.
     offer_bogus_p256_share: bool = false,
+    /// Omit the key_share extension outright, rather than sending an
+    /// empty one. §9.2 makes that a missing_extension; an empty
+    /// `client_shares` is the legal §4.2.8 request for the server's
+    /// choice, and the server has to tell them apart.
+    omit_key_share: bool = false,
     /// Offer a fake P-256 share beside (or instead of) the x25519 one.
     offer_unsupported_decoy: bool = false,
     /// Cipher suites to offer, wire order; null offers all three.
@@ -280,6 +285,20 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             builder.putByte(2);
             builder.putU16(0x0304);
             builder.patchU16(versions);
+            // Stop here: supported_groups is written, key_share is not,
+            // which is the §9.2 shape. The caller closes the extension
+            // block.
+            //
+            // Returning early also skips `buildPskExtensions`, while
+            // `buildHello` still patches a binder whenever `resume_with`
+            // is set — which would write binder bytes over the tail of
+            // whatever extension came last. The two options are
+            // incompatible, so say so here rather than let a future
+            // caller debug a silently corrupted hello.
+            if (self.options.omit_key_share) {
+                assert(self.options.resume_with == null);
+                return;
+            }
             builder.putU16(51); // key_share
             const shares = builder.markU16();
             const share_list = builder.markU16();

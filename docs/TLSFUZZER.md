@@ -10,8 +10,8 @@ itself.
 It runs: `zig build tlsfuzzer`.
 
 ```
-tlsfuzzer: 10 scripts to run, 47 disabled (26 of those untriaged)
-tlsfuzzer: 10 scripts passed, 0 failed, 47 disabled, floor 10
+tlsfuzzer: 14 scripts to run, 43 disabled (22 of those untriaged)
+tlsfuzzer: 14 scripts passed, 0 failed, 43 disabled, floor 14
 tlsfuzzer: PASS
 ```
 
@@ -59,19 +59,20 @@ is reporting on the fixture.
 
 ## The numbers, and the debt
 
-**10 of 57** `test-tls13-*` scripts run, 238 conversations between them.
+**14 of 57** `test-tls13-*` scripts run, 259 conversations between them.
 `test-tls13-connection-abort` is 150 of those on its own: it aborts the
 connection at every point in the handshake and checks the server neither
 hangs nor crashes. `test-tls13-invalid-ciphers` is another 52. The rest
-are the basic conversation, an unencrypted-alert case, Minerva
-timing-signal sanity, HelloRetryRequest, empty and unrecognised cipher
-lists, record padding, and the two RSA signature scripts.
+are the basic conversation, alert handling encrypted and not, Minerva
+timing-signal sanity, HelloRetryRequest and the §9.2 hello that must not
+get one, empty and unrecognised cipher lists, record padding, ticket
+counting, and the two RSA signature scripts.
 
-**47 disabled, and 26 of them say "not yet triaged".** That is a debt,
+**43 disabled, and 22 of them say "not yet triaged".** That is a debt,
 not a result. 21 carry real scope reasons — client certificates, FFDHE,
 brainpool curves, EdDSA, ML-DSA, ML-KEM, 0-RTT, compressed certificates,
 `psk_ke` without (EC)DHE — each pointing at a written decision. The
-other 26 are scripts that run against the harness and fail some or all
+other 22 are scripts that run against the harness and fail some or all
 of their conversations, and nobody has yet worked out whether each is a
 scope decision or a defect. The ledger records the counts observed and
 which leaf produced them, so they can be triaged rather than
@@ -79,19 +80,19 @@ rediscovered.
 
 The gate prints the untriaged number on every run for that reason: a
 suppression ledger where most entries say "unknown" is a debt, and a debt
-that is not counted is a debt that is not paid. Triaging those 26 is the
-next work here, and it has already produced one finding — see 4 below —
-the way BoGo's first run did.
+that is not counted is a debt that is not paid. Triaging those 22 is the
+next work here, and it has already produced three findings — 4 through 6
+below — the way BoGo's first run did.
 
-**The floor** is 10. `scripts.json` can disable a script, but not quietly:
+**The floor** is 14. `scripts.json` can disable a script, but not quietly:
 the passing count falls with it and the gate goes red.
 
 ## What it cost to get here
 
-Four defects, all found by running things rather than reading them, and
+Six defects, all found by running things rather than reading them, and
 each worth recording because each looked like something else. The first
-three are the harness's and the gate's; the fourth is the library's, and
-is the first finding this oracle produced.
+three are the harness's and the gate's; 4 through 6 are the library's,
+and are what this oracle has produced so far.
 
 1. **The listener starved.** It is sequential, and tlsfuzzer's abort
    cases deliberately leave sockets that never send again — one held the
@@ -129,8 +130,50 @@ is the first finding this oracle produced.
    because that ambiguity is expensive: it cost one full re-sweep to
    notice that two runs of the same corpus disagreed.
 
-The first three were not library defects. The fourth is, and none of the
-four would have been visible to a gate that was only read.
+5. **Alerts sent under the wrong keys, for a whole round trip.** §4.4.4
+   switches the server's write keys to application keys the moment its
+   Finished goes out — that is what makes 0.5-RTT data legal — and the
+   client installs its application *read* keys as soon as it verifies
+   that Finished. zssl staged the secrets at the right point (§7.1, in
+   `finishFlight`) but kept sealing with the *handshake* protector until
+   the client's Finished arrived, so everything the server sent in that
+   window was unreadable by any conforming peer. The window exists to
+   send one thing: the refusal of a client Finished that does not
+   verify. That alert could never be read.
+
+   It reproduces between zssl's own two machines — the client reports
+   `AuthenticationFailed` on the server's alert — so this was never a
+   tlslite-ng disagreement. `finishFlight` now moves the send side onto
+   the application keys and leaves the receive side on the handshake
+   ones, where the client's Finished still lives. Because the session is
+   later built from the same secret, `startApplicationKeys` asserts the
+   window protector sealed nothing: its only writer is `sendAlert`,
+   which retires the machine, so a used one would mean a nonce sequence
+   restarting under a live key.
+
+   The blast radius is the reason to record it. Most tlsfuzzer
+   conversations *end* by reading the server's alert, so one fix moved
+   the whole corpus: `test-tls13-finished` 2 -> 39 passing of 42,
+   `symetric-ciphers` 36 -> 78 of 102, `keyupdate` 59 -> 61 of 62,
+   `record-layer-limits` 8 -> 12, `zero-length-data` 5 -> 8, and two
+   scripts to green outright. A defect that hides behind every other
+   failure looks like a corpus that dislikes you.
+6. **An omitted `key_share` treated as an empty one.** §4.2.8 lets a
+   client send an empty `client_shares` to ask the server to choose a
+   group, at the cost of a round trip, and that earns a
+   HelloRetryRequest. §9.2 requires the extension to be *present* in any
+   hello attempting (EC)DHE, and a server receiving one without it "MUST
+   abort the handshake with a `missing_extension` alert". zssl sent a
+   retry for both, because `key_share_count == 0` cannot tell them
+   apart — the parser now records presence separately.
+
+   The check is deliberately narrow: only a hello carrying
+   `supported_groups` *without* `key_share` is the §9.2 case. Neither
+   present is a client not offering (EC)DHE at all, which §9.2 does not
+   reach, and zssl's refusal of that stays `handshake_failure`.
+
+The first three were not library defects. The last three are, and none
+of the six would have been visible to a gate that was only read.
 
 ## Timing
 
@@ -148,7 +191,7 @@ zig build tlsfuzzer-server -- --port 4433    # the server alone, to hand-drive
 ```
 
 With the server running, any script in the pinned checkout can be pointed
-at it — which is how the 26 untriaged entries get triaged:
+at it — which is how the 22 untriaged entries get triaged:
 
 ```sh
 cd zig-out/tlsfuzzer/tlsfuzzer

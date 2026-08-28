@@ -313,3 +313,46 @@ test "a share whose point is not on the curve is refused, not negotiated" {
     );
     try testing.expectEqual(ServerHandshake.State.failed, harness.server.state);
 }
+
+test "§9.2: an omitted key_share is missing_extension, an empty one is a retry" {
+    // The two are one byte apart on the wire and mean opposite things.
+    // §4.2.8 lets a client send an empty `client_shares` to ask the
+    // server to pick a group, which costs a round trip and is answered
+    // with HelloRetryRequest. §9.2 requires the extension to be *there*
+    // for any hello attempting (EC)DHE, and a server receiving one
+    // without it "MUST abort the handshake with a missing_extension
+    // alert". A `key_share_count` of zero cannot tell them apart.
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+
+    {
+        var harness: Harness = undefined;
+        try harness.init(null);
+        defer harness.deinit();
+        var client = Client.init(&client_x25519_private, &.{ .omit_key_share = true });
+        defer client.deinit();
+        try testing.expectError(
+            error.MissingExtension,
+            harness.server.handleRecord(client.helloRecord(&client_out), &server_out),
+        );
+    }
+
+    // The control: the extension present but offering only a group we do
+    // not hold is the §4.2.8 case, and must still earn a retry.
+    {
+        var harness: Harness = undefined;
+        try harness.init(null);
+        defer harness.deinit();
+        var client = Client.init(&client_x25519_private, &.{
+            .offer_x25519_share = false,
+            .offer_unsupported_decoy = true,
+        });
+        defer client.deinit();
+        const retry = try harness.server.handleRecord(client.helloRecord(&client_out), &server_out);
+        try testing.expectEqual(std.meta.activeTag(retry), .send);
+        try testing.expectEqual(
+            ServerHandshake.State.awaiting_retry_client_hello,
+            harness.server.state,
+        );
+    }
+}

@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 231 passed, 0 failed, 6918 declined by the shim (89), floor 231
+bogo: 232 passed, 0 failed, 6918 declined by the shim (89), floor 232
 bogo: PASS
 ```
 
@@ -41,11 +41,11 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**231 passed.** Cases the runner ran end to end and we satisfied —
+**232 passed.** Cases the runner ran end to end and we satisfied —
 including the alert we sent, which BoGo checks by name. 121 drive
-`ClientHandshake` and 110 drive `ServerHandshake`. The server number was
-6 until RSA signing landed, and 100 until secp256r1/secp384r1 did; see
-below.
+`ClientHandshake` and 111 drive `ServerHandshake`. The server number was
+6 until RSA signing landed, 100 until secp256r1/secp384r1 did, and 110
+until §9.2's `missing_extension` did; see below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
 either gets fixed or gets an entry in `DisabledTests` with a one-line
@@ -126,7 +126,7 @@ Three bugs, fixed in this slice:
    flight was at least 500 bytes, which a legitimately small ECDSA leaf
    falsifies. The floor is now the encoded chain's own size.
 
-Eight more are open. Each is an entry in the ledger citing this list, 35
+Twelve more are open. Each is an entry in the ledger citing this list, 54
 suppressed cases between them:
 
 1. **Only one post-handshake message per record.**
@@ -156,9 +156,13 @@ suppressed cases between them:
    encoding.
 8. **A handful of alert choices differ from BoringSSL's** — trailing data
    after a Certificate answers `bad_certificate` where `decode_error` is
-   the better reading, among others. The largest single group at 20
+   the better reading, among others. The largest single group at 19
    cases, and the least interesting: we refuse, for the right reason,
-   with the wrong description.
+   with the wrong description. `MissingKeyShare-Server-TLS13` left this
+   group when tlsfuzzer's `keyshare-omitted` showed the cause was not a
+   description at all: §9.2's `missing_extension` was never being sent,
+   because an omitted `key_share` was read as an empty one. See
+   docs/TLSFUZZER.md, finding 6.
 9. **A duplicate extension in the peer's hello is accepted** rather than
    refused, on both sides.
 10. **A PSK offer whose binder list does not match its identity list** is

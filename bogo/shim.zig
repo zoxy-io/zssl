@@ -814,6 +814,7 @@ fn alertFor(err: anyerror) ?alert.Description {
         error.AuthenticationFailed => .bad_record_mac,
         error.RecordOverflow => .record_overflow,
         error.HandshakeFailure => .handshake_failure,
+        error.MissingExtension => .missing_extension,
         // Legal grammar, illegal content.
         error.IllegalRetry,
         error.BadServerHello,

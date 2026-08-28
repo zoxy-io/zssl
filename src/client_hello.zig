@@ -92,6 +92,13 @@ pub const ClientHello = struct {
     /// refused — §4.2.8 lets a client offer whatever it likes.
     key_shares: [groups_supported.len]KeyShareEntry = undefined,
     key_share_count: u8 = 0,
+    /// Whether the extension was present at all, which `key_share_count`
+    /// cannot say: a client that offers only groups we skip leaves the
+    /// count at zero, and so does a client that sends the empty
+    /// `client_shares` §4.2.8 defines for requesting our choice. Both of
+    /// those earn a HelloRetryRequest. An omitted extension is a §9.2
+    /// protocol error instead, so the two have to be distinguishable.
+    has_key_share: bool = false,
     supports_tls13: bool = false,
     /// The inner u16 group list, prefix stripped and validated even.
     supported_groups_wire: ?[]const u8 = null,
@@ -281,7 +288,10 @@ fn trackedBit(extension_type: u16) ?u6 {
 fn applyExtension(extension_type: u16, data: []const u8, hello: *ClientHello) Error!void {
     switch (extension_type) {
         extension_server_name => hello.server_name = try parseServerName(data),
-        extension_key_share => try parseKeyShare(data, hello),
+        extension_key_share => {
+            hello.has_key_share = true;
+            try parseKeyShare(data, hello);
+        },
         extension_supported_versions => hello.supports_tls13 = try parseSupportedVersions(data),
         extension_supported_groups => {
             hello.supported_groups_wire = try parseU16List(data, groups_count_max);
