@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 232 passed, 0 failed, 6918 declined by the shim (89), floor 232
+bogo: 234 passed, 0 failed, 6918 declined by the shim (89), floor 234
 bogo: PASS
 ```
 
@@ -41,11 +41,12 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**232 passed.** Cases the runner ran end to end and we satisfied —
+**234 passed.** Cases the runner ran end to end and we satisfied —
 including the alert we sent, which BoGo checks by name. 121 drive
-`ClientHandshake` and 111 drive `ServerHandshake`. The server number was
-6 until RSA signing landed, 100 until secp256r1/secp384r1 did, and 110
-until §9.2's `missing_extension` did; see below.
+`ClientHandshake` and 113 drive `ServerHandshake`. The server number was
+6 until RSA signing landed, 100 until secp256r1/secp384r1 did, 110 until
+§9.2's `missing_extension` did, and 111 until §5.4's inner-plaintext cap
+did; see below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
 either gets fixed or gets an entry in `DisabledTests` with a one-line
@@ -126,7 +127,9 @@ Three bugs, fixed in this slice:
    flight was at least 500 bytes, which a legitimately small ECDSA leaf
    falsifies. The floor is now the encoded chain's own size.
 
-Twelve more are open. Each is an entry in the ledger citing this list, 54
+Twelve more were open and eleven remain — 3 is now fixed, and is kept in
+place below rather than renumbered, because the ledger cites these by
+number. Each of the eleven is an entry in the ledger citing this list, 52
 suppressed cases between them:
 
 1. **Only one post-handshake message per record.**
@@ -140,20 +143,24 @@ suppressed cases between them:
    `key_share` in EncryptedExtensions, extended_master_secret,
    ec_point_formats, an OCSP or SCT response on Certificate, trust
    anchors, and unknown or duplicate extensions. We ignore all of them.
-3. **No §5.4 cap on the inner plaintext *before* padding is stripped.**
-   `Protector.open` bounds the content it hands back — `content_bytes >
-   plaintext_bytes_max` has been a `record_overflow` since slice 1 — but
-   never checks the inner plaintext it was handed against
-   `record.inner_plaintext_bytes_max` (§5.4's 2^14+1), which is why that
-   constant is defined and unused. So `LargePlaintext-TLS13-Padded-16384-1`
-   and `-8193-8192`, both 16386 inner bytes, are accepted where §5.4 says
-   record_overflow.
+3. **FIXED — no §5.4 cap on the inner plaintext *before* padding is
+   stripped.** `Protector.open` bounded the content it handed back —
+   `content_bytes > plaintext_bytes_max` has been a `record_overflow`
+   since slice 1 — but never checked the inner plaintext it was *handed*
+   against `record.inner_plaintext_bytes_max` (§5.4's 2^14+1), which is
+   why that constant sat defined and unused. So
+   `LargePlaintext-TLS13-Padded-16384-1` and `-8193-8192`, both 16386
+   inner bytes, were accepted where §5.4 says record_overflow. One line
+   in `open`, checked on the framed length before any AEAD work, and both
+   cases now pass.
 
-   Worth reading as a lesson about findings: this said "content past 2^14
-   getting through once padding is stripped" until 2025-08-28, which is
-   the half that *was* checked. The case numbers were right and the
-   diagnosis was not, so nobody could act on it. A finding is a
-   measurement or it is a guess with a case number attached.
+   Worth keeping as a lesson about findings rather than deleting. This
+   read "content past 2^14 getting through once padding is stripped"
+   until it was measured — which is the half that *was* checked. The case
+   numbers were right and the diagnosis was not, so for four slices
+   nobody could act on it, and DESIGN.md §5 described a cap the code did
+   not have. A finding is a measurement or it is a guess with a case
+   number attached.
 4. **No bound on empty application records or on KeyUpdates** within a
    session. BoringSSL caps both; our KeyUpdate ceiling is far above the
    count that should end a connection.

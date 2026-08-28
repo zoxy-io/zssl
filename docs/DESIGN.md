@@ -113,10 +113,14 @@ the stream (slice 4).
 
 ## §5 Records
 
-Framing caps are enforced at header parse (`record.parseHeader`), per
-content type: §5.1's 2^14 for plaintext records, §5.2's 2^14+256 for
-protected ones, §5.4's 2^14+1 for the decrypted inner plaintext. A
-record the spec forbids never reaches a buffer.
+Framing caps are enforced before a record reaches a buffer, per content
+type: §5.1's 2^14 for plaintext records and §5.2's 2^14+256 for protected
+ones at header parse (`record.parseHeader`), and §5.4's 2^14+1 for the
+inner plaintext in `Protector.open` — which is where it has to live,
+because `parseHeader` does not know the suite whose tag length the inner
+length is derived from. This paragraph claimed all three happened at
+header parse while the §5.4 one happened nowhere at all; see BoGo
+finding 3.
 
 What is *not* enforced there is `legacy_record_version`'s minor byte:
 §5.1 calls the field deprecated and says it "MUST be ignored for all
@@ -129,10 +133,10 @@ plaintext and the embedder compensated above the API.
 `Protector` is one direction under one traffic key: AEAD contexts,
 static IV, sequence. The §5.5 sequence bound (2^24 records, the
 AES-GCM-conservative figure applied to every suite) is an error, not a
-wrap. zssl never writes padding; it strips peers' padding per §5.4, and caps
-what is left at §5.1's 2^14 — but not, yet, the §5.4 cap on the inner
-plaintext it was handed *before* stripping, which is BoGo finding 3 in
-`docs/BOGO.md`.
+wrap. zssl never writes padding; it strips peers' padding per §5.4, caps the
+inner plaintext it was handed at §5.4's 2^14+1 before doing any AEAD
+work, and caps what is left after stripping at §5.1's 2^14. Both halves
+matter: a peer can spend the whole budget on padding.
 
 ## §6 Slices
 

@@ -116,6 +116,14 @@ pub const Protector = struct {
         if (ciphertext_with_tag.len < cipher_suite.tag_bytes + 1) return error.BadInnerPlaintext;
 
         const inner_bytes = ciphertext_with_tag.len - cipher_suite.tag_bytes;
+        // §5.4: the inner plaintext — content, its type byte, and any
+        // padding — is capped one past §5.1's limit. Checked here, on
+        // the length the peer framed, rather than after unpadding: the
+        // cap is on what was *sent*, and a peer can spend the whole
+        // budget on padding. The post-strip content is bounded again
+        // below, and that check alone is what §5.4 asks for only if you
+        // read "inner plaintext" as "content", which it is not.
+        if (inner_bytes > record.inner_plaintext_bytes_max) return error.RecordOverflow;
         assert(inner_bytes >= 1);
         assert(out.len >= inner_bytes);
         const nonce = self.nonceFor(self.sequence);
@@ -129,7 +137,7 @@ pub const Protector = struct {
         self.sequence += 1;
 
         // §5.4: scan padding backwards to the content-type byte. Bounded
-        // structurally by inner_bytes ≤ 16624, and by construction the
+        // structurally by inner_bytes ≤ 16385, and by construction the
         // loop ends at index 0 if every byte is zero.
         var index: usize = inner_bytes;
         while (index > 0) : (index -= 1) {
@@ -137,9 +145,14 @@ pub const Protector = struct {
         }
         if (index == 0) return error.BadInnerPlaintext;
         const content_bytes = index - 1;
-        if (content_bytes > record.plaintext_bytes_max) return error.RecordOverflow;
         const content_type = record.ContentType.fromWire(out[content_bytes]) orelse
             return error.BadInnerPlaintext;
+        // §5.1's cap on what survives unpadding, and now a consequence
+        // rather than a check: the guard above holds inner_bytes at
+        // 2^14+1, the content-type byte costs one, so this can only be
+        // 2^14 at most. It was a live `return error.RecordOverflow` until
+        // that guard existed — the half of §5.4 that *was* enforced while
+        // the docs credited the other half.
         assert(content_bytes <= record.plaintext_bytes_max);
         return .{ .content_type = content_type, .plaintext_bytes = @intCast(content_bytes) };
     }
@@ -167,4 +180,50 @@ test "nonce XOR folds the sequence into the IV tail" {
     const nonce_one = protector.nonceFor(1);
     try std.testing.expectEqual(static_iv[11] ^ 1, nonce_one[11]);
     try std.testing.expectEqualSlices(u8, static_iv[0..11], nonce_one[0..11]);
+}
+
+test "§5.4: an inner plaintext past the cap is record_overflow, before any AEAD work" {
+    // BoGo's `LargePlaintext-TLS13-Padded-16384-1` and `-8193-8192`: one
+    // spends the overflow on content, the other on padding, and both
+    // frame 16386 inner bytes where §5.4 allows 16385. The split does not
+    // matter to this check and that is the point — the cap is on what the
+    // peer sent, not on what survives unpadding, and reading it the other
+    // way is what left this open with the wrong diagnosis attached.
+    const suite: CipherSuite = .aes_128_gcm_sha256;
+    const key = [_]u8{0x22} ** 16;
+    const static_iv = [_]u8{0x33} ** 12;
+    var protector = try Protector.init(suite, &key, &static_iv);
+    defer protector.deinit();
+
+    var wire: [record.wire_record_bytes_max]u8 = undefined;
+    var out: [record.wire_record_bytes_max]u8 = undefined;
+
+    // 16386 inner bytes plus the tag, which §5.2's cap still admits — so
+    // the header parses and this check is what refuses it.
+    const over = record.inner_plaintext_bytes_max + 1;
+    const body_bytes = @as(usize, over) + cipher_suite.tag_bytes;
+    record.writeHeader(
+        .{ .content_type = .application_data, .length = @intCast(body_bytes) },
+        wire[0..record.header_bytes],
+    );
+    @memset(wire[record.header_bytes..][0..body_bytes], 0x5a);
+    try std.testing.expectError(
+        error.RecordOverflow,
+        protector.open(wire[0 .. record.header_bytes + body_bytes], &out),
+    );
+
+    // The boundary itself is admitted this far: exactly 16385 inner bytes
+    // is legal framing, so it reaches the AEAD and dies there instead.
+    // Garbage never authenticates, which is the answer that proves the
+    // length check let it past rather than swallowing it.
+    const at_cap = @as(usize, record.inner_plaintext_bytes_max) + cipher_suite.tag_bytes;
+    record.writeHeader(
+        .{ .content_type = .application_data, .length = @intCast(at_cap) },
+        wire[0..record.header_bytes],
+    );
+    @memset(wire[record.header_bytes..][0..at_cap], 0x5a);
+    try std.testing.expectError(
+        error.AuthenticationFailed,
+        protector.open(wire[0 .. record.header_bytes + at_cap], &out),
+    );
 }
