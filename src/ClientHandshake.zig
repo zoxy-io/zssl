@@ -1240,6 +1240,10 @@ fn ArmOf(comptime suite: CipherSuite) type {
         fn startHandshakeKeys(self: *Self, shared: *const [32]u8, psk: ?[]const u8) protect.Error!void {
             assert(self.schedule == null);
             assert(self.recv == null);
+            // The client offers only resumption PSKs, which §4.6.1
+            // derives at exactly a hash length — see
+            // `ServerHandshake.startHandshakeKeys` for the accepting
+            // half, where an external PSK makes this a range.
             if (psk) |bytes| assert(bytes.len == hash_bytes);
             var schedule = Schedule.initEarly(psk);
             schedule.advanceToHandshake(shared);

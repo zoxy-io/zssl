@@ -48,12 +48,12 @@ const TicketStore = struct {
         identity: []const u8,
         obfuscated_age: u32,
         psk_out: *[cipher_suite.hash_bytes_max]u8,
-    ) ?u8 {
+    ) ?ServerHandshake.Psk {
         _ = obfuscated_age;
         const store: *TicketStore = @ptrCast(@alignCast(context));
         if (!std.mem.eql(u8, store.identity[0..store.identity_bytes], identity)) return null;
         psk_out.* = store.psk;
-        return 32;
+        return .{ .psk_bytes = 32, .kind = .resumption };
     }
 };
 

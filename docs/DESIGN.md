@@ -43,8 +43,13 @@ proxy needs instead of what a general TLS library carries.
   untestable by anything but our own client. The client half still
   offers x25519 alone: offering more only pays with HelloRetryRequest
   support, which it refuses structurally (slice 4).
-- PSK resumption with server-side NewSessionTicket issuance; ALPN and
-  SNI reads.
+- PSK resumption with server-side NewSessionTicket issuance, and
+  server-side acceptance of **external** PSKs — the two differ by
+  §4.2.11.2's binder label ("res binder" against "ext binder"), which
+  `psk_lookup` now reports alongside the key. The client half offers
+  resumption PSKs only: an external one would need the negotiated suite
+  from somewhere other than the PSK's length, which is what
+  `client_messages` infers it from. ALPN and SNI reads.
 - kTLS key export (§4).
 
 **Out, permanently** (a caller that needs these wants a different
@@ -156,9 +161,10 @@ matter: a peer can spend the whole budget on padding.
    path. Known-refused, on purpose: KeyUpdate and post-handshake
    messages error loudly (`KeyUpdateUnsupported`) until slice 4.
 3. **Resumption** — done: `psk_lookup` is the embedder seam (opaque
-   identity in, PSK out; ticket sealing, lifetime, and age policy stay
-   the embedder's), binder verification aborts on a recognized identity
-   with a bad binder (a replayed identity is refused, never downgraded),
+   identity in, PSK *and its kind* out; ticket sealing, lifetime, and
+   age policy stay the embedder's), binder verification aborts on a
+   recognized identity with a bad binder (a replayed identity is
+   refused, never downgraded),
    an unknown identity falls back to a full handshake, and the resumed
    flight drops Certificate/CertificateVerify. `resumptionPsk` derives
    before `sendNewSessionTicket` seals — the stateless-server ordering —

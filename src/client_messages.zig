@@ -190,7 +190,13 @@ pub fn patchBinder(message: []u8, psk: []const u8) void {
             var truncated_hash: [Hash.digest_length]u8 = undefined;
             Hash.hash(truncated, &truncated_hash, .{});
             var schedule = Schedule.initEarly(psk);
-            const binder = schedule.resumptionBinder(&truncated_hash);
+            // Resumption by construction: this offer's PSK came from a
+            // ticket this client was issued. Offering an *external* PSK
+            // would need the suite from somewhere other than the PSK's
+            // length, which the switch above infers it from — see
+            // `ServerHandshake.Psk`, where the accepting half does
+            // carry the distinction.
+            const binder = schedule.pskBinder(.resumption, &truncated_hash);
             schedule.wipe();
             @memcpy(message[message.len - psk.len ..], &binder);
         },

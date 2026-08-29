@@ -77,6 +77,11 @@ pub const Ticket = struct {
     ticket_bytes: u16,
     psk: [cipher_suite.hash_bytes_max]u8,
     psk_bytes: u8,
+    /// Which §4.2.11.2 label this offer's binder is computed under. A
+    /// ticket this client was issued is `.resumption`; an out-of-band
+    /// key is `.external`, and the whole point of the field is that the
+    /// wire cannot tell them apart — only the offerer knows.
+    kind: key_schedule.PskKind = .resumption,
 };
 
 pub fn TestClient(comptime suite: CipherSuite) type {
@@ -237,15 +242,19 @@ pub fn TestClient(comptime suite: CipherSuite) type {
         /// patched in — after the rest of the message is final.
         fn patchBinder(self: *Self) void {
             const ticket = self.options.resume_with.?;
-            assert(ticket.psk_bytes == hash_bytes);
+            // A resumption PSK is a hash long by §4.6.1's derivation; an
+            // external one is whatever was agreed. The *binder* is a
+            // hash long either way — it is an HMAC output — which is why
+            // the section size below does not move.
+            assert(ticket.psk_bytes >= 1 and ticket.psk_bytes <= hash_bytes);
             const message = self.hello_storage[0..self.hello_bytes];
             const binders_section_bytes = 2 + 1 + hash_bytes;
             assert(message.len > binders_section_bytes);
             const truncated = message[0 .. message.len - binders_section_bytes];
             var truncated_hash: [hash_bytes]u8 = undefined;
             Hash.hash(truncated, &truncated_hash, .{});
-            var schedule = Schedule.initEarly(ticket.psk[0..hash_bytes]);
-            var binder = schedule.resumptionBinder(&truncated_hash);
+            var schedule = Schedule.initEarly(ticket.psk[0..ticket.psk_bytes]);
+            var binder = schedule.pskBinder(ticket.kind, &truncated_hash);
             schedule.wipe();
             if (self.options.corrupt_binder) binder[0] ^= 0x01;
             @memcpy(message[message.len - hash_bytes ..], &binder);
@@ -369,7 +378,7 @@ pub fn TestClient(comptime suite: CipherSuite) type {
 
         fn buildPskExtensions(self: *Self, builder: *wire.Builder) void {
             const ticket = self.options.resume_with.?;
-            assert(ticket.psk_bytes == hash_bytes);
+            assert(ticket.psk_bytes >= 1 and ticket.psk_bytes <= hash_bytes);
             assert(ticket.ticket_bytes >= 1);
             builder.putU16(41); // pre_shared_key
             const extension = builder.markU16();
@@ -501,8 +510,12 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                 server_share,
                 &shared_buffer,
             );
+            // `psk_bytes`, not `hash_bytes`: a resumption PSK is a hash
+            // long, but an external one is whatever the peers agreed,
+            // and padding it out with the zeros the buffer happens to
+            // hold derives a different early secret than the server's.
             const psk: ?[]const u8 = if (self.psk_accepted)
-                self.options.resume_with.?.psk[0..hash_bytes]
+                self.options.resume_with.?.psk[0..self.options.resume_with.?.psk_bytes]
             else
                 null;
             var schedule = Schedule.initEarly(psk);
@@ -647,6 +660,11 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             @memset(&entry.psk, 0);
             @memcpy(entry.psk[0..hash_bytes], &psk);
             entry.psk_bytes = hash_bytes;
+            // `entry` starts undefined and is filled field by field, so
+            // the struct default never runs — and a `kind` left undefined
+            // is a switch on a corrupt value the moment a binder is
+            // computed. A ticket is a resumption PSK by definition.
+            entry.kind = .resumption;
             self.tickets[self.ticket_count] = entry;
             self.ticket_count += 1;
             assert(self.ticket_count <= self.tickets.len);

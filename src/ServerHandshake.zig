@@ -146,28 +146,52 @@ pub const Config = struct {
     /// Caller-owned space for flight plaintext assembly; must hold the
     /// certificate chain plus ~1 KiB.
     flight: []u8,
-    /// The resumption seam: given an offered ticket identity, answer the
-    /// PSK it stands for, or null to fall back to a full handshake. The
-    /// embedder owns ticket sealing, lifetime, and age policy — this
-    /// machine owns only the binder check that follows.
+    /// The PSK seam: given an offered identity, answer the key it stands
+    /// for and say which kind it is, or null to fall back to a full
+    /// handshake. Both §4.2.11 sources come through here — a ticket this
+    /// server issued, and a key agreed out of band — because the wire
+    /// tells them apart only by what the embedder recognises. The
+    /// embedder owns ticket sealing, lifetime, and age policy; this
+    /// machine owns the binder check that follows, and picks its label
+    /// from the `kind` this answers with.
     psk_lookup: ?PskLookup = null,
 };
 
 pub const PskLookup = struct {
     context: *anyopaque,
-    /// Writes the PSK into `psk_out` and returns its length (one hash
-    /// length), or null when the identity is not ours to accept.
+    /// Writes the PSK into `psk_out` and answers for it, or null when
+    /// the identity is not ours to accept.
     lookup: *const fn (
         context: *anyopaque,
         identity: []const u8,
         obfuscated_age: u32,
         psk_out: *[cipher_suite.hash_bytes_max]u8,
-    ) ?u8,
+    ) ?Psk,
+};
+
+/// What an embedder answers with. The `kind` is not bookkeeping: §4.2.11.2
+/// derives `binder_key` under "ext binder" or "res binder" by it, so a
+/// PSK described as the wrong kind fails its binder and looks to the peer
+/// like a key mismatch. The wire carries an identity and says nothing
+/// about provenance, so only the embedder that recognised the identity
+/// can say which it is.
+pub const Psk = struct {
+    /// How many bytes were written into `psk_out`. A resumption PSK is
+    /// exactly the negotiated hash's length, because §4.6.1 derives it
+    /// that way; an external one is whatever was agreed out of band,
+    /// bounded here by `psk_out` itself.
+    ///
+    /// Named for the count, not the content: every other `bytes:` field
+    /// in this tree holds a slice, and the `_bytes` suffix is what a
+    /// length wears — `psk_bytes`, `ticket_bytes`, `nonce_bytes`.
+    psk_bytes: u8,
+    kind: key_schedule.PskKind,
 };
 
 const SelectedPsk = struct {
     psk: [cipher_suite.hash_bytes_max]u8,
     psk_bytes: u8,
+    kind: key_schedule.PskKind,
     index: u16,
 };
 
@@ -491,16 +515,38 @@ fn selectPsk(
     var index: u8 = 0;
     while (index < offer.count) : (index += 1) {
         assert(index < client_hello.psk_identities_max);
-        var selected: SelectedPsk = .{ .psk = undefined, .psk_bytes = 0, .index = index };
-        const psk_bytes = lookup.lookup(
+        var selected: SelectedPsk = .{
+            .psk = undefined,
+            .psk_bytes = 0,
+            .kind = .resumption,
+            .index = index,
+        };
+        const answer = lookup.lookup(
             lookup.context,
             offer.identities[index],
             offer.obfuscated_ages[index],
             &selected.psk,
         ) orelse continue;
-        if (psk_bytes != suite.hashBytes()) continue; // A PSK is bound to its hash.
-        selected.psk_bytes = psk_bytes;
-        if (!binderMatches(suite, selected.psk[0..psk_bytes], truncated, offer.binders[index])) {
+        // A resumption PSK is bound to its hash — §4.6.1 derives it at
+        // exactly that length, so any other length is an embedder
+        // handing back something a ticket cannot have produced. An
+        // external PSK carries no such derivation and §4.2.11 sets no
+        // length for it, so the only bound is the buffer it arrived in.
+        // Zero is refused either way rather than asserted: it would
+        // extract a schedule from nothing.
+        switch (answer.kind) {
+            .resumption => if (answer.psk_bytes != suite.hashBytes()) continue,
+            .external => if (answer.psk_bytes == 0 or answer.psk_bytes > selected.psk.len) continue,
+        }
+        selected.psk_bytes = answer.psk_bytes;
+        selected.kind = answer.kind;
+        if (!binderMatches(
+            suite,
+            answer.kind,
+            selected.psk[0..answer.psk_bytes],
+            truncated,
+            offer.binders[index],
+        )) {
             return error.DecryptError;
         }
         return selected;
@@ -508,8 +554,16 @@ fn selectPsk(
     return null;
 }
 
-fn binderMatches(suite: CipherSuite, psk: []const u8, truncated: []const u8, binder: []const u8) bool {
-    assert(psk.len == suite.hashBytes());
+fn binderMatches(
+    suite: CipherSuite,
+    kind: key_schedule.PskKind,
+    psk: []const u8,
+    truncated: []const u8,
+    binder: []const u8,
+) bool {
+    // Not `== suite.hashBytes()`: an external PSK is whatever length the
+    // two peers agreed on, and `selectPsk` has already bounded it.
+    assert(psk.len >= 1 and psk.len <= cipher_suite.hash_bytes_max);
     assert(truncated.len >= handshake.header_bytes);
     switch (suite) {
         inline else => |comptime_suite| {
@@ -520,7 +574,7 @@ fn binderMatches(suite: CipherSuite, psk: []const u8, truncated: []const u8, bin
             Hash.hash(truncated, &truncated_hash, .{});
             var schedule = Schedule.initEarly(psk);
             defer schedule.wipe();
-            const expected = schedule.resumptionBinder(&truncated_hash);
+            const expected = schedule.pskBinder(kind, &truncated_hash);
             return std.crypto.timing_safe.eql(
                 [Hash.digest_length]u8,
                 binder[0..Hash.digest_length].*,
@@ -1174,13 +1228,20 @@ fn LadderOf(comptime suite: CipherSuite) type {
 
         /// ClientHello..ServerHello are in the transcript: derive the
         /// handshake secrets and bring up the handshake-key protectors.
-        /// `psk` is the accepted resumption secret, or null for a full
-        /// handshake — either way the (EC)DHE share is mixed (psk_dhe_ke
-        /// is the only mode this library speaks).
+        /// `psk` is the accepted pre-shared key — from a ticket or from
+        /// out of band, the schedule cannot tell and does not need to —
+        /// or null for a full handshake. Either way the (EC)DHE share is
+        /// mixed: psk_dhe_ke is the only mode this library speaks.
         fn startHandshakeKeys(self: *Self, shared: []const u8, psk: ?[]const u8) protect.Error!void {
             assert(self.schedule == null);
             assert(self.recv == null);
-            if (psk) |bytes| assert(bytes.len == hash_bytes);
+            // A resumption PSK is a hash long by §4.6.1's derivation; an
+            // external one is whatever the peers agreed, and §4.2.11 sets
+            // no length for it. The bound is a range because the value
+            // arrives from an embedder answering `psk_lookup` about an
+            // identity the *peer* chose — an equality here was reachable
+            // from the wire the moment external PSKs became acceptable.
+            if (psk) |bytes| assert(bytes.len >= 1 and bytes.len <= cipher_suite.hash_bytes_max);
             var schedule = Schedule.initEarly(psk);
             schedule.advanceToHandshake(shared);
             const hello_hash = self.transcriptHash();

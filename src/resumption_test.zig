@@ -49,7 +49,7 @@ test "§4 vectors: the binder chain, truncation arithmetic, and the PSK ladder" 
     try testing.expectEqualSlices(u8, &vectors.resumed_binder_finished_key, &binder_finished_key);
     const binder = Schedule.verifyData(&binder_finished_key, &truncated_hash);
     try testing.expectEqualSlices(u8, &vectors.resumed_binder_value, &binder);
-    const one_call = schedule.resumptionBinder(&truncated_hash);
+    const one_call = schedule.pskBinder(.resumption, &truncated_hash);
     try testing.expectEqualSlices(u8, &vectors.resumed_binder_value, &one_call);
     // The binder also sits verbatim at the message's tail.
     try testing.expectEqualSlices(
@@ -118,7 +118,7 @@ const TicketStore = struct {
         identity: []const u8,
         obfuscated_age: u32,
         psk_out: *[cipher_suite.hash_bytes_max]u8,
-    ) ?u8 {
+    ) ?ServerHandshake.Psk {
         _ = obfuscated_age; // Age policy is the embedder's; this one has none.
         const store: *TicketStore = @ptrCast(@alignCast(context));
         var index: u8 = 0;
@@ -126,7 +126,7 @@ const TicketStore = struct {
             std.debug.assert(index < 4);
             if (std.mem.eql(u8, store.identities[index][0..store.identity_bytes[index]], identity)) {
                 psk_out.* = store.psks[index];
-                return 32;
+                return .{ .psk_bytes = 32, .kind = .resumption };
             }
         }
         return null;
@@ -157,6 +157,27 @@ const Harness = struct {
                 .context = context,
                 .lookup = TicketStore.lookup,
             } else null,
+        });
+    }
+
+    /// Same server, but with the `psk_lookup` handed in whole. `init`
+    /// takes a `TicketStore` because most tests want one; an external
+    /// PSK answers through a different embedder entirely, which is the
+    /// point of the seam being a function pointer and a context.
+    fn initLookup(harness: *Harness, lookup: ServerHandshake.PskLookup) !void {
+        harness.credentials = try Credentials.load(
+            @embedFile("testdata/cert.pem"),
+            @embedFile("testdata/key.pem"),
+            &harness.chain_storage,
+            true,
+        );
+        harness.server = ServerHandshake.init(&.{
+            .credentials = &harness.credentials,
+            .server_random = .{0x5c} ** 32,
+            .key_share_private = server_key_share_private,
+            .reassembly = &harness.reassembly,
+            .flight = &harness.flight,
+            .psk_lookup = lookup,
         });
     }
 
@@ -255,6 +276,104 @@ test "resumption end to end: tickets out, PSK session up, no certificate" {
     const chained_event = try client_two.absorb(chained, &client_out);
     try testing.expectEqual(std.meta.activeTag(chained_event), .none);
     try testing.expectEqual(@as(u8, 1), client_two.ticket_count);
+}
+
+/// A `psk_lookup` that answers one out-of-band identity, and answers it
+/// as `.external` so §4.2.11.2's "ext binder" label is the one derived.
+/// Deliberately shorter than a hash: §4.2.11 associates a hash with an
+/// external PSK and says nothing about the key's length, and the length
+/// is the part a resumption-only implementation quietly assumes.
+const ExternalStore = struct {
+    const identity = "out-of-band-identity";
+    const secret = [_]u8{0x5a} ** 16;
+
+    fn lookup(
+        context: *anyopaque,
+        offered: []const u8,
+        obfuscated_age: u32,
+        psk_out: *[cipher_suite.hash_bytes_max]u8,
+    ) ?ServerHandshake.Psk {
+        _ = context;
+        _ = obfuscated_age; // An external PSK has no ticket age to police.
+        if (!std.mem.eql(u8, offered, identity)) return null;
+        @memcpy(psk_out[0..secret.len], &secret);
+        return .{ .psk_bytes = secret.len, .kind = .external };
+    }
+};
+
+test "§4.2.11.2: an external PSK is accepted under the ext binder label" {
+    var context: u8 = 0;
+    var harness: Harness = undefined;
+    try harness.initLookup(.{ .context = &context, .lookup = ExternalStore.lookup });
+    defer harness.deinit();
+
+    var offer: test_client.Ticket = .{
+        .lifetime_s = 0,
+        .age_add = 0,
+        .nonce = undefined,
+        .nonce_bytes = 0,
+        .ticket = undefined,
+        .ticket_bytes = ExternalStore.identity.len,
+        .psk = undefined,
+        .psk_bytes = ExternalStore.secret.len,
+        .kind = .external,
+    };
+    @memcpy(offer.ticket[0..ExternalStore.identity.len], ExternalStore.identity);
+    @memcpy(offer.psk[0..ExternalStore.secret.len], &ExternalStore.secret);
+
+    var client = Client.init(&client_x25519_private, &.{ .resume_with = &offer });
+    defer client.deinit();
+    try completeHandshake(&harness.server, &client);
+
+    // The session came up on the PSK: no certificate, and the server
+    // says it resumed even though no ticket was ever issued — from
+    // §4.2.11's side the two are the same handshake.
+    try testing.expect(harness.server.resumed);
+    try testing.expect(client.psk_accepted);
+    try testing.expect(!client.certificate_verified);
+
+    // And it carries traffic, which is what says the two sides agreed on
+    // an early secret derived from a 16-byte PSK.
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var server_out: [record.wire_record_bytes_max]u8 = undefined;
+    const ping = try client.sendApplicationData("external", &client_out);
+    const event = try harness.server.handleRecord(ping, &server_out);
+    try testing.expectEqualSlices(u8, "external", event.application_data);
+}
+
+test "an external PSK offered under the resumption label is refused" {
+    var context: u8 = 0;
+    var harness: Harness = undefined;
+    try harness.initLookup(.{ .context = &context, .lookup = ExternalStore.lookup });
+    defer harness.deinit();
+
+    // Same identity, same secret, wrong label. §4.2.11.2 makes the label
+    // part of the computation, so this is a binder that does not verify
+    // — and the alert says so rather than saying "unknown identity",
+    // because the identity *was* ours.
+    var offer: test_client.Ticket = .{
+        .lifetime_s = 0,
+        .age_add = 0,
+        .nonce = undefined,
+        .nonce_bytes = 0,
+        .ticket = undefined,
+        .ticket_bytes = ExternalStore.identity.len,
+        .psk = undefined,
+        .psk_bytes = ExternalStore.secret.len,
+        .kind = .resumption,
+    };
+    @memcpy(offer.ticket[0..ExternalStore.identity.len], ExternalStore.identity);
+    @memcpy(offer.psk[0..ExternalStore.secret.len], &ExternalStore.secret);
+
+    var client = Client.init(&client_x25519_private, &.{ .resume_with = &offer });
+    defer client.deinit();
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    const hello = client.helloRecord(&client_out);
+    try testing.expectError(
+        error.DecryptError,
+        harness.server.handleRecord(hello, &server_out),
+    );
 }
 
 test "resumption failure paths: bad binder is fatal, unknown ticket falls back" {

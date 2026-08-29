@@ -10,8 +10,8 @@ itself.
 It runs: `zig build tlsfuzzer`.
 
 ```
-tlsfuzzer: 18 scripts to run, 39 disabled (0 of those untriaged)
-tlsfuzzer: 18 scripts passed, 0 failed, 39 disabled, floor 18
+tlsfuzzer: 19 scripts to run, 38 disabled (0 of those untriaged)
+tlsfuzzer: 19 scripts passed, 0 failed, 38 disabled, floor 19
 tlsfuzzer: PASS
 ```
 
@@ -59,7 +59,7 @@ is reporting on the fixture.
 
 ## The numbers, and the debt
 
-**18 of 57** `test-tls13-*` scripts run, 1345 conversations between them.
+**19 of 57** `test-tls13-*` scripts run, 1348 conversations between them.
 `test-tls13-lengths` is 1002 of those on its own: every plaintext length
 from 1 to 2^14, each echoed back and checked for size.
 `test-tls13-connection-abort` is another 150, aborting the connection at
@@ -72,7 +72,7 @@ RSA signature scripts, the 68 conversations of `record-layer-limits`
 walking §5.1's and §5.2's caps from both sides since finding 7 closed,
 and `ccs` since finding 8 did.
 
-**39 disabled, none of them untriaged.** 24 carry scope reasons that were
+**38 disabled, none of them untriaged.** 24 carry scope reasons that were
 always plain — client certificates, FFDHE, brainpool curves, EdDSA,
 ML-DSA, ML-KEM, 0-RTT, compressed certificates, `psk_ke` without (EC)DHE,
 TLS 1.2 fallback, AES-CCM — each pointing at a written decision. The
@@ -90,8 +90,20 @@ defects into `Not a defect` with a number behind it —
 `shuffled-extentions` and `large-number-of-extensions` score *identically*
 under OpenSSL, 2 of 19 and 2 of 22.
 
-One caution about those counts, learned by measuring twice: some scripts
-randomise their own vectors, so their pass count moves run to run with
+Two cautions about measuring by hand, both learned the expensive way.
+
+The first is stale listeners. `zig build tlsfuzzer` starts and stops its
+own harnesses, but a hand-driven sweep leaves one bound to 4433/4434,
+and the *next* sweep's harness loses the bind and scores against the old
+binary. It reads like a fix that did not work — twice it did exactly
+that here, once for finding 10 and once for finding 12. Worse, the
+obvious cleanup is silently wrong: `pkill -x zssl-tlsfuzzer-server`
+matches nothing, because the name is longer than the 15 characters
+`/proc/<pid>/comm` keeps, and `pkill -f` matches the shell running it.
+Resolving `/proc/<pid>/exe` is the version that means what it says. Ten
+stale harnesses were running when that was finally checked.
+
+The second is randomisation: some scripts randomise their own vectors, so their pass count moves run to run with
 nothing changing underneath. `symetric-ciphers` scored 59, 71, 69 and 75
 on one unmodified binary. Its entry names the cause — every failure is an
 AES-CCM suite — and deliberately carries no number, because a number that
@@ -103,7 +115,7 @@ and a debt that is not counted is a debt that is not paid. A new script
 arriving with a pin bump may push it back above zero; triage it before
 the commit lands, never after.
 
-**The floor** is 18. `scripts.json` can disable a script, but not quietly:
+**The floor** is 19. `scripts.json` can disable a script, but not quietly:
 the passing count falls with it and the gate goes red.
 
 ## What it cost to get here
@@ -351,35 +363,50 @@ script's *expectation* was read instead of our reply.
     the next reader will notice `legacy-version` scoring 2 of 10 and
     reach for the same fix.
 
-12. **An external PSK's binder cannot verify.** §4.2.11.2 derives
+12. **An external PSK's binder could not verify.** §4.2.11.2 derives
     `binder_key` from the early secret under one of two labels — "ext
     binder" for a PSK established out of band, "res binder" for one that
     came from a NewSessionTicket — and `key_schedule.zig` only ever
-    writes `"res binder"`. So an external PSK is not merely unsupported;
-    it is refused with `decrypt_error`, which reads like a bad key
-    rather than a capability we do not have.
+    wrote `"res binder"`. So an external PSK was not merely unsupported;
+    it was refused with `decrypt_error`, which reads like a bad key
+    rather than a capability we did not have.
 
-    This was measured, not read. `tlsfuzzer/server.zig` grew `--psk` and
-    `--psk-iden`, the harness's `psk_lookup` answered the script's
-    identity with the script's own 32-byte secret, and a debug print
-    confirmed the lookup matched — `identity=74657374` is `test` — and
-    still every conversation died. The alert is the tell: an identity we
-    do not recognise falls through to a certificate handshake the hello
-    cannot support and yields `handshake_failure`, which is what the
-    first triage saw; an identity we *do* recognise whose binder does
-    not verify yields `decrypt_error`, which is what appeared the moment
-    the flags worked. tlslite writes `"ext binder"` here
-    (`handshakehelpers.py:55`), so the two implementations disagree on
-    the label and on nothing else.
+    Measured rather than read. `--psk`/`--psk-iden` went onto the
+    harness, the lookup answered the script's identity with the script's
+    own secret, and a debug print confirmed the match —
+    `identity=74657374` is `test` — and every conversation still died.
+    The alert is the tell: an unknown identity falls through to a
+    certificate handshake the hello cannot support and yields
+    `handshake_failure`; a *known* identity whose binder does not verify
+    yields `decrypt_error`, which appeared the moment the flags worked.
 
-    Closing it is not a fixture and not a flag. `Config.psk_lookup`
-    returns a length and nothing else, so the machine cannot tell which
-    label the PSK it just received deserves — the seam would have to
-    carry the PSK's *kind*, which is a public API change on top of a
-    DESIGN.md §1 that scopes this to "PSK resumption" and a
-    `psk_lookup` whose own doc comment calls itself the resumption seam.
-    The capability was never claimed; the flags were reverted rather
-    than left as machinery with nothing behind them.
+    Closed by carrying the kind. `ServerHandshake.Psk` — the new answer
+    from `psk_lookup` — reports whether the key it just wrote is a
+    resumption or an external one, because the wire carries an identity
+    and says nothing about provenance: only whoever recognised the
+    identity can say. `key_schedule.PskKind` owns the two labels and
+    `pskBinder` takes it. The client half still offers resumption PSKs
+    only; `client_messages` infers the suite from the PSK's *length*,
+    which an arbitrary-length external key would break, and DESIGN.md §1
+    now says so.
+
+    The length rule moved with it, and this is the part a test caught
+    that the corpus would not have. A resumption PSK is exactly a hash
+    long because §4.6.1 derives it that way, and three places asserted
+    that — `initEarly`, and `startHandshakeKeys` on both machines.
+    §4.2.11 associates a *hash* with an external PSK and says nothing
+    about the key's length, so the moment external keys became
+    acceptable those equalities were **reachable assertions on a length
+    an embedder supplies about an identity the peer chose**. An in-tree
+    test offering a 16-byte external PSK aborted the process on
+    `ServerHandshake.zig:1229`; the bound is a range now. tlsfuzzer
+    alone would never have found it, because the script's key is a hash
+    long.
+
+    `test-tls13-psk_dhe_ke` **0 of 4 -> 3**, and into `Run` with
+    `-e ffdhe2048`: that conversation wants finite-field DHE, which
+    DESIGN.md §1 excludes, and the harness says so in as many words —
+    "no preferred key share". Floor 18 -> 19, badge 19/57.
 
 13. **Records interleaved with a fragmented handshake message were
     accepted.** §5.1: "Handshake messages MUST NOT be interleaved with
@@ -424,9 +451,9 @@ the shape of the debt that was paid.
 
 | Verdict | Scripts |
 | --- | --- |
-| **SCOPE** — needs a capability or a fixture we chose not to carry | `ecdhe-curves`, `ecdsa-support`, `psk_dhe_ke`, `rsapss-signatures`, `serverhello-random`, `session-resumption`, `signature-algorithms` |
+| **SCOPE** — needs a capability or a fixture we chose not to carry | `ecdhe-curves`, `ecdsa-support`, `rsapss-signatures`, `serverhello-random`, `session-resumption`, `signature-algorithms` |
 | **KEEP** — the corpus wants one reading of the RFC and a second corpus demands the other | `finished` (7), `legacy-version` (11) |
-| **Green, and now in `Run`** | `record-layer-limits` (9, 7), `ccs` (8), `zero-length-data` (10) |
+| **Green, and now in `Run`** | `record-layer-limits` (9, 7), `ccs` (8), `zero-length-data` (10), `psk_dhe_ke` (12) |
 | **Not a defect** — the corpus is stating its own policy, or the harness's shape | `keyupdate` (flaky; see its entry), `keyupdate-from-server`, `large-number-of-extensions`, `multiple-ccs-messages`, `shuffled-extentions`, `zero-content-type` |
 
 Two patterns are worth carrying forward. The **SCOPE** column looked at
@@ -447,16 +474,17 @@ the measured version:
   RSA-PSS-`rsae`. Adding either leaf is a policy change first and a
   `.pem` second, which is what keeps `ecdsa-support` and
   `rsapss-signatures` in this column.
-- **`psk_dhe_ke` is not two flags either**, and that took building them
-  to find out — finding 12 below. An external PSK's binder is derived
-  under a different label than a resumption PSK's, and zssl only writes
-  the resumption one.
+- **`psk_dhe_ke` was not two flags either**, and that took building
+  them to find out — finding 12. It needed a binder label, a public API
+  that could report which one, and a length bound that stopped being an
+  equality; the flags were the last mile, not the work. It is green now.
 
-So: one fixture that was genuinely just a fixture, and three scripts
-that need DESIGN.md to move before any `.pem` or flag would help. The
-estimate this paragraph used to carry was wrong in the same direction
-each time — a missing *capability* reads like a missing fixture right up
-until you supply the fixture.
+So: one fixture that was genuinely just a fixture, one script that
+needed a capability behind the flags, and two that still need DESIGN.md
+to move before any `.pem` would help. The estimate this paragraph used
+to carry was wrong in the same direction each time — a missing
+*capability* reads like a missing fixture right up until you supply the
+fixture.
 
 And every **Not a defect** in the table is a number, not an opinion:
 `shuffled-extentions` and `large-number-of-extensions` score identically

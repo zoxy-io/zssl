@@ -30,11 +30,11 @@ const tlsfuzzer_commit = "5eebc4464e5197a7f7392fb9acda99cfc32441f7";
 const tlslite_requirement = "tlslite-ng==0.9.0b2";
 const ecdsa_requirement = "ecdsa>=0.15";
 
-/// What the pin above scores on this tree: 18 scripts, 1345
+/// What the pin above scores on this tree: 19 scripts, 1348
 /// conversations between them. Raise it whenever a fix moves the number
 /// up; a drop is either a regression or a suppression, and both deserve
 /// to stop the build.
-const passing_floor: u32 = 18;
+const passing_floor: u32 = 19;
 
 const work_dir = "zig-out/tlsfuzzer";
 const checkout_dir = work_dir ++ "/tlsfuzzer";
@@ -77,6 +77,18 @@ const leaves = [_]Leaf{
 
 /// What a `Run` entry that names no leaf is served.
 const default_leaf = "ecdsa";
+
+/// The out-of-band PSK both harnesses carry, and the identity it answers
+/// to. `test-tls13-psk_dhe_ke` is the only script that offers an
+/// external identity, and it needs both sides to hold the same bytes —
+/// so the value lives here and its `arguments` entry in `scripts.json`
+/// repeats it, rather than each side inventing one.
+///
+/// Throwaway material by construction: it authenticates nothing but a
+/// loopback conversation with a corpus, and it is committed for the same
+/// reason `src/testdata`'s keys are.
+const external_psk_hex = "ab" ** 32;
+const external_psk_identity = "test";
 
 /// Generous: a cold run clones the corpus and pip-installs two packages
 /// before a single script runs.
@@ -363,9 +375,10 @@ fn startServer(
     const server = try arena.create(Server);
     server.child = try std.process.spawn(io, .{
         .argv = &.{
-            absolute,      "--port",       port,
-            "--cert",      leaf.cert_path, "--key",
-            leaf.key_path,
+            absolute,      "--port",              port,
+            "--cert",      leaf.cert_path,        "--key",
+            leaf.key_path, "--psk",               external_psk_hex,
+            "--psk-iden",  external_psk_identity,
         },
         .stdin = .ignore,
         .stdout = .ignore,

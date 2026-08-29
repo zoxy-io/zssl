@@ -78,6 +78,17 @@ const Options = struct {
     /// NewSessionTickets to issue per connection. Zero is a legitimate
     /// configuration and some scripts ask for exactly that.
     tickets: u8 = 1,
+    /// An out-of-band PSK, as hex, and the identity it answers to.
+    /// `test-tls13-psk_dhe_ke` is written against a server that has one:
+    /// every conversation it runs offers an external identity, and a
+    /// server with none can only answer handshake_failure, which is the
+    /// fixture reporting on itself rather than on us.
+    ///
+    /// Hex because that is the form the script's own `--psk` takes, so
+    /// the two sides are copied from one place. Null leaves `psk_lookup`
+    /// answering resumption identities alone.
+    psk: ?[]const u8 = null,
+    psk_identity: []const u8 = "test",
     /// Seconds one conversation may take. Five is right for tlsfuzzer,
     /// whose scripts are fast and whose abort cases *need* a short
     /// deadline to keep a sequential listener from starving. TLS-Anvil
@@ -109,7 +120,21 @@ pub fn main(init: std.process.Init) !u8 {
     // part of the interface rather than decoration.
     std.debug.print("zssl-tlsfuzzer-server: listening on 127.0.0.1:{d}\n", .{options.port});
 
+    var external_storage: [cipher_suite.hash_bytes_max]u8 = undefined;
     var store: TicketStore = .{};
+    if (options.psk) |hex| {
+        // Refused here rather than shrugged at: a harness that quietly
+        // ran without the key it was told to use would fail the script
+        // for a reason that is not the library's, which is the failure
+        // mode two leaves already exist to avoid.
+        if (hex.len % 2 != 0) return error.BadFlagValue;
+        if (hex.len / 2 > external_storage.len) return error.BadFlagValue;
+        if (hex.len == 0) return error.BadFlagValue;
+        const secret = external_storage[0 .. hex.len / 2];
+        _ = std.fmt.hexToBytes(secret, hex) catch return error.BadFlagValue;
+        store.external = secret;
+        store.external_identity = options.psk_identity;
+    }
     var served: u64 = 0;
     while (true) : (served += 1) {
         const stream = listener.accept(io) catch continue;
@@ -150,6 +175,10 @@ fn parseArguments(init: std.process.Init, arena: std.mem.Allocator) !Options {
             if (options.connection_budget_s == 0) return error.BadFlagValue;
         } else if (std.mem.eql(u8, argument, "--tickets")) {
             options.tickets = std.fmt.parseInt(u8, value, 10) catch return error.BadFlagValue;
+        } else if (std.mem.eql(u8, argument, "--psk")) {
+            options.psk = value;
+        } else if (std.mem.eql(u8, argument, "--psk-iden")) {
+            options.psk_identity = value;
         } else {
             return error.UnknownFlag;
         }
@@ -158,25 +187,42 @@ fn parseArguments(init: std.process.Init, arena: std.mem.Allocator) !Options {
     return options;
 }
 
-/// The embedder's ticket state, kept across connections so the
-/// resumption scripts have something to come back with. One slot: the
-/// scripts offer the ticket they were most recently given.
+/// The embedder's PSK state: the ticket last issued, kept across
+/// connections so the resumption scripts have something to come back
+/// with, and an out-of-band key when `--psk` configured one.
+///
+/// Both answer through the same seam, which is the point of
+/// `ServerHandshake.Psk` carrying a kind — §4.2.11.2 derives the binder
+/// under a different label for each, and only this side knows which.
 const TicketStore = struct {
     psk: [cipher_suite.hash_bytes_max]u8 = undefined,
     psk_bytes: u8 = 0,
+    /// `--psk`/`--psk-iden`, already decoded from hex.
+    external: ?[]const u8 = null,
+    external_identity: []const u8 = "",
 
     fn lookup(
         context: *anyopaque,
         identity: []const u8,
         obfuscated_age: u32,
         psk_out: *[cipher_suite.hash_bytes_max]u8,
-    ) ?u8 {
+    ) ?ServerHandshake.Psk {
         _ = obfuscated_age; // Age policy is the embedder's; this one has none.
         const self: *TicketStore = @ptrCast(@alignCast(context));
+        // The external key first: it is configured once and never
+        // changes, where the ticket slot holds whatever the last
+        // connection left behind.
+        if (self.external) |secret| {
+            if (std.mem.eql(u8, identity, self.external_identity)) {
+                assert(secret.len <= psk_out.len);
+                @memcpy(psk_out[0..secret.len], secret);
+                return .{ .psk_bytes = @intCast(secret.len), .kind = .external };
+            }
+        }
         if (self.psk_bytes == 0) return null;
         if (!std.mem.eql(u8, identity, ticket_identity)) return null;
         psk_out.* = self.psk;
-        return self.psk_bytes;
+        return .{ .psk_bytes = self.psk_bytes, .kind = .resumption };
     }
 };
 

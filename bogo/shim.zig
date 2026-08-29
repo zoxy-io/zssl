@@ -375,13 +375,17 @@ const TicketStore = struct {
         identity: []const u8,
         obfuscated_age: u32,
         psk_out: *[cipher_suite.hash_bytes_max]u8,
-    ) ?u8 {
+    ) ?ServerHandshake.Psk {
         _ = obfuscated_age; // Age policy is the embedder's; this one has none.
         const self: *TicketStore = @ptrCast(@alignCast(context));
         if (self.psk_bytes == 0) return null;
         if (!std.mem.eql(u8, self.identity[0..self.identity_bytes], identity)) return null;
         psk_out.* = self.psk;
-        return self.psk_bytes;
+        // Every PSK this shim knows came from a ticket it issued a
+        // moment ago, so the binder label is "res binder". BoGo drives no
+        // external-PSK case at this pin; if it ever does, this is the
+        // line that has to learn the difference.
+        return .{ .psk_bytes = self.psk_bytes, .kind = .resumption };
     }
 };
 
