@@ -292,7 +292,19 @@ const Pump = struct {
         while (records_seen < records_per_phase_max) : (records_seen += 1) {
             const one = pump.nextRecord() catch |err| switch (err) {
                 error.PeerClosed => return,
-                else => return err,
+                // Through `abort` like every other refusal. A record
+                // rejected at its *header* — §5.1's cap above all — is
+                // refused before `handleRecord` is ever called, and
+                // returning that raw is how it used to reach the peer
+                // as an abrupt close rather than as the alert the table
+                // names. `handshake` never had the bug because `serve`
+                // wraps the whole call; this loop is its own caller and
+                // has to say so. A library that refuses correctly and a
+                // harness that reports the refusal as silence are
+                // indistinguishable from a library that does not refuse:
+                // this one line was 50 conversations of
+                // `test-tls13-record-layer-limits`.
+                else => return pump.abort(server, err),
             };
             const event = server.handleRecord(one, &pump.out) catch |err| {
                 return pump.abort(server, err);

@@ -227,23 +227,26 @@ library's until the OpenSSL oracle said otherwise.
    Costs `test-tls13-ccs` its only failure — the other four pass, and
    OpenSSL passes all five — and one conversation of
    `test-tls13-multiple-ccs-messages`.
-9. **(harness) A record refused at its header closes the connection
+9. **(harness) A record refused at its header closed the connection
    without an alert, but only after the handshake.** `Pump.converse`
-   routes `handleRecord`'s errors through `Pump.abort`, which sends
-   whatever the table names — and returns `nextRecord`'s errors raw, to a
-   caller that swallows them and closes. So every header-level refusal
-   after `connected` reaches the peer as an abrupt close: `RecordOverflow`
+   routed `handleRecord`'s errors through `Pump.abort`, which sends
+   whatever the table names — and returned `nextRecord`'s errors raw, to
+   a caller that swallowed them and closed. So every header-level refusal
+   after `connected` reached the peer as an abrupt close: `RecordOverflow`
    above all, which is the single most-tested refusal in the corpus.
-   During the handshake the same path *is* wrapped, which is exactly why
-   this hid — the gate's own scripts exercise the guarded half.
+   During the handshake the same path *is* wrapped, by `serve`, which is
+   exactly why this hid — the gate's own scripts exercise the guarded
+   half.
 
    zssl's answer was right the whole time. §5.1's cap is enforced at
    header parse in `record.zig`, where CLAUDE.md's invariant says it
-   must be, and the harness threw the verdict away. Measured: routing
-   that path through `abort` too takes `test-tls13-record-layer-limits`
-   from **16 of 68 to 66**, past OpenSSL's 62 on the same script. A
-   library that refuses correctly and a harness that reports it as
-   silence are indistinguishable from a library that does not refuse.
+   must be, and the harness threw the verdict away. Routing that path
+   through `abort` too took `test-tls13-record-layer-limits` from **16 of
+   68 to 66**, past OpenSSL's 62 on the same script — one line, fifty
+   conversations. A library that refuses correctly and a harness that
+   reports it as silence are indistinguishable from a library that does
+   not refuse, which is the reason to record a harness bug at the same
+   weight as a library one.
 10. **(harness) The echo answers every record; the scripts expect one
     reply.** `converse` echoes each application-data record as it
     arrives, which is what `test-tls13-lengths` needs — 1002
@@ -289,7 +292,7 @@ the shape of the debt that was paid.
 
 | Verdict | Scripts |
 | --- | --- |
-| **OPEN GAP** — a defect we mean to fix | `ccs` (8), `finished` (7), `keyupdate` (7, 10), `legacy-version` (11), `record-layer-limits` (9, 7) |
+| **OPEN GAP** — a defect we mean to fix | `ccs` (8), `finished` (7), `keyupdate` (7, 10), `legacy-version` (11), `record-layer-limits` (7; 9 closed) |
 | **SCOPE** — needs a capability or a fixture we chose not to carry | `ecdhe-curves`, `ecdsa-support`, `psk_dhe_ke`, `rsapss-signatures`, `serverhello-random`, `session-resumption`, `signature-algorithms` |
 | **Not a defect** — the corpus is stating its own policy, or the harness's shape | `keyupdate-from-server`, `large-number-of-extensions`, `multiple-ccs-messages`, `shuffled-extentions`, `zero-content-type`, `zero-length-data` |
 
