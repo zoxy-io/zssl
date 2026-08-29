@@ -282,7 +282,7 @@ its own CI workflow, so they run in parallel and fail separately.
 | Oracle | Status | Details |
 | --- | --- | --- |
 | [**BoGo**](docs/BOGO.md) | [![bogo](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml)<br>[![bogo passing](https://img.shields.io/badge/bogo-278%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | Hostile-peer corpus; checks *which* alert we send |
-| [**tlsfuzzer**](docs/TLSFUZZER.md) | [![tlsfuzzer](https://github.com/zoxy-io/zssl/actions/workflows/tlsfuzzer.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/tlsfuzzer.yml)<br>[![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-17%2F57%20scripts-yellow)](docs/TLSFUZZER.md) | A third implementation, driving our *server* |
+| [**tlsfuzzer**](docs/TLSFUZZER.md) | [![tlsfuzzer](https://github.com/zoxy-io/zssl/actions/workflows/tlsfuzzer.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/tlsfuzzer.yml)<br>[![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-18%2F57%20scripts-yellow)](docs/TLSFUZZER.md) | A third implementation, driving our *server* |
 | [**TLS-Anvil**](docs/TLSANVIL.md) | [![tlsanvil](https://github.com/zoxy-io/zssl/actions/workflows/tlsanvil.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/tlsanvil.yml)<br>[![tlsanvil passing](https://img.shields.io/badge/tls--anvil-115%20passing-brightgreen)](docs/TLSANVIL.md)<br>[![tlsanvil declined](https://img.shields.io/badge/tls--anvil-321%20declined-lightgrey)](docs/TLSANVIL.md#it-scopes-itself) | A corpus derived from the RFCs, not an implementation |
 | [**RFC 8448**](src/rfc8448_test.zig) | [![rfc8448](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml) | The RFC's traced bytes, reproduced exactly |
 | [**OpenSSL**](interop/main.zig) | [![interop](https://github.com/zoxy-io/zssl/actions/workflows/interop.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/interop.yml) | Four legs against a real `openssl` binary |
@@ -294,12 +294,12 @@ ClientHellos, tampered Finished messages, corrupted binders, inverted
 flights, sequence exhaustion.
 
 The gaps, stated plainly. All three adversarial gates decline far more
-than they run: BoGo never ran 6918 of its cases, tlsfuzzer runs 17
+than they run: BoGo never ran 6918 of its cases, tlsfuzzer runs 18
 scripts of 57, and 321 of TLS-Anvil's 437 tests opt out against a
 TLS 1.3-only server. That is why each carries a second, counted badge
 rather than a bare pass mark, and why each holds its passing count
 against a floor, so a regression or a quiet suppression stops the build.
-Nine findings sit on BoGo's ledger, tlsfuzzer's 40 declines are all
+Nine findings sit on BoGo's ledger, tlsfuzzer's 39 declines are all
 triaged and none of them now stands on an open gap, and TLS-Anvil has two
 open failures it refuses to suppress; the three documents name every one,
 with a reason.

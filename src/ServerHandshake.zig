@@ -312,13 +312,38 @@ pub fn handleRecord(self: *ServerHandshake, wire_record: []const u8, out: []u8) 
                 else => {},
             }
             if (self.ccs_seen == ccs_seen_max) return error.UnexpectedMessage;
+            // §5's tolerance is for a record between *flights*, not one
+            // wedged into a message being reassembled; §5.1 forbids that
+            // for "other record types" without excepting this one.
+            try self.refuseInterleavedRecord();
             self.ccs_seen += 1;
             return .none;
         },
-        .alert => return self.handlePlaintextAlert(wire_record[record.header_bytes..]),
+        .alert => {
+            try self.refuseInterleavedRecord();
+            return self.handlePlaintextAlert(wire_record[record.header_bytes..]);
+        },
         .handshake => return self.handlePlaintextHandshake(wire_record, out),
         .application_data => return self.handleProtectedRecord(wire_record, out),
     }
+}
+
+/// §5.1: "Handshake messages MUST NOT be interleaved with other record
+/// types. That is, if a handshake message is split over two or more
+/// records, there MUST NOT be any other records between them."
+///
+/// The assembler holding bytes here means exactly that and nothing
+/// else: `handleRecord` has already refused a *complete* undrained
+/// message with `EventsPending`, so whatever is left is a message whose
+/// length header arrived and whose body did not. A record of any other
+/// type on top of it is the interleaving §5.1 forbids.
+///
+/// It matters beyond tidiness. A peer that can park a half-message and
+/// then send freely decides how long we hold a partial reassembly, and
+/// tlsfuzzer walks exactly that: a KeyUpdate split in two with a
+/// request in the gap (docs/TLSFUZZER.md finding 10).
+fn refuseInterleavedRecord(self: *const ServerHandshake) Error!void {
+    if (!self.assembler.empty()) return error.UnexpectedMessage;
 }
 
 fn handlePlaintextAlert(self: *ServerHandshake, payload: []const u8) Error!Event {
@@ -740,9 +765,13 @@ fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: [
                 return error.UnexpectedMessage;
             }
             switch (opened.content_type) {
-                .alert => return self.handlePlaintextAlert(plaintext),
+                .alert => {
+                    try self.refuseInterleavedRecord();
+                    return self.handlePlaintextAlert(plaintext);
+                },
                 .handshake => return self.handleProtectedHandshake(arm, plaintext, out),
                 .application_data => {
+                    try self.refuseInterleavedRecord();
                     // Readable, not connected: our own close_notify
                     // shuts the write side, and the peer is entitled to
                     // keep sending until it closes its own (§6.1).

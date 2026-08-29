@@ -66,6 +66,10 @@
     },
     {
       "name": "test-tls13-unencrypted-alert.py"
+    },
+    {
+      "name": "test-tls13-zero-length-data.py",
+      "leaf": "rsa"
     }
   ],
   "Disabled": {
@@ -87,7 +91,7 @@
     "test-tls13-ffdhe-sanity.py": "Finite-field DHE: zssl does elliptic-curve key exchange only (DESIGN.md \u00a71).",
     "test-tls13-finished.py": "KEEP \u2014 39 of 42 over the rsa leaf; real OpenSSL passes 42. All three remaining send a Finished whose body is not the negotiated hash's length and want decode_error for it (\u00a76.2, \"the length of the message was incorrect\"); zssl answers decrypt_error, which is what \u00a74.4.4 demands of a Finished whose \"contents are correct\" test fails, and what BoGo's TrailingMessageData-TLS13-*Finished cases require of us in as many words. The two corpora disagree here and both run against this tree; finding 7 in docs/TLSFUZZER.md records the split and why \u00a74.4.4 wins.",
     "test-tls13-keyupdate-from-server.py": "Not a defect \u2014 2 of 3 over the rsa leaf. The one failure needs a server that sends a post-handshake KeyUpdate when the client fetches /keyupdate; this harness echoes rather than serving resources, and real OpenSSL s_server fails the same conversation.",
-    "test-tls13-keyupdate.py": "Not a defect \u2014 58 to 60 of 62 over the rsa leaf; the script samples its own vectors, so which conversations remain moves run to run. Finding 7 in docs/TLSFUZZER.md closed the two length cases ('empty' and 'large KeyUpdate message', now decode_error). What is left is finding 10, the harness echoing each application-data record where the script sends a request in several and waits for one reply. Real OpenSSL passes 62.",
+    "test-tls13-keyupdate.py": "Not a defect, and flaky \u2014 scored 55, 62, 62, 60 and 49 of 62 over the rsa leaf on one unmodified binary. Finding 13 in docs/TLSFUZZER.md closed the real failures (\u00a75.1 interleaving) and finding 10 the rest, and a clean run is 62 of 62. What is left is the harness's own 5-second connection budget: these conversations do post-handshake KeyUpdate with fragmentation, the listener is sequential, and a connection that ages out arrives as an abrupt close that reads exactly like a protocol failure. Raising the budget to 30s gave 61, 62, 62 \u2014 but the budget is what stops test-tls13-connection-abort's abandoned sockets from starving the listener, so it does not move for one script. Not in Run because a flaky gate is worse than a suppression.",
     "test-tls13-large-number-of-extensions.py": "Not a defect \u2014 2 of 22 over the rsa leaf, and real OpenSSL scores exactly the same 2 of 22. The script offers ClientHellos carrying a thousand-odd extensions; zssl caps them at 64 (client_hello.zig extensions_count_max) and answers decode_error. That is a deliberate bound under the no-allocator budget, and the corpus does not agree with itself about it.",
     "test-tls13-legacy-version.py": "KEEP \u2014 2 of 10 over either leaf; real OpenSSL passes 9. The script wants protocol_version for a ClientHello.legacy_version below 0x0300, and zssl never reads the field, because \u00a74.2.1 binds the reader: a server \"MUST NOT use the ClientHello.legacy_version value for version negotiation and MUST use only the 'supported_versions' extension\". Not a judgement call in the end \u2014 9baf500 removed exactly this check to satisfy BoGo, and re-adding it was measured to break five cases, the first named IgnoreLegacyVersion-TLS13. Finding 11 in docs/TLSFUZZER.md has the run.",
     "test-tls13-mldsa-in-certificate-verify.py": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",
@@ -107,7 +111,6 @@
     "test-tls13-symetric-ciphers.py": "AES-CCM: every failure is TLS_AES_128_CCM_SHA256 or TLS_AES_128_CCM_8_SHA256, outside the suite policy (DESIGN.md \u00a71). No count here on purpose \u2014 the script randomises its fuzz vectors, so it varies run to run.",
     "test-tls13-unrecognised-groups.py": "Groups outside x25519/secp256r1/secp384r1 (DESIGN.md \u00a71).",
     "test-tls13-version-negotiation.py": "TLS 1.2: every failing conversation is a fallback from a 1.3 draft codepoint to 1.2, which zssl does not implement (DESIGN.md \u00a71).",
-    "test-tls13-zero-content-type.py": "Not a defect \u2014 6 of 8 over either leaf; real OpenSSL passes 8. Both failures are finding 10 in docs/TLSFUZZER.md: the harness echoes each application-data record, and these two conversations send a request in three records and wait for a single reply.",
-    "test-tls13-zero-length-data.py": "Not a defect \u2014 8 of 11 over the rsa leaf; real OpenSSL passes 11. All three failures are finding 10, the harness's per-record echo answering a three-record request three times."
+    "test-tls13-zero-content-type.py": "Not a defect \u2014 6 of 8 over either leaf; real OpenSSL passes 8. Both remaining conversations send an incomplete request (\"GET /\", no blank line) and then a record with content type 0, and expect the alert and nothing else. zssl does send it \u2014 an unknown content type is refused at header parse \u2014 but the harness has already echoed the request, because it echoes anything and test-tls13-lengths needs exactly that across 1002 conversations. The script assumes a server that buffers until a request is complete; s_server -www is one and this is not. Finding 10 in docs/TLSFUZZER.md has the shape."
   }
 }

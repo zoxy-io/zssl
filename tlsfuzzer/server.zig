@@ -289,6 +289,28 @@ const Pump = struct {
     /// with our own — `ExpectAlert` in the scripts is waiting for it.
     fn converse(pump: *Pump, server: *ServerHandshake) !void {
         var records_seen: u32 = 0;
+        // One reply per *run* of application-data records, where any
+        // other record starts a new run.
+        //
+        // Echoing every record is what `test-tls13-lengths` needs — 1002
+        // conversations, each sending one record and checking the reply
+        // is exactly as long. Several other scripts split one request
+        // across three records and then wait for a single response, and
+        // read our second echo where they expected an alert or a ticket.
+        // Answering the first of a run satisfies both: `lengths` sends
+        // one record, so its run is one record long.
+        //
+        // A run has to end on a non-application record rather than on a
+        // reply, because `test-tls13-keyupdate` sends a request, a
+        // KeyUpdate, and a second request, and expects an answer to
+        // each. Resetting on the KeyUpdate is what keeps that a two-reply
+        // conversation while the three-record ones stay at one.
+        //
+        // A zero-length application record does not end a run: §5.4
+        // makes it legal application data, the scripts interleave them
+        // with the fragments on purpose, and treating one as a boundary
+        // would echo the fragment behind it.
+        var echoed_this_run = false;
         while (records_seen < records_per_phase_max) : (records_seen += 1) {
             const one = pump.nextRecord() catch |err| switch (err) {
                 error.PeerClosed => return,
@@ -324,6 +346,8 @@ const Pump = struct {
                 switch (event) {
                     .application_data => |bytes| {
                         if (bytes.len == 0) continue;
+                        if (echoed_this_run) continue;
+                        echoed_this_run = true;
                         // Echo, byte for byte. A canned HTTP response answers
                         // "did anything come back" and nothing else, which is
                         // all most scripts ask — but `test-tls13-lengths`
@@ -362,8 +386,11 @@ const Pump = struct {
                         pump.write(server.sendAlert(.close_notify, &pump.out)) catch {};
                         return;
                     },
-                    .send => |bytes| try pump.write(bytes),
-                    .none, .connected => {},
+                    .send => |bytes| {
+                        echoed_this_run = false;
+                        try pump.write(bytes);
+                    },
+                    .none, .connected => echoed_this_run = false,
                 }
             }
         }

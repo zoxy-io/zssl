@@ -425,10 +425,16 @@ pub fn handleRecord(self: *ClientHandshake, wire_record: []const u8, out: []u8) 
                 else => {},
             }
             if (self.ccs_seen == ccs_seen_max) return error.UnexpectedMessage;
+            // §5's tolerance is for a record between *flights*, not one
+            // wedged into a message being reassembled.
+            try self.refuseInterleavedRecord();
             self.ccs_seen += 1;
             return .none;
         },
-        .alert => return self.handleAlertPayload(wire_record[record.header_bytes..]),
+        .alert => {
+            try self.refuseInterleavedRecord();
+            return self.handleAlertPayload(wire_record[record.header_bytes..]);
+        },
         .handshake => {
             if (self.state != .awaiting_server_hello) return error.UnexpectedMessage;
             try self.assembler.push(wire_record[record.header_bytes..]);
@@ -439,6 +445,16 @@ pub fn handleRecord(self: *ClientHandshake, wire_record: []const u8, out: []u8) 
         },
         .application_data => return self.handleProtectedRecord(wire_record, out),
     }
+}
+
+/// §5.1: "Handshake messages MUST NOT be interleaved with other record
+/// types. That is, if a handshake message is split over two or more
+/// records, there MUST NOT be any other records between them."
+///
+/// See `ServerHandshake.refuseInterleavedRecord`; both machines had the
+/// hole and both close it the same way.
+fn refuseInterleavedRecord(self: *const ClientHandshake) Error!void {
+    if (!self.assembler.empty()) return error.UnexpectedMessage;
 }
 
 fn handleAlertPayload(self: *ClientHandshake, payload: []const u8) Error!Event {
@@ -581,13 +597,17 @@ fn handleProtectedRecord(self: *ClientHandshake, wire_record: []const u8, out: [
                 return error.UnexpectedMessage;
             }
             switch (opened.content_type) {
-                .alert => return self.handleAlertPayload(plaintext),
+                .alert => {
+                    try self.refuseInterleavedRecord();
+                    return self.handleAlertPayload(plaintext);
+                },
                 .handshake => {
                     try self.assembler.push(plaintext);
                     if (self.state != .awaiting_flight) return self.handlePostHandshake(arm, out);
                     return self.drainFlight(arm, out);
                 },
                 .application_data => {
+                    try self.refuseInterleavedRecord();
                     // Readable, not connected: our own close_notify
                     // shuts the write side, and the peer is entitled to
                     // keep sending until it closes its own (§6.1).

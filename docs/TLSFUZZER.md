@@ -10,8 +10,8 @@ itself.
 It runs: `zig build tlsfuzzer`.
 
 ```
-tlsfuzzer: 17 scripts to run, 40 disabled (0 of those untriaged)
-tlsfuzzer: 17 scripts passed, 0 failed, 40 disabled, floor 17
+tlsfuzzer: 18 scripts to run, 39 disabled (0 of those untriaged)
+tlsfuzzer: 18 scripts passed, 0 failed, 39 disabled, floor 18
 tlsfuzzer: PASS
 ```
 
@@ -59,7 +59,7 @@ is reporting on the fixture.
 
 ## The numbers, and the debt
 
-**17 of 57** `test-tls13-*` scripts run, 1334 conversations between them.
+**18 of 57** `test-tls13-*` scripts run, 1345 conversations between them.
 `test-tls13-lengths` is 1002 of those on its own: every plaintext length
 from 1 to 2^14, each echoed back and checked for size.
 `test-tls13-connection-abort` is another 150, aborting the connection at
@@ -72,7 +72,7 @@ RSA signature scripts, the 68 conversations of `record-layer-limits`
 walking §5.1's and §5.2's caps from both sides since finding 7 closed,
 and `ccs` since finding 8 did.
 
-**40 disabled, none of them untriaged.** 24 carry scope reasons that were
+**39 disabled, none of them untriaged.** 24 carry scope reasons that were
 always plain — client certificates, FFDHE, brainpool curves, EdDSA,
 ML-DSA, ML-KEM, 0-RTT, compressed certificates, `psk_ke` without (EC)DHE,
 TLS 1.2 fallback, AES-CCM — each pointing at a written decision. The
@@ -103,16 +103,18 @@ and a debt that is not counted is a debt that is not paid. A new script
 arriving with a pin bump may push it back above zero; triage it before
 the commit lands, never after.
 
-**The floor** is 17. `scripts.json` can disable a script, but not quietly:
+**The floor** is 18. `scripts.json` can disable a script, but not quietly:
 the passing count falls with it and the gate goes red.
 
 ## What it cost to get here
 
-Twelve defects, all found by running things rather than reading them, and
-each worth recording because each looked like something else. 1 through 3
-are the harness's and the gate's; 4 through 8, 11 and 12 are the
-library's; 9 and 10 are the harness's again, and both were mistaken for
-the library's until the OpenSSL oracle said otherwise.
+Thirteen defects, all found by running things rather than reading them,
+and each worth recording because each looked like something else. 1
+through 3 are the harness's and the gate's; 4 through 8, 11, 12 and 13
+are the library's; 9 and 10 are the harness's again, and both were
+mistaken for the library's until the OpenSSL oracle said otherwise —
+while 13 went the other way, filed under 10 as a harness shape until the
+script's *expectation* was read instead of our reply.
 
 1. **The listener starved.** It is sequential, and tlsfuzzer's abort
    cases deliberately leave sockets that never send again — one held the
@@ -290,21 +292,37 @@ the library's until the OpenSSL oracle said otherwise.
    reports it as silence are indistinguishable from a library that does
    not refuse, which is the reason to record a harness bug at the same
    weight as a library one.
-10. **(harness) The echo answers every record; the scripts expect one
-    reply.** `converse` echoes each application-data record as it
-    arrives, which is what `test-tls13-lengths` needs — 1002
+10. **(harness) The echo answered every record; several scripts expect
+    one reply.** `converse` echoed each application-data record as it
+    arrived, which is what `test-tls13-lengths` needs — 1002
     conversations each checking the reply's *length* against what they
     sent. Several other scripts split one request across three records
     and then wait for a single response, and read our second echo where
-    they expected an alert or a ticket. Real `s_server -www` answers
-    once and passes all of them.
+    they expected an alert or a ticket.
 
-    Costs `test-tls13-zero-length-data` (3 of 11),
-    `test-tls13-zero-content-type` (2 of 8) and one conversation of
-    `test-tls13-keyupdate`. It is a genuine tension rather than an
-    oversight — `lengths` and these want opposite things from the same
-    loop — and it is recorded so the next reader does not spend the
-    afternoon we spent proving it was not a record-layer bug.
+    The rule is now one reply per *run* of application-data records,
+    where any other record starts a new run. `lengths` sends one record,
+    so its run is one record long and nothing changes for it. A run ends
+    on a non-application record rather than on a reply, because
+    `test-tls13-keyupdate` sends a request, a KeyUpdate and a second
+    request and expects an answer to each — resetting on the KeyUpdate
+    is what keeps that a two-reply conversation while the three-record
+    ones become one. A zero-length application record does not end a
+    run: §5.4 makes it legal application data, the scripts interleave
+    them with the fragments on purpose, and treating one as a boundary
+    would echo the fragment behind it.
+
+    `test-tls13-zero-length-data` **8 of 11 -> 11**, and into `Run`.
+
+    `test-tls13-zero-content-type` keeps 2 of 8, and those two are not
+    fixable here. They send an incomplete request — `GET /`, no blank
+    line — then a record with content type 0, and expect the alert and
+    nothing else. We do send it. The echo of the request simply arrives
+    first, and a server that would stay silent is one that buffers until
+    a request is complete: `s_server -www` is such a server and an echo
+    harness cannot be, because `lengths` is 1002 conversations that
+    require the opposite. The entry says so rather than calling it open.
+
 11. **`ClientHello.legacy_version` is ignored, and that is the rule.**
     §4.1.2 says the client "MUST" set it to 0x0303, and §4.2.1 says a
     server "MUST NOT use the ClientHello.legacy_version value for version
@@ -363,10 +381,40 @@ the library's until the OpenSSL oracle said otherwise.
     The capability was never claimed; the flags were reverted rather
     than left as machinery with nothing behind them.
 
-Five of the twelve were the harness's or the gate's — three at the start,
-and 9 and 10 found here, both of which read as library defects until the
-oracle disagreed. The other seven are the library's. None of the twelve
-would have been visible to a gate that was only read.
+13. **Records interleaved with a fragmented handshake message were
+    accepted.** §5.1: "Handshake messages MUST NOT be interleaved with
+    other record types. That is, if a handshake message is split over
+    two or more records, there MUST NOT be any other records between
+    them." zssl pushed handshake fragments into the assembler and
+    dispatched every other record type without ever asking whether a
+    message was half-assembled, so a peer could park a length header,
+    send application data, alerts and compatibility CCS records at will,
+    and then finish the message later.
+
+    Found by mis-triage, which is the part worth recording.
+    `test-tls13-keyupdate`'s "fragmented keyupdate msg, appdata between"
+    was filed under finding 10 because the symptom was an
+    `ApplicationData` where the script wanted something else — and the
+    something else was not a missing reply, it was a **fatal alert**.
+    The script splits a KeyUpdate in two and puts a request in the gap;
+    reading what it *expected* rather than what we sent is what turned
+    an echo-shape complaint into a §5.1 defect.
+
+    Both machines had it and both now ask
+    `refuseInterleavedRecord` before dispatching a non-handshake record.
+    The check is exact rather than heuristic: `handleRecord` already
+    refuses a *complete* undrained message with `EventsPending`, so
+    bytes left in the assembler at that point are a fragment and nothing
+    else. It matters past tidiness — a peer that can park a half-message
+    and keep sending decides how long we hold a partial reassembly.
+
+    BoGo 278 passed / 0 failed with it, including the compatibility-CCS
+    half, which was the part most likely to object.
+
+Five of the thirteen were the harness's or the gate's — three at the
+start, and 9 and 10 found here, both of which read as library defects
+until the oracle disagreed. The other eight are the library's. None of
+the thirteen would have been visible to a gate that was only read.
 
 ## The triage of the eighteen
 
@@ -378,8 +426,8 @@ the shape of the debt that was paid.
 | --- | --- |
 | **SCOPE** — needs a capability or a fixture we chose not to carry | `ecdhe-curves`, `ecdsa-support`, `psk_dhe_ke`, `rsapss-signatures`, `serverhello-random`, `session-resumption`, `signature-algorithms` |
 | **KEEP** — the corpus wants one reading of the RFC and a second corpus demands the other | `finished` (7), `legacy-version` (11) |
-| **Green, and now in `Run`** | `record-layer-limits` (findings 9 and 7), `ccs` (finding 8) |
-| **Not a defect** — the corpus is stating its own policy, or the harness's shape | `keyupdate`, `keyupdate-from-server`, `large-number-of-extensions`, `multiple-ccs-messages`, `shuffled-extentions`, `zero-content-type`, `zero-length-data` |
+| **Green, and now in `Run`** | `record-layer-limits` (9, 7), `ccs` (8), `zero-length-data` (10) |
+| **Not a defect** — the corpus is stating its own policy, or the harness's shape | `keyupdate` (flaky; see its entry), `keyupdate-from-server`, `large-number-of-extensions`, `multiple-ccs-messages`, `shuffled-extentions`, `zero-content-type` |
 
 Two patterns are worth carrying forward. The **SCOPE** column looked at
 first like mostly fixtures rather than protocol, and an earlier draft of
