@@ -532,7 +532,7 @@ fn runClient(
     var protocols: [alpn_protocols_max][]const u8 = undefined;
     const offered = try splitAlpn(connection.advertise_alpn, &protocols);
 
-    var entropy: [96]u8 = undefined;
+    var entropy: [144]u8 = undefined;
     io.random(&entropy);
     var resumption: ?ClientHandshake.Resumption = null;
     if (connection.index >= 1 and store.psk_bytes >= 1) {
@@ -549,6 +549,11 @@ fn runClient(
     var client = ClientHandshake.init(&.{
         .client_random = entropy[0..32].*,
         .x25519_private = entropy[32..64].*,
+        // The second scalar, which is what lets this client answer a
+        // HelloRetryRequest at all (DESIGN.md §1). BoGo drives two dozen
+        // retry cases at the client half, and every one of them was
+        // declined while there was nothing to answer with.
+        .retry_key_share_private = entropy[96..144].*,
         .session_id = entropy[64..96],
         .server_name = connection.host_name,
         .alpn_protocols = offered,

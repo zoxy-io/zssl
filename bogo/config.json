@@ -76,7 +76,8 @@
     ],
     ":WRONG_CURVE:": [
       "zssl:HandshakeFailure",
-      "zssl:BadServerHello"
+      "zssl:BadServerHello",
+      "zssl:IllegalRetry"
     ],
     ":WRONG_CIPHER_RETURNED:": [
       "zssl:BadServerHello"
@@ -131,7 +132,8 @@
     ],
     ":MISSING_KEY_SHARE:": [
       "zssl:BadServerHello",
-      "zssl:MissingExtension"
+      "zssl:MissingExtension",
+      "zssl:IllegalRetry"
     ],
     ":OLD_SESSION_PRF_HASH_MISMATCH:": [
       "zssl:BadServerHello"
@@ -183,7 +185,8 @@
       "zssl:PeerAlert"
     ],
     ":MISSING_EXTENSION:": [
-      "zssl:MissingExtension"
+      "zssl:MissingExtension",
+      "zssl:ExpectedResumption"
     ],
     ":TOO_MANY_KEY_UPDATES:": [
       "zssl:TooManyKeyUpdates"
@@ -196,6 +199,15 @@
     ],
     ":SSLV3_ALERT_DECOMPRESSION_FAILURE:": [
       "zssl:PeerAlert"
+    ],
+    ":EMPTY_HELLO_RETRY_REQUEST:": [
+      "zssl:IllegalRetry"
+    ],
+    ":DUPLICATE_EXTENSION:": [
+      "zssl:DuplicateExtension"
+    ],
+    ":SECOND_SERVERHELLO_VERSION_MISMATCH:": [
+      "zssl:BadServerHello"
     ]
   },
   "DisabledTests": {
@@ -346,9 +358,8 @@
     "CorruptTicket-TLS-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "CorruptTicket-TLS-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "CurveID-Resume-Client": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "CurveID-Resume-Client-TLS13": "The runner offers P-256 on the resumed leg; zssl holds x25519 alone (DESIGN.md \u00a71).",
+    "CurveID-Resume-Client-TLS13": "SCOPE: expects a resumed session to survive a HelloRetryRequest. \u00a74.1.4 requires the second ClientHello's binder to be recomputed over message_hash(CH1) + the retry + the truncated CH2, and `client_messages.patchBinder` hashes the truncated hello alone \u2014 so this client drops the PSK on the retry instead, one of the two answers \u00a74.1.4 allows, and degrades to a full handshake rather than sending a binder that cannot verify. The same \u00a74.4.1 surgery the server half declines (DESIGN.md \u00a76 slice 3). docs/BOGO.md.",
     "CurveID-Resume-Server": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "CurveID-Resume-Server-TLS13": "The runner offers P-256 on the resumed leg; zssl holds x25519 alone (DESIGN.md \u00a71).",
     "CurveTest-Client-X25519-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "CurveTest-Client-X25519-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "CurveTest-Client-X25519-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -466,17 +477,8 @@
     "GarbageCertificate-Client-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "GarbageCertificate-Client-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "GarbageCertificate-Client-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "HelloRetryRequest-CipherChange-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
-    "HelloRetryRequest-Cookie-Curve-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
-    "HelloRetryRequest-Cookie-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
-    "HelloRetryRequest-DuplicateCookie-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
-    "HelloRetryRequest-DuplicateCurve-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
-    "HelloRetryRequest-Empty-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
-    "HelloRetryRequest-EmptyCookie-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
-    "HelloRetryRequest-NonResumableCipher-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
-    "HelloRetryRequest-Unknown-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
-    "HelloRetryRequestCurveMismatch-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
-    "HelloRetryRequestVersionMismatch-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
+    "HelloRetryRequest-DuplicateCookie-TLS13": "KEEP: a duplicate extension earns decode_error here and the runner wants illegal_parameter for one inside a HelloRetryRequest specifically \u2014 it expects decode_error for the same fault in a ClientHello or ServerHello (DuplicateExtensionClient/Server, both passing). One alert per fault is the answer we keep; \u00a74.2 names illegal_parameter and \u00a76.2 names decode_error for a block that says something twice, and no reading of either makes the alert depend on which handshake message carried the block. docs/BOGO.md.",
+    "HelloRetryRequest-DuplicateCurve-TLS13": "KEEP: a duplicate extension earns decode_error here and the runner wants illegal_parameter for one inside a HelloRetryRequest specifically \u2014 it expects decode_error for the same fault in a ClientHello or ServerHello (DuplicateExtensionClient/Server, both passing). One alert per fault is the answer we keep; \u00a74.2 names illegal_parameter and \u00a76.2 names decode_error for a block that says something twice, and no reading of either makes the alert depend on which handshake message carried the block. docs/BOGO.md.",
     "InvalidCompressionMethod": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "LooseInitialRecordVersion-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "LooseInitialRecordVersion-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -539,11 +541,9 @@
     "OmitExtensions-ServerHello-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "PAKE-Extension-Duplicate": "PAKE credentials: not implemented.",
     "PAKE-No-Server-Support": "PAKE credentials: not implemented.",
-    "PAKE-NormalClient-PAKEInHRR": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
     "PartialClientFinishedWithClientHello-TLS12-Resume": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "PartialFinishedWithServerHelloDone": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "PartialNewSessionTicketWithServerHelloDone": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "PartialServerHelloWithHelloRetryRequest": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
     "PointFormat-Client-Missing": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "PointFormat-Client-MissingUncompressed": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "PointFormat-Client-Tolerance": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -623,7 +623,7 @@
     "Resume-Server-NoTickets-TLS12-TLS1-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Resume-Server-NoTickets-TLS12-TLS11-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Resume-Server-NoTickets-TLS12-TLS12-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "Resume-Server-OmitAllPSKsOnSecondClientHello": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
+    "Resume-Server-OmitAllPSKsOnSecondClientHello": "SCOPE: a PSK offer on a *retry* ClientHello, whose binder hashes \u00a74.4.1's reconstructed transcript \u2014 the surgery binder DESIGN.md \u00a76 slice 3 leaves out on the server side. Unchanged by client HelloRetryRequest support; it is the same cut seen from the other end. docs/BOGO.md.",
     "Resume-Server-TLS1-TLS1-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Resume-Server-TLS1-TLS11-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Resume-Server-TLS1-TLS12-TLS": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -642,11 +642,6 @@
     "Resume-Server-UnofferedCipher": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Resume-Server-UnofferedCipher-TLS13": "Not a defect: the runner's own comment says \"Servers may resume at another cipher if the PRF matches\" and that BoringSSL declines by policy. The resume hello offers AES-128-GCM-SHA256 for a ChaCha20-SHA256 ticket; the PRF matches, so zssl resumes. docs/BOGO.md, finding 11.",
     "ResumeTLS12SessionID-TLS13": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "SecondClientHelloMissingKeyShare-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
-    "SecondClientHelloWrongCurve-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
-    "SecondHelloRetryRequest-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
-    "SecondServerHelloNoVersion-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
-    "SecondServerHelloWrongVersion-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
     "SendBogusAlertType": "KEEP: an alert whose level byte is 0x42 draws decode_error from us and illegal_parameter from BoringSSL. Both refuse it; only the description differs, and neither is mandated \u2014 AlertLevel is an open enum TLS 1.3 deprecates outright. We read a field we cannot interpret as \u00a76.2's decode_error rather than guess. docs/BOGO.md, finding 8.",
     "SendEmptySessionTicket-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "SendSNIWarningAlert": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -726,7 +721,6 @@
     "SkipEarlyData-SecondClientHelloEarlyData-TLS13": "0-RTT: deferred pending a replay analysis (DESIGN.md \u00a71).",
     "SkipEarlyData-TLS13": "0-RTT: deferred pending a replay analysis (DESIGN.md \u00a71).",
     "SkipEarlyData-TooMuchData-TLS13": "0-RTT: deferred pending a replay analysis (DESIGN.md \u00a71).",
-    "SkipHelloRetryRequest-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
     "SkipNewSessionTicket": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "SkipServerKeyExchange": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "StrayHelloRequest": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -734,10 +728,9 @@
     "SupportTicketsWithSessionID": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "SupportedCurves-ServerHello-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "SupportedVersionSelection-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "TLS-ECH-Client-UnsolictedHRRExtension": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
     "TLS-ECH-Server-ECHInner": "Encrypted ClientHello: not implemented.",
     "TLS-ECH-Server-ECHInner-Absent-TLS12": "Encrypted ClientHello: not implemented.",
-    "TLS-ECH-Server-ECHInner-HelloRetryRequest": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
+    "TLS-ECH-Server-ECHInner-HelloRetryRequest": "Encrypted ClientHello: not implemented (DESIGN.md \u00a71 names no ECH).",
     "TLS-ECH-Server-ECHInner-NotEmpty": "Encrypted ClientHello: not implemented.",
     "TLS-TLS1-ECDHE_ECDSA_WITH_AES_128_CBC_SHA-BadRecord": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TLS-TLS1-ECDHE_ECDSA_WITH_AES_128_CBC_SHA-LargeRecord": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -814,7 +807,6 @@
     "TLS13-Client-ClientAuth-ECDSA": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",
     "TLS13-Client-ClientAuth-RSA": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",
     "TLS13-DuplicateTicketEarlyDataSupport": "0-RTT: deferred pending a replay analysis (DESIGN.md \u00a71).",
-    "TLS13-HRR-InvalidCompressionMethod": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
     "Ticket-Forbidden-TLS13": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TicketSessionIDLength-0-TLS-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TicketSessionIDLength-0-TLS-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -860,7 +852,6 @@
     "UnencryptedEncryptedExtensions": "KEEP: EncryptedExtensions arriving as a plaintext handshake record draws unexpected_message from us and bad_record_mac from BoringSSL, which tries to decrypt it first. Both refuse it. \u00a75.2 gives protected records content_type application_data, so a handshake-typed record there is a message at the wrong moment \u2014 and matching BoringSSL would mean running peer bytes through the AEAD when the record's own type says it is not protected. docs/BOGO.md, finding 8.",
     "UnknownCipher": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "UnknownCurve": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "UnknownCurve-HelloRetryRequest-TLS13": "HelloRetryRequest: the client holds one group and refuses both shapes structurally; the server's retry path answers only x25519 (DESIGN.md \u00a76).",
     "UnknownCurve-TLS13": "The runner offers only a group zssl does not hold, so the handshake fails where BoringSSL would retry (DESIGN.md \u00a71).",
     "UnknownExtension-Client": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "UnknownExtensionInCertificateRequest-TLS13": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",

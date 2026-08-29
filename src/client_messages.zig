@@ -37,7 +37,22 @@ pub const PskParams = struct {
 pub const HelloParams = struct {
     random: *const [32]u8,
     session_id: []const u8,
-    x25519_public: *const [32]u8,
+    /// The one group we send a share for, and that share. A second hello
+    /// after a HelloRetryRequest carries a different pair — §4.1.4 makes
+    /// the retry's whole purpose "send a share for the group I name", so
+    /// this cannot be fixed at x25519 the way it once was.
+    share_group: u16,
+    share_public: []const u8,
+    /// What `supported_groups` advertises, in preference order. Wider
+    /// than `share_group` on purpose: a client that advertises only what
+    /// it has already shared can never be sent a legal
+    /// HelloRetryRequest, which is a way of being untestable as much as
+    /// it is a way of being narrow (DESIGN.md §1).
+    groups: []const u16,
+    /// §4.2.2: echoed verbatim from a HelloRetryRequest that sent one.
+    /// The server may keep its whole retry state in here, so dropping it
+    /// is not a simplification — it is a handshake that cannot complete.
+    cookie: ?[]const u8 = null,
     server_name: ?[]const u8 = null,
     /// Offered in preference order (RFC 7301 §3.1); empty omits the
     /// extension entirely.
@@ -54,6 +69,9 @@ pub fn clientHello(out: []u8, params: *const HelloParams) []const u8 {
     if (params.server_name) |name| assert(name.len >= 1);
     if (params.server_name) |name| assert(name.len <= 255);
     assert(params.alpn_protocols.len <= alpn_protocols_max);
+    assert(params.groups.len >= 1);
+    assert(params.share_public.len >= 1);
+    if (params.cookie) |cookie| assert(cookie.len >= 1);
     var builder = wire.Builder.init(out);
     const message = handshake.beginMessage(&builder, .client_hello);
     builder.putU16(0x0303);
@@ -90,10 +108,10 @@ fn helloExtensions(builder: *wire.Builder, params: *const HelloParams) void {
         builder.patchU16(list);
         builder.patchU16(body);
     }
-    builder.putU16(10); // supported_groups: x25519 is the one we hold keys for.
+    builder.putU16(10); // supported_groups
     const groups = builder.markU16();
     const group_list = builder.markU16();
-    builder.putU16(client_hello.group_x25519);
+    for (params.groups) |group| builder.putU16(group);
     builder.patchU16(group_list);
     builder.patchU16(groups);
     // signature_algorithms (§4.2.3): what we will accept in the server's
@@ -132,12 +150,20 @@ fn helloExtensions(builder: *wire.Builder, params: *const HelloParams) void {
     builder.putByte(2);
     builder.putU16(0x0304);
     builder.patchU16(versions);
+    if (params.cookie) |cookie| {
+        builder.putU16(44); // cookie (§4.2.2)
+        const body = builder.markU16();
+        const value = builder.markU16();
+        builder.putSlice(cookie);
+        builder.patchU16(value);
+        builder.patchU16(body);
+    }
     builder.putU16(51); // key_share
     const shares = builder.markU16();
     const share_list = builder.markU16();
-    builder.putU16(client_hello.group_x25519);
-    builder.putU16(32);
-    builder.putSlice(params.x25519_public);
+    builder.putU16(params.share_group);
+    builder.putU16(@intCast(params.share_public.len));
+    builder.putSlice(params.share_public);
     builder.patchU16(share_list);
     builder.patchU16(shares);
     // psk_key_exchange_modes (§4.2.9), sent on *every* hello and not only
@@ -211,7 +237,9 @@ test "the production hello parses under our own strict parser" {
     const encoded = clientHello(&out, &.{
         .random = &random,
         .session_id = &(.{0xee} ** 32),
-        .x25519_public = &public,
+        .share_group = client_hello.group_x25519,
+        .share_public = &public,
+        .groups = &.{client_hello.group_x25519},
         .server_name = "origin.internal",
         .alpn_protocols = &.{ "h2", "http/1.1" },
     });
@@ -243,7 +271,9 @@ test "a PSK hello carries a well-formed offer and a patchable binder" {
     const encoded = clientHello(&out, &.{
         .random = &random,
         .session_id = &.{},
-        .x25519_public = &public,
+        .share_group = client_hello.group_x25519,
+        .share_public = &public,
+        .groups = &.{client_hello.group_x25519},
         .psk = .{ .identity = "sealed-ticket", .obfuscated_age = 7, .binder_bytes = 32 },
     });
     // The mutable view for patching is the same bytes.

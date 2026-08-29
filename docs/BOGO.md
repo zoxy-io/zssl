@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 261 passed, 0 failed, 6918 declined by the shim (89), floor 261
+bogo: 299 passed, 0 failed, 6918 declined by the shim (89), floor 299
 bogo: PASS
 ```
 
@@ -41,9 +41,20 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**278 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. 146 drive
-`ClientHandshake` and 132 drive `ServerHandshake`. The server number was
+**299 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. It was 278 until
+the client could answer a HelloRetryRequest: a single-group client that
+refused every retry structurally kept 26 patterns declined, and
+un-declining them is where the 21 came from.
+
+The per-machine split this paragraph used to give — 146 client, 132
+server — is not restated here, because the gate does not compute one and
+the log's names do not carry it reliably. A number nobody can re-derive
+is a number that rots; `grep -c '^PASSED' zig-out/bogo/bogo.log` is the
+one that can.
+
+The server half's history is worth keeping even so, because each step
+names a defect: it was
 6 until RSA signing landed, 100 until secp256r1/secp384r1 did, 110 until
 §9.2's `missing_extension` did, 111 until §5.4's inner-plaintext cap did,
 113 until eight suppressions turned out to be describing bugs that were

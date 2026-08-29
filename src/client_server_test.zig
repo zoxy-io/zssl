@@ -3,8 +3,9 @@
 //! Covers the full origination path zoxy needs for upstreams: SNI, ALPN,
 //! leaf verification, tickets captured through the client's event
 //! surface, resumption, §4.6.3 KeyUpdate in both directions with the
-//! kTLS export tracking generations, and the client's structural refusal
-//! of HelloRetryRequest.
+//! kTLS export tracking generations, and the client's HelloRetryRequest
+//! handling — the retry it answers, the three §4.1.4 shapes it refuses,
+//! and the PSK it drops on the way.
 
 const std = @import("std");
 const testing = std.testing;
@@ -79,6 +80,9 @@ const Harness = struct {
         /// The leaf the server presents. RSA draws a fresh PSS salt per
         /// signature, so it cannot run with deterministic nonces.
         leaf: enum { ecdsa_p256, ecdsa_p384, rsa_2048 } = .ecdsa_p256,
+        /// The client's second key-exchange scalar, and the switch that
+        /// lets it answer a HelloRetryRequest at all.
+        retry_private: ?[backend.group_private_bytes_max]u8 = null,
     };
 
     fn init(harness: *Harness, options: Options) !void {
@@ -125,6 +129,7 @@ const Harness = struct {
             .certificate_policy = options.certificate_policy,
             .chain_verifier = options.chain_verifier,
             .resume_session = resume_session,
+            .retry_key_share_private = options.retry_private,
             .reassembly = &harness.client_reassembly,
         });
     }
@@ -410,26 +415,193 @@ test "a hostile server flight errors rather than panicking" {
     }
 }
 
-test "the client refuses HelloRetryRequest, structurally" {
+/// Frame a HelloRetryRequest naming `group`, ready to feed to a client.
+fn retryRecord(out: []u8, group: u16) []const u8 {
+    var message_buffer: [server_messages.server_hello_bytes_max]u8 = undefined;
+    const retry = server_messages.helloRetryRequest(
+        &message_buffer,
+        &(.{0x44} ** 32),
+        .aes_128_gcm_sha256,
+        group,
+    );
+    record.writeHeader(
+        .{ .content_type = .handshake, .length = @intCast(retry.len) },
+        out[0..record.header_bytes],
+    );
+    @memcpy(out[record.header_bytes..][0..retry.len], retry);
+    return out[0 .. record.header_bytes + retry.len];
+}
+
+test "§4.1.4: a retry naming the group we already shared is illegal" {
+    // The shape §4.1.4 calls out by name: "the client MUST abort ... if
+    // the HelloRetryRequest would not result in any change in the
+    // ClientHello". We shared x25519, so being asked for x25519 again is
+    // a server that would loop us. Answering `HandshakeFailure` — which
+    // this client did for *every* retry when it could answer none — said
+    // "I cannot", where the truth is "you may not".
     var buffers: Buffers = .{};
     var harness: Harness = undefined;
-    try harness.init(.{});
+    try harness.init(.{ .retry_private = .{0x71} ** 48 });
     defer harness.deinit();
     _ = harness.client.start(&buffers.client_out);
 
-    var message_buffer: [server_messages.server_hello_bytes_max]u8 = undefined;
-    const retry = server_messages.helloRetryRequest(&message_buffer, &(.{0x44} ** 32), .aes_128_gcm_sha256, client_hello_mod.group_x25519);
     var wire_buffer: [record.header_bytes + server_messages.server_hello_bytes_max]u8 = undefined;
-    record.writeHeader(
-        .{ .content_type = .handshake, .length = @intCast(retry.len) },
-        wire_buffer[0..record.header_bytes],
-    );
-    @memcpy(wire_buffer[record.header_bytes..][0..retry.len], retry);
+    const retry = retryRecord(&wire_buffer, client_hello_mod.group_x25519);
     try testing.expectError(
-        error.HandshakeFailure,
-        harness.client.handleRecord(wire_buffer[0 .. record.header_bytes + retry.len], &buffers.scratch),
+        error.IllegalRetry,
+        harness.client.handleRecord(retry, &buffers.scratch),
     );
     try testing.expectEqual(ClientHandshake.State.failed, harness.client.state);
+}
+
+test "§4.1.4: a retry into a group we advertised produces a second hello" {
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{ .retry_private = .{0x71} ** 48 });
+    defer harness.deinit();
+    const first = harness.client.start(&buffers.client_out);
+    const first_hello = try client_hello_mod.parse(first[record.header_bytes..]);
+    // The offer that makes a retry legal at all: three groups advertised,
+    // one share. A client that advertises only what it shares cannot be
+    // retried, which is a way of being untestable (DESIGN.md §1).
+    try testing.expect(first_hello.supportsGroup(client_hello_mod.group_secp256r1));
+    try testing.expectEqual(@as(?[]const u8, null), first_hello.keyShareFor(client_hello_mod.group_secp256r1));
+
+    var wire_buffer: [record.header_bytes + server_messages.server_hello_bytes_max]u8 = undefined;
+    const retry = retryRecord(&wire_buffer, client_hello_mod.group_secp256r1);
+    const event = try harness.client.handleRecord(retry, &buffers.scratch);
+    try testing.expectEqual(std.meta.activeTag(event), .send);
+    try testing.expectEqual(ClientHandshake.State.awaiting_server_hello, harness.client.state);
+
+    // The second hello carries a share for the group we were sent to,
+    // and an uncompressed SEC1 point at that — §4.2.8.2's only encoding.
+    // `send` may lead with D.4's compatibility CCS, so walk to the last
+    // record rather than assuming which one the hello is.
+    var index: usize = 0;
+    var hello_record: []const u8 = &.{};
+    while (index < event.send.len) {
+        hello_record = recordAt(event.send, index);
+        index += hello_record.len;
+    }
+    try testing.expectEqual(record.ContentType.handshake, try contentTypeOf(hello_record));
+    const second = try client_hello_mod.parse(hello_record[record.header_bytes..]);
+    const share = second.keyShareFor(client_hello_mod.group_secp256r1) orelse
+        return error.TestExpectedShare;
+    try testing.expectEqual(@as(usize, 65), share.len);
+    try testing.expectEqual(@as(u8, 0x04), share[0]);
+    // And the old one is gone: two shares would re-open the loop §4.1.4
+    // closes.
+    try testing.expectEqual(@as(?[]const u8, null), second.keyShareFor(client_hello_mod.group_x25519));
+}
+
+test "a retried hello offers no PSK, so a selected one is refused" {
+    // The hole this closes. `handleHelloRetryRequest` drops the PSK from
+    // CH2 — it cannot compute §4.4.1's binder — but the ServerHello
+    // parser gated `pre_shared_key` on the *config* holding a
+    // resumption, which stopped meaning "this hello offered one" the
+    // moment a retry could change the hello. A server answering with
+    // `selected_identity` anyway would set `resumed`, and `resumed` is
+    // what tells `completeHandshake` a certificate was not required.
+    //
+    // §4.2.11 forbids selecting an identity the client did not offer, so
+    // this is the RFC's refusal as much as it is ours.
+    var buffers: Buffers = .{};
+    var store: TicketStore = .{
+        .identity = undefined,
+        .identity_bytes = 6,
+        .psk = .{0x5e} ** cipher_suite.hash_bytes_max,
+    };
+    @memcpy(store.identity[0..6], "ticket");
+    const resumption: ClientHandshake.Resumption = .{
+        .identity = store.identity[0..6],
+        .obfuscated_age = 0,
+        .psk = store.psk,
+        .psk_bytes = 32,
+    };
+    var harness: Harness = undefined;
+    try harness.init(.{ .retry_private = .{0x71} ** 48, .resume_session = resumption });
+    defer harness.deinit();
+    _ = harness.client.start(&buffers.client_out);
+
+    // Retry into a group we advertised: CH2 goes out without the PSK.
+    var wire_buffer: [record.header_bytes + server_messages.server_hello_bytes_max]u8 = undefined;
+    const retry = retryRecord(&wire_buffer, client_hello_mod.group_secp256r1);
+    const event = try harness.client.handleRecord(retry, &buffers.scratch);
+    try testing.expectEqual(std.meta.activeTag(event), .send);
+    try testing.expect(!harness.client.resumed);
+
+    // Now answer with a ServerHello that selects identity 0 anyway.
+    var hello_buffer: [server_messages.server_hello_bytes_max]u8 = undefined;
+    var b = wire.Builder.init(&hello_buffer);
+    const message = handshake.beginMessage(&b, .server_hello);
+    b.putU16(0x0303);
+    b.putSlice(&(.{0x2b} ** 32));
+    b.putByte(32);
+    b.putSlice(&(.{0x44} ** 32));
+    b.putU16(@intFromEnum(cipher_suite.CipherSuite.aes_128_gcm_sha256));
+    b.putByte(0);
+    const extensions = b.markU16();
+    b.putU16(43); // supported_versions
+    const versions = b.markU16();
+    b.putU16(0x0304);
+    b.patchU16(versions);
+    b.putU16(41); // pre_shared_key, for an identity CH2 never offered
+    const psk_ext = b.markU16();
+    b.putU16(0);
+    b.patchU16(psk_ext);
+    b.patchU16(extensions);
+    handshake.endMessage(&b, message);
+    const hello = b.written();
+
+    var framed: [record.header_bytes + server_messages.server_hello_bytes_max]u8 = undefined;
+    record.writeHeader(
+        .{ .content_type = .handshake, .length = @intCast(hello.len) },
+        framed[0..record.header_bytes],
+    );
+    @memcpy(framed[record.header_bytes..][0..hello.len], hello);
+    try testing.expectError(
+        error.BadServerHello,
+        harness.client.handleRecord(framed[0 .. record.header_bytes + hello.len], &buffers.scratch),
+    );
+    try testing.expect(!harness.client.resumed);
+}
+
+test "§4.1.4: a second retry, and a retry we hold no scalar for" {
+    var buffers: Buffers = .{};
+    // One retry is the limit — "the client MUST abort ... with an
+    // unexpected_message alert" on a second.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{ .retry_private = .{0x71} ** 48 });
+        defer harness.deinit();
+        _ = harness.client.start(&buffers.client_out);
+        var wire_buffer: [record.header_bytes + server_messages.server_hello_bytes_max]u8 = undefined;
+        const first = retryRecord(&wire_buffer, client_hello_mod.group_secp256r1);
+        _ = try harness.client.handleRecord(first, &buffers.scratch);
+        var second_buffer: [record.header_bytes + server_messages.server_hello_bytes_max]u8 = undefined;
+        const again = retryRecord(&second_buffer, client_hello_mod.group_secp384r1);
+        try testing.expectError(
+            error.UnexpectedMessage,
+            harness.client.handleRecord(again, &buffers.scratch),
+        );
+    }
+
+    // Without retry entropy the structural refusal stands, which is the
+    // behaviour every embedder had before this config field existed.
+    // `HandshakeFailure` and not `IllegalRetry`: the retry is legal, we
+    // simply cannot answer it without inventing randomness §1 forbids.
+    {
+        var harness: Harness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        _ = harness.client.start(&buffers.client_out);
+        var wire_buffer: [record.header_bytes + server_messages.server_hello_bytes_max]u8 = undefined;
+        const retry = retryRecord(&wire_buffer, client_hello_mod.group_secp256r1);
+        try testing.expectError(
+            error.HandshakeFailure,
+            harness.client.handleRecord(retry, &buffers.scratch),
+        );
+    }
 }
 
 /// A `chain_verifier` that records what it was shown and answers with a

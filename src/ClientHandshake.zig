@@ -5,12 +5,24 @@
 //!
 //! Two deliberate shapes:
 //!
-//! - **HelloRetryRequest is refused, structurally.** This client holds
-//!   keys for exactly one group (x25519) and always offers its share, so
-//!   an HRR is either illegal (demanding what was already offered —
-//!   §4.1.4 forbids a retry that changes nothing) or unsatisfiable
-//!   (demanding a group we cannot compute). Both are
-//!   `error.HandshakeFailure`, not a retry.
+//! - **HelloRetryRequest is answered when the embedder supplies a second
+//!   scalar.** This client shares x25519 and advertises secp256r1 and
+//!   secp384r1 beside it, so a server may legally retry it into either.
+//!   `Config.retry_key_share_private` is the switch: with it, the retry
+//!   earns a second ClientHello carrying the named group's share and any
+//!   cookie; without it the old structural refusal stands, because
+//!   inventing a scalar would break §1's no-randomness rule.
+//!
+//!   §4.1.4's illegal shapes stay refused and are told apart: a retry
+//!   naming the group we already shared, or one naming a group we never
+//!   advertised, is `IllegalRetry` (illegal_parameter); a second retry
+//!   is `UnexpectedMessage`. A cookie-only retry is legal — the cookie
+//!   is the change — and re-sends the same share.
+//!
+//!   The PSK does not come along. §4.1.4 wants the second binder
+//!   computed over §4.4.1's reconstructed transcript, which is the
+//!   surgery the server half also leaves out, so a retried resumption
+//!   drops the identity and degrades to a full handshake.
 //! - **Certificate policy is an explicit seam.** `.leaf_signature` proves
 //!   the peer holds the key its leaf names, via `std.crypto`'s ECDSA or
 //!   RSA-PSS over the leaf's own SPKI; chain building and RFC 9525 name
@@ -65,6 +77,12 @@ ccs_seen: u8,
 ccs_sent: bool,
 hello_storage: [client_messages.hello_bytes_max]u8,
 hello_bytes: u16,
+/// §4.1.4 allows exactly one HelloRetryRequest. A second is a server
+/// that cannot make up its mind, and the RFC calls it unexpected_message.
+retried: bool,
+/// The group our *current* key_share is for — x25519 on the first hello,
+/// whatever the retry named on the second.
+share_group: u16,
 /// Whether this session came up on our offered PSK.
 resumed: bool,
 /// True once the leaf's CertificateVerify checked out under the policy.
@@ -187,6 +205,26 @@ pub const Config = struct {
     /// Embedder-supplied entropy; zssl generates none.
     client_random: [32]u8,
     x25519_private: [32]u8,
+    /// The scalar for a second key_share, and the switch that turns
+    /// HelloRetryRequest support on. Null keeps the structural refusal
+    /// this client shipped with: a retry it cannot answer is a handshake
+    /// failure, and saying so is better than pretending.
+    ///
+    /// Embedder-supplied like every other secret here, because §1's
+    /// no-randomness rule does not get an exception for the second
+    /// flight — a seeded simulation must replay a retried handshake as
+    /// exactly as a straight one. Sized for the widest group we
+    /// advertise; a narrower one takes the prefix, the same way
+    /// `ServerHandshake.Config.key_share_private` does.
+    retry_key_share_private: ?[backend.group_private_bytes_max]u8 = null,
+    /// What `supported_groups` offers, in preference order. The share
+    /// goes to x25519 either way; the rest are what a server may retry
+    /// us into, and only if `retry_key_share_private` is set.
+    groups: []const u16 = &.{
+        client_hello.group_x25519,
+        client_hello.group_secp256r1,
+        client_hello.group_secp384r1,
+    },
     /// Compatibility session id to send and expect echoed (§4.1.3);
     /// embedder-random, may be empty.
     session_id: []const u8 = &.{},
@@ -242,6 +280,11 @@ pub const Error = backend.Error || protect.Error || session_keys.Error ||
     /// The ServerHello broke a rule: bad echo, unknown suite, missing or
     /// wrong supported_versions, a PSK we never offered.
     BadServerHello,
+    /// §4.1.4: a HelloRetryRequest that cannot be answered because it
+    /// changes nothing — it names the group we already shared — or names
+    /// a group we never advertised. Distinct from `HandshakeFailure`,
+    /// which is what a retry we simply have no scalar for earns.
+    IllegalRetry,
     /// HelloRetryRequest — see the file comment for why this is final.
     HandshakeFailure,
     /// §4.2: the peer sent an extension we did not offer, or one that
@@ -303,6 +346,8 @@ pub fn init(config: *const Config) ClientHandshake {
         .ccs_sent = false,
         .hello_storage = undefined,
         .hello_bytes = 0,
+        .retried = false,
+        .share_group = client_hello.group_x25519,
         .resumed = false,
         .certificate_verified = false,
         .certificate_seen = false,
@@ -351,7 +396,9 @@ pub fn start(self: *ClientHandshake, out: []u8) []const u8 {
     const message = client_messages.clientHello(&self.hello_storage, &.{
         .random = &self.config.client_random,
         .session_id = self.config.session_id,
-        .x25519_public = &x25519_public,
+        .share_group = client_hello.group_x25519,
+        .share_public = &x25519_public,
+        .groups = self.config.groups,
         .server_name = self.config.server_name,
         .alpn_protocols = self.config.alpn_protocols,
         .psk = psk,
@@ -441,7 +488,7 @@ pub fn handleRecord(self: *ClientHandshake, wire_record: []const u8, out: []u8) 
             const message = (try self.assembler.next()) orelse return .none;
             if (message.messageType() != .server_hello) return error.UnexpectedMessage;
             if (!self.assembler.empty()) return error.UnexpectedMessage;
-            return self.handleServerHello(message.bytes);
+            return self.handleServerHello(message.bytes, out);
         },
         .application_data => return self.handleProtectedRecord(wire_record, out),
     }
@@ -477,51 +524,257 @@ fn handleAlertPayload(self: *ClientHandshake, payload: []const u8) Error!Event {
     }
 }
 
-fn handleServerHello(self: *ClientHandshake, message: []const u8) Error!Event {
+/// §4.1.4. The retry names a group we advertised but did not share, and
+/// the answer is a second ClientHello carrying that share and whatever
+/// cookie came with it.
+///
+/// Three ways a retry is illegal and all three are the RFC's, not ours:
+/// a second retry in one handshake ("the client MUST abort ... with an
+/// unexpected_message alert"); a group we never advertised; and a group
+/// we *did* already share, which §4.1.4 calls out by name because such a
+/// retry asks the client to change nothing and would loop.
+///
+/// The fourth refusal is ours and is a configuration answer rather than
+/// a protocol one: with no `retry_key_share_private` there is no second
+/// scalar to build a share from, and inventing one would break §1's
+/// no-randomness rule. That is `HandshakeFailure`, and it is what this
+/// client did for every retry before it could answer any.
+fn handleHelloRetryRequest(
+    self: *ClientHandshake,
+    message: []const u8,
+    body: *wire.Cursor,
+    out: []u8,
+) Error!Event {
+    if (self.retried) return error.UnexpectedMessage;
+    const echo = try body.takeSlice(try body.takeByte());
+    if (!std.mem.eql(u8, echo, self.config.session_id)) return error.BadServerHello;
+    const suite = CipherSuite.fromWire(try body.takeU16()) orelse return error.BadServerHello;
+    // §4.1.3: legacy_compression_method "MUST be a single byte with
+    // value 0". A field with exactly one legal value carrying another is
+    // a message that could not be decoded (§6.2), not a parameter we
+    // disagree with — BoGo's TLS13-HRR-InvalidCompressionMethod is where
+    // the difference is visible.
+    if (try body.takeByte() != 0) return error.MalformedMessage;
+    const retry = try self.readRetryExtensions(body);
+    if (!retry.tls13_selected) return error.BadServerHello;
+
+    // §4.1.4 turns on one question: does this retry change the hello? A
+    // `key_share` naming a different group does. A `cookie` does too,
+    // all by itself — the retry is then "send that again and carry
+    // this", which is how a stateless server keeps its retry state on
+    // the client. Neither present changes nothing, and neither does a
+    // key_share naming the group we already shared; the RFC's answer to
+    // both is illegal_parameter.
+    const selected = retry.selected_group orelse self.share_group;
+    if (retry.selected_group) |named| {
+        if (named == self.share_group) return error.IllegalRetry;
+    } else {
+        if (retry.cookie == null) return error.IllegalRetry;
+    }
+    var advertised = false;
+    for (self.config.groups) |group| {
+        if (group == selected) advertised = true;
+    }
+    if (!advertised) return error.IllegalRetry;
+    const group = backend.Group.fromWire(selected) orelse return error.IllegalRetry;
+    // A cookie-only retry re-sends the share it already sent, so the
+    // scalar is the one that built it; a group change needs the second.
+    const scalar: [backend.group_private_bytes_max]u8 = if (selected == client_hello.group_x25519)
+        self.config.x25519_private ++ [_]u8{0} ** (backend.group_private_bytes_max - 32)
+    else
+        self.config.retry_key_share_private orelse return error.HandshakeFailure;
+
+    // §4.4.1's surgery, and the reason the ladder is built here rather
+    // than at the ServerHello: CH1 is replaced in the transcript by a
+    // synthetic message_hash, and hashing needs the suite — which the
+    // retry names, so this is the first moment it can be done.
+    self.ladder = Ladder.initFor(suite);
+    switch (self.ladder.?) {
+        inline else => |*arm| arm.absorbRetryClientHello(
+            self.hello_storage[0..self.hello_bytes],
+            message,
+        ),
+    }
+
+    var share_storage: [backend.group_public_bytes_max]u8 = undefined;
+    const share = backend.keySharePublic(
+        group,
+        scalar[0..group.privateBytes()],
+        &share_storage,
+    ) catch return error.HandshakeFailure;
+
+    // The PSK does not come with us. §4.1.4 requires the binder on a
+    // second ClientHello to be recomputed over §4.4.1's transcript —
+    // message_hash(CH1), the retry, then the truncated CH2 — and
+    // `client_messages.patchBinder` hashes the truncated hello alone.
+    // Offering the identity with a binder that cannot verify would be a
+    // handshake that fails later and blames the key; dropping it is one
+    // of the two answers §4.1.4 allows, and it degrades to a full
+    // handshake rather than to a lie.
+    //
+    // The server half declines the same surgery from the other side
+    // (DESIGN.md §6 slice 3), so this is one scope cut seen twice, not
+    // two.
+    const second = client_messages.clientHello(&self.hello_storage, &.{
+        .random = &self.config.client_random,
+        .session_id = self.config.session_id,
+        .share_group = selected,
+        .share_public = share,
+        .groups = self.config.groups,
+        .cookie = retry.cookie,
+        .server_name = self.config.server_name,
+        .alpn_protocols = self.config.alpn_protocols,
+    });
+    self.hello_bytes = @intCast(second.len);
+    self.share_group = selected;
+    self.retried = true;
+    self.resumed = false;
+    // CH2 joins the transcript now; the ServerHello that answers it will
+    // be absorbed on top, and `handleServerHello` must not re-absorb CH1.
+    switch (self.ladder.?) {
+        inline else => |*arm| arm.transcript.update(self.hello_storage[0..self.hello_bytes]),
+    }
+    // §D.4: our own compatibility CCS goes before the first *protected*
+    // record, and the second hello is not one — but a peer in
+    // compatibility mode expects it after the retry, which is where
+    // every other 1.3 client puts it.
+    var builder = wire.Builder.init(out);
+    if (self.config.send_change_cipher_spec and !self.ccs_sent) {
+        builder.putSlice(&server_messages.change_cipher_spec_record);
+        self.ccs_sent = true;
+    }
+    appendPlaintextRecord(&builder, .handshake, self.hello_storage[0..self.hello_bytes]);
+    return .{ .send = builder.written() };
+}
+
+const RetryExtensions = struct {
+    selected_group: ?u16,
+    cookie: ?[]const u8,
+    tls13_selected: bool,
+};
+
+/// §4.1.4's HelloRetryRequest extension block: `key_share` carries a
+/// bare group here rather than a share, `cookie` is opaque and echoed,
+/// and `supported_versions` still has to select 1.3.
+fn readRetryExtensions(self: *ClientHandshake, body: *wire.Cursor) Error!RetryExtensions {
+    _ = self;
+    const extensions_bytes = try body.takeU16();
+    if (extensions_bytes != body.remaining()) return error.BadServerHello;
+    var result: RetryExtensions = .{ .selected_group = null, .cookie = null, .tls13_selected = false };
+    try wire.refuseDuplicateExtensions(8, body.rest());
+    var seen: u8 = 0;
+    while (body.remaining() > 0) : (seen += 1) {
+        if (seen == 8) return error.BadServerHello;
+        const extension_type = try body.takeU16();
+        const data = try body.takeSlice(try body.takeU16());
+        switch (extension_type) {
+            51 => {
+                if (data.len != 2) return error.BadServerHello;
+                result.selected_group = std.mem.readInt(u16, data[0..2], .big);
+            },
+            44 => {
+                if (data.len < 2) return error.BadServerHello;
+                const cookie_bytes = std.mem.readInt(u16, data[0..2], .big);
+                if (cookie_bytes == 0) return error.BadServerHello;
+                if (@as(usize, cookie_bytes) + 2 != data.len) return error.BadServerHello;
+                result.cookie = data[2..];
+            },
+            43 => {
+                if (data.len != 2) return error.BadServerHello;
+                if (std.mem.readInt(u16, data[0..2], .big) != 0x0304) return error.BadServerHello;
+                result.tls13_selected = true;
+            },
+            else => return error.UnsupportedExtension,
+        }
+    }
+    return result;
+}
+
+fn handleServerHello(self: *ClientHandshake, message: []const u8, out: []u8) Error!Event {
     assert(self.state == .awaiting_server_hello);
-    assert(self.ladder == null);
+    // After a retry the ladder already exists: the surgery in §4.4.1
+    // needs the suite, the HelloRetryRequest names it, and so the
+    // transcript starts one message earlier than it used to.
+    assert(self.retried or self.ladder == null);
     var body = wire.Cursor.init(message[handshake.header_bytes..]);
     if (try body.takeU16() != 0x0303) return error.BadServerHello;
     const random = try body.takeSlice(32);
     if (std.mem.eql(u8, random, &server_messages.hello_retry_magic)) {
-        // See the file comment: a single-group client has no second offer.
-        return error.HandshakeFailure;
+        return self.handleHelloRetryRequest(message, &body, out);
     }
     const echo = try body.takeSlice(try body.takeByte());
     if (!std.mem.eql(u8, echo, self.config.session_id)) return error.BadServerHello;
     const suite = CipherSuite.fromWire(try body.takeU16()) orelse return error.BadServerHello;
-    if (try body.takeByte() != 0) return error.BadServerHello;
+    // §4.1.3: legacy_compression_method "MUST be a single byte with
+    // value 0". A field with exactly one legal value carrying another is
+    // a message that could not be decoded (§6.2), not a parameter we
+    // disagree with — BoGo's TLS13-HRR-InvalidCompressionMethod is where
+    // the difference is visible.
+    if (try body.takeByte() != 0) return error.MalformedMessage;
     const extensions = try self.readServerHelloExtensions(&body);
     // §4.2.1: no supported_versions selecting 1.3 means a 1.2 server —
     // and this library has nothing to say to one.
     if (!extensions.tls13_selected) return error.BadServerHello;
     const server_share = extensions.server_share orelse return error.BadServerHello;
+    // §4.1.4: the ServerHello answering a retry keeps the suite the retry
+    // named. Letting it change would let a server pick one suite to
+    // compute the message_hash under and another to finish with.
+    if (self.retried and std.meta.activeTag(self.ladder.?) != suite) return error.BadServerHello;
     if (self.resumed) {
         // §4.2.11: the selected PSK's hash and the suite's must agree.
         if (self.config.resume_session.?.psk_bytes != suite.hashBytes()) return error.BadServerHello;
     }
+    // The share must be for the group our *current* key_share names —
+    // x25519 on a straight handshake, the retried group after one.
+    if (server_share.group != self.share_group) return error.BadServerHello;
+    const group = backend.Group.fromWire(server_share.group) orelse return error.BadServerHello;
+    // By the *group*, not by whether we retried: a cookie-only retry
+    // re-sends the x25519 share it already sent, so `retried` says
+    // nothing about which scalar built the share on the wire. Choosing
+    // by `retried` there derived the shared secret from the wrong key
+    // and surfaced as a bad record MAC on the server's first flight —
+    // a transcript-shaped symptom for a key-selection bug.
+    const private: []const u8 = if (server_share.group == client_hello.group_x25519)
+        &self.config.x25519_private
+    else
+        self.config.retry_key_share_private.?[0..group.privateBytes()];
 
-    var shared: [32]u8 = undefined;
-    try backend.x25519Shared(&self.config.x25519_private, &server_share, &shared);
-    defer std.crypto.secureZero(u8, &shared);
-    self.ladder = Ladder.initFor(suite);
+    var shared_storage: [backend.group_shared_bytes_max]u8 = undefined;
+    const shared = try backend.keyShareShared(
+        group,
+        private,
+        server_share.value[0..server_share.bytes],
+        &shared_storage,
+    );
+    defer std.crypto.secureZero(u8, &shared_storage);
+    if (!self.retried) self.ladder = Ladder.initFor(suite);
     switch (self.ladder.?) {
         inline else => |*arm| {
-            arm.transcript.update(self.hello_storage[0..self.hello_bytes]);
+            // A retried handshake already holds message_hash(CH1), the
+            // retry, and CH2; a straight one starts here.
+            if (!self.retried) arm.transcript.update(self.hello_storage[0..self.hello_bytes]);
             arm.transcript.update(message);
             const psk: ?[]const u8 = if (self.resumed)
                 self.config.resume_session.?.psk[0..self.config.resume_session.?.psk_bytes]
             else
                 null;
-            try arm.startHandshakeKeys(&shared, psk);
+            try arm.startHandshakeKeys(shared, psk);
         },
     }
     self.state = .awaiting_flight;
     return .none;
 }
 
+/// A KeyShareEntry as the ServerHello carries it: the group, and the
+/// peer's public value at whatever length that group fixes.
+const ServerShare = struct {
+    group: u16,
+    value: [backend.group_public_bytes_max]u8,
+    bytes: u8,
+};
+
 const ServerHelloExtensions = struct {
-    server_share: ?[32]u8,
+    server_share: ?ServerShare,
     tls13_selected: bool,
 };
 
@@ -539,10 +792,18 @@ fn readServerHelloExtensions(self: *ClientHandshake, body: *wire.Cursor) Error!S
         switch (extension_type) {
             51 => {
                 var share = wire.Cursor.init(data);
-                if (try share.takeU16() != client_hello.group_x25519) return error.BadServerHello;
-                if (try share.takeU16() != 32) return error.BadServerHello;
-                result.server_share = (try share.takeSlice(32))[0..32].*;
+                const group = try share.takeU16();
+                const value_bytes = try share.takeU16();
+                // The length the group fixes, checked here rather than
+                // trusted: `keyShareShared` would refuse a wrong one, but
+                // this is the boundary that owns the peer's framing.
+                const known = backend.Group.fromWire(group) orelse return error.BadServerHello;
+                if (value_bytes != known.publicBytes()) return error.BadServerHello;
+                const value = try share.takeSlice(value_bytes);
                 if (share.remaining() != 0) return error.BadServerHello;
+                var entry: ServerShare = .{ .group = group, .value = undefined, .bytes = @intCast(value_bytes) };
+                @memcpy(entry.value[0..value.len], value);
+                result.server_share = entry;
             },
             43 => {
                 var version = wire.Cursor.init(data);
@@ -551,6 +812,17 @@ fn readServerHelloExtensions(self: *ClientHandshake, body: *wire.Cursor) Error!S
                 result.tls13_selected = true;
             },
             41 => {
+                // §4.2.11: "the server MUST NOT select an identity that
+                // the client did not offer". The question is what *this*
+                // hello offered, not what the config holds — and those
+                // stopped being the same thing when a retry began
+                // dropping the PSK from CH2. Gating on the config alone
+                // let a server answer a hello with no identities at all
+                // and still set `resumed`, which is the flag
+                // `completeHandshake` reads to decide a certificate was
+                // not required. An unauthenticated connection reaching
+                // `connected` is the one thing that must not happen.
+                if (self.retried) return error.BadServerHello;
                 if (self.config.resume_session == null) return error.BadServerHello;
                 var selected = wire.Cursor.init(data);
                 // We offer exactly one identity, so index 0 is the only
@@ -1233,11 +1505,36 @@ fn ArmOf(comptime suite: CipherSuite) type {
             self.* = undefined;
         }
 
+        /// §4.4.1: after a HelloRetryRequest, CH1 is replaced in the
+        /// transcript by a synthetic message_hash message. The server
+        /// half carries the same routine — the surgery is symmetric,
+        /// because both sides have to arrive at one transcript.
+        fn absorbRetryClientHello(self: *Self, ch1: []const u8, hrr: []const u8) void {
+            assert(self.transcript.messages_seen == 0);
+            assert(ch1.len >= handshake.header_bytes);
+            var ch1_hash: [hash_bytes]u8 = undefined;
+            Hash.hash(ch1, &ch1_hash, .{});
+            const synthetic_header = [handshake.header_bytes]u8{
+                @intFromEnum(handshake.MessageType.message_hash),
+                0,
+                0,
+                hash_bytes,
+            };
+            self.transcript.state.update(&synthetic_header);
+            self.transcript.state.update(&ch1_hash);
+            self.transcript.messages_seen = 1;
+            self.transcript.update(hrr);
+        }
+
         fn transcriptHash(self: *const Self) [hash_bytes]u8 {
             return self.transcript.currentHash();
         }
 
-        fn startHandshakeKeys(self: *Self, shared: *const [32]u8, psk: ?[]const u8) protect.Error!void {
+        /// `shared` is a slice, not a `*const [32]u8`: §7.4 makes the
+        /// (EC)DHE secret the group's own width, and a retried handshake
+        /// can land on secp384r1's 48 bytes. The server half has always
+        /// taken a slice here for the same reason.
+        fn startHandshakeKeys(self: *Self, shared: []const u8, psk: ?[]const u8) protect.Error!void {
             assert(self.schedule == null);
             assert(self.recv == null);
             // The client offers only resumption PSKs, which §4.6.1

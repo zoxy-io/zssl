@@ -40,9 +40,13 @@ proxy needs instead of what a general TLS library carries.
   the corpora which test a *server* mostly assume secp256r1 — 48 of
   tlsfuzzer's 57 TLS 1.3 scripts hardcode it and never mention x25519 —
   so an x25519-only server was not merely narrow, it was close to
-  untestable by anything but our own client. The client half still
-  offers x25519 alone: offering more only pays with HelloRetryRequest
-  support, which it refuses structurally (slice 4).
+  untestable by anything but our own client. The client half now
+  advertises all three and shares x25519, which is what makes a
+  HelloRetryRequest answerable: `Config.retry_key_share_private` is the
+  second scalar and the switch, and without it the old structural
+  refusal stands rather than randomness being invented. The same
+  argument that widened the server applies here — BoGo drove two dozen
+  client retry cases that no single-group client could reach.
 - PSK resumption with server-side NewSessionTicket issuance, and
   server-side acceptance of **external** PSKs — the two differ by
   §4.2.11.2's binder label ("res binder" against "ext binder"), which
@@ -187,9 +191,16 @@ matter: a peer can spend the whole budget on padding.
    (`.leaf_signature` proves key possession via std.crypto against
    the presented leaf — ECDSA or RSA-PSS; chain/name are the embedder's
    through `chain_verifier`, per §1), ticket capture
-   through the event surface, resumption, and a *structural* refusal of
-   HelloRetryRequest — a single-group client has no second offer to
-   make, so both HRR shapes (illegal repeat, unsatisfiable demand) abort.
+   through the event surface, resumption, and — since BoGo pressed it —
+   HelloRetryRequest answered rather than refused: the client advertises
+   three groups, shares x25519, and takes a second scalar through
+   `Config.retry_key_share_private`. §4.1.4's illegal shapes stay
+   refused and are now told apart (a retry that changes nothing, or
+   names a group never advertised, is `IllegalRetry`; a second retry is
+   `UnexpectedMessage`), a cookie-only retry is legal and re-sends the
+   same share, and a retried *resumption* drops its PSK because the
+   second binder wants §4.4.1's reconstructed transcript — the same
+   surgery slice 3 leaves out on the server side.
    Oracle: both production machines end to end — handshake, resume,
    KeyUpdate both directions with kTLS exports agreeing across machines
    at every generation.
@@ -209,8 +220,14 @@ matter: a peer can spend the whole budget on padding.
    and so could never be given a ticket by a conforming server, a
    mid-handshake alert that preceded D.4's compatibility record, and a
    reachable assertion on flight size) and left eight open gaps, each
-   suppressed by name with a reason. `docs/BOGO.md` carries the numbers,
-   the ledger and the queue. The ztls differential stays out, and moves
+   suppressed by name with a reason. Those eight are closed or argued
+   now — `grep 'OPEN GAP' bogo/config.json` returns nothing — and the
+   ledger's shape is the durable part, not that count. `docs/BOGO.md` carries the numbers,
+   the ledger and the queue. Three more rungs followed it: `zig build
+   tlsfuzzer` (a Python client over tlslite-ng, driving our *server*),
+   `zig build tlsanvil` (an RFC-derived corpus against the same
+   harness), and `zig build interop`'s fourth leg. The ztls differential
+   stays out, and moves
    to zoxy's engine swap, where the two run side by side and a
    disagreement is diagnosable against a live proxy.
 
