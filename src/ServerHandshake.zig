@@ -53,6 +53,11 @@ session_echo: [32]u8,
 /// Whether this session came up on an accepted PSK — the fact behind
 /// zoxy's `tls_resumed` counter.
 resumed: bool,
+/// Whether the ClientHello that earned a HelloRetryRequest carried a
+/// `pre_shared_key`. §4.1.2 lets the second hello update that extension
+/// and not drop it, and CH1's bytes are gone by the time CH2 arrives —
+/// so the question is answered while it still can be.
+ch1_offered_psk: bool,
 /// §4.2.9: whether a NewSessionTicket may be sent. Kept because a ticket
 /// is issued long after the hello is gone.
 ///
@@ -267,6 +272,7 @@ pub fn init(config: *const Config) ServerHandshake {
         .session_echo_bytes = 0,
         .session_echo = undefined,
         .resumed = false,
+        .ch1_offered_psk = false,
     };
 }
 
@@ -423,6 +429,40 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
     const suite = negotiateSuite(&hello) orelse return error.HandshakeFailure;
     assert(hello.offersSuite(suite));
     assert(hello.cipher_suites_wire.len >= 2);
+    if (self.state == .awaiting_retry_client_hello) {
+        // §4.1.2: after a HelloRetryRequest the client "MUST send the
+        // same ClientHello without modification, except as follows",
+        // and the list that follows permits *updating* a
+        // `pre_shared_key` — recomputing its age and binder — not
+        // dropping it. A CH2 that drops one CH1 made is missing an
+        // extension it is required to carry, which is the alert §4.1.2
+        // earns and the one BoringSSL sends
+        // (`Resume-Server-OmitAllPSKsOnSecondClientHello`).
+        //
+        // Safe here because the suite cannot move across our retry: it
+        // is chosen by the same preference walk over the same offer, and
+        // a CH2 that changed it is refused two lines down. §4.2.11's
+        // "SHOULD NOT offer a PSK whose hash is not the selected
+        // suite's" therefore never obliges a client to drop one on us.
+        if (self.ch1_offered_psk and hello.pre_shared_key_wire == null) {
+            return error.MissingExtension;
+        }
+        // §4.1.4: the retry must keep the suite and answer the demand.
+        //
+        // Ahead of the PSK, and that ordering is load-bearing now that a
+        // binder on CH2 is verified: it hashes the transcript this
+        // handshake's ladder is holding, and the ladder was built for
+        // the suite CH1 settled on. A CH2 that moved the suite must be
+        // refused before anything reads that transcript, or the binder
+        // would be checked under one hash against a ladder keyed to
+        // another.
+        const ladder_suite: CipherSuite = self.ladder.?;
+        if (suite != ladder_suite) return error.IllegalRetry;
+        // The retry must answer the group we asked for, and no other.
+        if (hello.keyShareFor(@intFromEnum(self.key_share_group)) == null) {
+            return error.IllegalRetry;
+        }
+    }
     const selected_psk = try self.selectPsk(&hello, message, suite);
     if (selected_psk == null) {
         // A full handshake signs a CertificateVerify; a resumed one
@@ -436,13 +476,6 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
     self.captureSessionEcho(&hello);
 
     if (self.state == .awaiting_retry_client_hello) {
-        // §4.1.4: the retry must keep the suite and answer the demand.
-        const ladder_suite: CipherSuite = self.ladder.?;
-        if (suite != ladder_suite) return error.IllegalRetry;
-        // The retry must answer the group we asked for, and no other.
-        const retried = hello.keyShareFor(@intFromEnum(self.key_share_group)) orelse
-            return error.IllegalRetry;
-        _ = retried;
         return self.acceptClientHello(&hello, message, suite, selected_psk, out);
     }
 
@@ -496,6 +529,9 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
     // hold, demand it (§4.1.4); if it does not, there is no handshake.
     const wanted = hello.preferredSupportedGroup() orelse return error.HandshakeFailure;
     self.key_share_group = backend.Group.fromWire(wanted).?;
+    // Remembered rather than re-derived: CH1's bytes are gone by the
+    // time CH2 arrives, and §4.1.2 asks what *that* hello carried.
+    self.ch1_offered_psk = hello.pre_shared_key_wire != null;
     return self.sendHelloRetry(message, suite, out);
 }
 
@@ -504,10 +540,10 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
 /// the handshake aborts — an attacker replaying a stolen identity does
 /// not get downgraded to a full handshake, it gets refused.
 ///
-/// PSK offers on a retry ClientHello are deliberately ignored (full
-/// handshake instead): the binder there hashes the §4.4.1 surgery
-/// transcript, and zssl does not carry that path untested — BoGo in
-/// slice 5 is where it earns its way in.
+/// A retry ClientHello may carry an offer like any other. What changes
+/// is the transcript the binder covers — §4.4.1's reconstruction rather
+/// than the truncation alone — and `binderTranscriptHash` is where that
+/// difference lives.
 fn selectPsk(
     self: *ServerHandshake,
     hello: *const client_hello.ClientHello,
@@ -515,13 +551,13 @@ fn selectPsk(
     suite: CipherSuite,
 ) Error!?SelectedPsk {
     const lookup = self.config.psk_lookup orelse return null;
-    if (self.state != .awaiting_client_hello) return null;
     if (hello.preferredKeyShare() == null) return null; // psk_dhe_ke needs a share.
     if (!hello.offersPskDheKe()) return null;
     const offer = (try client_hello.parsePskOffer(hello)) orelse return null;
     assert(offer.count >= 1);
     assert(offer.binders_section_bytes < message.len);
     const truncated = message[0 .. message.len - offer.binders_section_bytes];
+    const transcript_hash = self.binderTranscriptHash(suite, truncated);
 
     var index: u8 = 0;
     while (index < offer.count) : (index += 1) {
@@ -555,7 +591,7 @@ fn selectPsk(
             suite,
             answer.kind,
             selected.psk[0..answer.psk_bytes],
-            truncated,
+            transcript_hash[0..suite.hashBytes()],
             offer.binders[index],
         )) {
             return error.DecryptError;
@@ -565,27 +601,68 @@ fn selectPsk(
     return null;
 }
 
+/// §4.2.11.2's `Transcript-Hash(Truncate(ClientHello))`.
+///
+/// On a first ClientHello the truncation is the whole transcript and
+/// this is its plain hash. On a second one it is not: §4.4.1 replaced
+/// CH1 with a `message_hash` message and put the HelloRetryRequest
+/// behind it, and the binder covers all three. The ladder is standing at
+/// exactly that point — `sendHelloRetry` absorbed both and CH2 goes in
+/// only once it is accepted — so the prefix is asked for rather than
+/// rebuilt here, which is also what stops the two from ever disagreeing
+/// about what CH1 hashed to.
+fn binderTranscriptHash(
+    self: *const ServerHandshake,
+    suite: CipherSuite,
+    truncated: []const u8,
+) [cipher_suite.hash_bytes_max]u8 {
+    // Not reachable from the wire: the truncation is a parsed
+    // ClientHello minus its binders section, and `selectPsk` has
+    // already established that the section is shorter than the message.
+    // A hello short enough to fail this could not have parsed.
+    assert(truncated.len >= handshake.header_bytes);
+    var digest: [cipher_suite.hash_bytes_max]u8 = undefined;
+    if (self.state == .awaiting_retry_client_hello) {
+        switch (self.ladder.?) {
+            inline else => |*arm, tag| {
+                // `handleClientHello` refuses a CH2 that moved the suite
+                // before this is reached.
+                assert(tag == suite);
+                const Hash = CipherSuite.HashType(tag);
+                digest[0..Hash.digest_length].* = arm.transcript.hashWith(truncated);
+            },
+        }
+        return digest;
+    }
+    assert(self.state == .awaiting_client_hello);
+    switch (suite) {
+        inline else => |comptime_suite| {
+            const Hash = CipherSuite.HashType(comptime_suite);
+            Hash.hash(truncated, digest[0..Hash.digest_length], .{});
+        },
+    }
+    return digest;
+}
+
 fn binderMatches(
     suite: CipherSuite,
     kind: key_schedule.PskKind,
     psk: []const u8,
-    truncated: []const u8,
+    transcript_hash: []const u8,
     binder: []const u8,
 ) bool {
     // Not `== suite.hashBytes()`: an external PSK is whatever length the
     // two peers agreed on, and `selectPsk` has already bounded it.
     assert(psk.len >= 1 and psk.len <= cipher_suite.hash_bytes_max);
-    assert(truncated.len >= handshake.header_bytes);
+    assert(transcript_hash.len == suite.hashBytes());
     switch (suite) {
         inline else => |comptime_suite| {
             const Hash = CipherSuite.HashType(comptime_suite);
             const Schedule = key_schedule.KeySchedule(comptime_suite);
             if (binder.len != Hash.digest_length) return false;
-            var truncated_hash: [Hash.digest_length]u8 = undefined;
-            Hash.hash(truncated, &truncated_hash, .{});
             var schedule = Schedule.initEarly(psk);
             defer schedule.wipe();
-            const expected = schedule.pskBinder(kind, &truncated_hash);
+            const expected = schedule.pskBinder(kind, transcript_hash[0..Hash.digest_length]);
             return std.crypto.timing_safe.eql(
                 [Hash.digest_length]u8,
                 binder[0..Hash.digest_length].*,

@@ -4,12 +4,15 @@
 //! agreement between the two derivations is the check.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const testing = std.testing;
 
 const Credentials = @import("Credentials.zig");
 const ServerHandshake = @import("ServerHandshake.zig");
+const backend = @import("crypto/backend_openssl.zig");
 const cipher_suite = @import("cipher_suite.zig");
 const client_hello = @import("client_hello.zig");
+const client_messages = @import("client_messages.zig");
 const key_schedule = @import("key_schedule.zig");
 const record = @import("record.zig");
 const test_client = @import("test_client.zig");
@@ -59,7 +62,6 @@ test "§4 vectors: the binder chain, truncation arithmetic, and the PSK ladder" 
     );
 
     // The PSK-mixed ladder down to the master secret.
-    const backend = @import("crypto/backend_openssl.zig");
     var shared: [32]u8 = undefined;
     try backend.x25519Shared(&vectors.resumed_client_x25519_private, &vectors.resumed_server_x25519_public, &shared);
     try testing.expectEqualSlices(u8, &vectors.resumed_ecdhe_shared, &shared);
@@ -276,6 +278,138 @@ test "resumption end to end: tickets out, PSK session up, no certificate" {
     const chained_event = try client_two.absorb(chained, &client_out);
     try testing.expectEqual(std.meta.activeTag(chained_event), .none);
     try testing.expectEqual(@as(u8, 1), client_two.ticket_count);
+}
+
+test "§4.4.1: the server verifies a binder on a retry ClientHello" {
+    // The other end of the same surgery. A PSK offered on CH2 is bound
+    // to message_hash(CH1), the HelloRetryRequest, and then the
+    // truncated CH2 — so a server that hashes the truncation alone
+    // refuses every legitimate resumption across a retry, and one that
+    // hashes anything else accepts binders it should not.
+    //
+    // The transcript is rebuilt here with `std.crypto` from the bytes
+    // that actually crossed, so the check is agreement between two
+    // derivations rather than `Transcript.hashWith` against itself.
+    const psk = [_]u8{0x9a} ** 32;
+    const random = [_]u8{0x07} ** 32;
+    const unusable_group: u16 = 0xfefe; // Parsed, skipped, no share we can use.
+
+    // CH1 offers the identity and a share for a group we do not hold,
+    // which is §4.2.8's legal way to ask the server to choose — and the
+    // only way to make this server retry at all, since it takes any of
+    // the three groups it knows.
+    var ch1_storage: [client_messages.hello_bytes_max]u8 = undefined;
+    const ch1 = client_messages.clientHello(&ch1_storage, &.{
+        .random = &random,
+        .session_id = &.{},
+        .share_group = unusable_group,
+        .share_public = &(.{0xab} ** 32),
+        .groups = &.{client_hello.group_secp256r1},
+        .psk = .{ .identity = "ticket", .obfuscated_age = 0, .binder_bytes = 32 },
+    });
+    client_messages.patchBinder(ch1_storage[0..ch1.len], &psk, null);
+    var ch1_record: [record.wire_record_bytes_max]u8 = undefined;
+    const ch1_framed = frameHandshake(&ch1_record, ch1_storage[0..ch1.len]);
+
+    // The share CH2 answers the demand with.
+    var share_storage: [backend.group_public_bytes_max]u8 = undefined;
+    const share = try backend.keySharePublic(
+        .secp256r1,
+        &(.{0x71} ** 32),
+        &share_storage,
+    );
+
+    // Three shapes of second hello. The first is the legitimate one.
+    // The second carries the binder CH1's own truncation would produce —
+    // the regression guard, since a server that skipped §4.4.1's surgery
+    // is exactly the server that accepts it. The third drops the offer
+    // altogether, which §4.1.2 does not list among the changes a second
+    // ClientHello may make.
+    const Second = enum { reconstructed, truncation_only, omitted };
+    for ([_]Second{ .reconstructed, .truncation_only, .omitted }) |shape| {
+        var store: TicketStore = .empty;
+        store.add("ticket", &psk);
+        var harness: Harness = undefined;
+        try harness.init(&store);
+        defer harness.deinit();
+        var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+
+        const retry = (try harness.server.handleRecord(ch1_framed, &server_out)).?;
+        try testing.expectEqual(std.meta.activeTag(retry), .send);
+        try testing.expectEqual(
+            ServerHandshake.State.awaiting_retry_client_hello,
+            harness.server.state,
+        );
+        // The flight is the HelloRetryRequest and then §D.4's CCS.
+        const hrr_length = std.mem.readInt(u16, retry.send[3..5], .big);
+        const hrr = retry.send[record.header_bytes..][0..hrr_length];
+
+        var ch2_storage: [client_messages.hello_bytes_max]u8 = undefined;
+        const ch2 = client_messages.clientHello(&ch2_storage, &.{
+            .random = &random,
+            .session_id = &.{},
+            .share_group = client_hello.group_secp256r1,
+            .share_public = share,
+            .groups = &.{client_hello.group_secp256r1},
+            .psk = if (shape == .omitted)
+                null
+            else
+                .{ .identity = "ticket", .obfuscated_age = 0, .binder_bytes = 32 },
+        });
+        const ch2_bytes = ch2_storage[0..ch2.len];
+        var ch2_record: [record.wire_record_bytes_max]u8 = undefined;
+        if (shape == .omitted) {
+            try testing.expectError(
+                error.MissingExtension,
+                harness.server.handleRecord(frameHandshake(&ch2_record, ch2_bytes), &server_out),
+            );
+            continue;
+        }
+
+        // The synthetic message_hash message — type 254, a u24 length,
+        // the hash of CH1 — then the retry, then the truncated CH2.
+        var ch1_hash: [32]u8 = undefined;
+        Sha256.hash(ch1_storage[0..ch1.len], &ch1_hash, .{});
+        var surgery = Sha256.init(.{});
+        surgery.update(&[_]u8{ 254, 0, 0, 32 });
+        surgery.update(&ch1_hash);
+        surgery.update(hrr);
+        surgery.update(client_messages.binderTruncation(ch2_bytes, 32));
+        var digest: [32]u8 = undefined;
+        surgery.final(&digest);
+        client_messages.patchBinder(
+            ch2_bytes,
+            &psk,
+            if (shape == .reconstructed) &digest else null,
+        );
+
+        const ch2_framed = frameHandshake(&ch2_record, ch2_bytes);
+        if (shape == .truncation_only) {
+            // §4.2.11: an identity the embedder recognized whose binder
+            // does not verify is a refusal, never a downgrade to a full
+            // handshake.
+            try testing.expectError(
+                error.DecryptError,
+                harness.server.handleRecord(ch2_framed, &server_out),
+            );
+            continue;
+        }
+        const flight = (try harness.server.handleRecord(ch2_framed, &server_out)).?;
+        try testing.expectEqual(std.meta.activeTag(flight), .send);
+        try testing.expect(harness.server.resumed);
+        try testing.expectEqual(ServerHandshake.State.awaiting_finished, harness.server.state);
+    }
+}
+
+/// Wrap one handshake message in its record, ready to feed.
+fn frameHandshake(out: []u8, message: []const u8) []const u8 {
+    assert(out.len >= record.header_bytes + message.len);
+    record.writeHeader(
+        .{ .content_type = .handshake, .length = @intCast(message.len) },
+        out[0..record.header_bytes],
+    );
+    @memcpy(out[record.header_bytes..][0..message.len], message);
+    return out[0 .. record.header_bytes + message.len];
 }
 
 /// A `psk_lookup` that answers one out-of-band identity, and answers it

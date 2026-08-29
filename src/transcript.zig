@@ -46,6 +46,31 @@ pub fn Transcript(comptime Hash: type) type {
             snapshot.final(&digest);
             return digest;
         }
+
+        /// The same hash with `tail` on the end, absorbing nothing.
+        ///
+        /// §4.2.11.2's binder covers a *truncated* ClientHello — the
+        /// message minus its binders section — and that is not a
+        /// complete handshake message: its length header still counts
+        /// the bytes that were cut. `update` refuses it for exactly that
+        /// reason, and rightly, since the truncation must never join the
+        /// running state; the whole hello does, later. So this is the
+        /// one read that takes an argument.
+        ///
+        /// On a first ClientHello the caller has nothing absorbed and
+        /// this is the truncation's own hash. After a HelloRetryRequest
+        /// §4.4.1 has already put message_hash(CH1) and the retry in
+        /// front of it, which is the entire difficulty of a binder on a
+        /// second hello and is why it is the transcript that answers.
+        pub fn hashWith(self: *const Self, tail: []const u8) [Hash.digest_length]u8 {
+            assert(self.messages_seen <= messages_max);
+            assert(tail.len >= message_header_bytes);
+            var snapshot = self.state;
+            snapshot.update(tail);
+            var digest: [Hash.digest_length]u8 = undefined;
+            snapshot.final(&digest);
+            return digest;
+        }
     };
 }
 
@@ -55,6 +80,28 @@ test "empty transcript hashes like the empty string" {
     var expected: [32]u8 = undefined;
     Sha256.hash(&.{}, &expected, .{});
     try std.testing.expectEqualSlices(u8, &expected, &transcript.currentHash());
+}
+
+test "hashWith covers the prefix and the tail, absorbing neither" {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const vectors = @import("rfc8448_vectors.zig");
+    var transcript: Transcript(Sha256) = .empty;
+    // With nothing absorbed it is the tail's own hash — the first
+    // ClientHello's binder, where §4.4.1 has added nothing yet.
+    var bare: [32]u8 = undefined;
+    Sha256.hash(&vectors.client_hello, &bare, .{});
+    try std.testing.expectEqualSlices(u8, &bare, &transcript.hashWith(&vectors.client_hello));
+    // With a prefix absorbed it is the concatenation's, and the state is
+    // where it was: a second read answers the same bytes.
+    transcript.update(&vectors.client_hello);
+    const with_prefix = transcript.hashWith(&vectors.server_hello);
+    try std.testing.expectEqualSlices(u8, &with_prefix, &transcript.hashWith(&vectors.server_hello));
+    try std.testing.expectEqual(@as(u32, 1), transcript.messages_seen);
+    // And it equals absorbing the tail for real, which is the property
+    // the binder depends on: the server hashes the same bytes the client
+    // did, one having absorbed them and the other not.
+    transcript.update(&vectors.server_hello);
+    try std.testing.expectEqualSlices(u8, &with_prefix, &transcript.currentHash());
 }
 
 test "currentHash is a snapshot, not a finalization" {

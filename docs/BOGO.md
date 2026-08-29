@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 299 passed, 0 failed, 6918 declined by the shim (89), floor 299
+bogo: 306 passed, 0 failed, 6918 declined by the shim (89), floor 306
 bogo: PASS
 ```
 
@@ -41,11 +41,14 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**299 passed.** Cases the runner ran end to end and we satisfied —
+**306 passed.** Cases the runner ran end to end and we satisfied —
 including the alert we sent, which BoGo checks by name. It was 278 until
 the client could answer a HelloRetryRequest: a single-group client that
 refused every retry structurally kept 26 patterns declined, and
-un-declining them is where the 21 came from.
+un-declining them is where the 21 came from. The last seven are the
+§4.4.1 retry binder (finding 13 below) — two that carry a PSK across a
+retry, one per machine, and five malformed offers on a second hello
+that could not be refused while the whole message was being ignored.
 
 The per-machine split this paragraph used to give — 146 client, 132
 server — is not restated here, because the gate does not compute one and
@@ -527,15 +530,17 @@ name.
     place, and `-NoPSKBinder` was passing before this slice, so getting
     it wrong was a regression rather than a miss.
 
-    The other 5 are the `-SecondBinder` variants, and they are not a
-    defect at all: that suffix forces a HelloRetryRequest
+    The other 5 are the `-SecondBinder` variants, and at the time they
+    were not a defect: that suffix forces a HelloRetryRequest
     (`resumption_tests.go`, "Force a HelloRetryRequest by predicting an
     empty curve list"), so the corrupt binder rides the *second*
-    ClientHello, and `selectPsk` ignores PSK offers on a retry hello on
+    ClientHello, and `selectPsk` ignored PSK offers on a retry hello on
     purpose — the binder there hashes the §4.4.1 surgery transcript,
-    which zssl does not carry. Their ledger entries say that now, rather
-    than pointing at an OPEN GAP that is closed; they move again if the
-    HRR+PSK path is ever carried.
+    which zssl did not carry. Their entries said "they move again if the
+    HRR+PSK path is ever carried", and finding 13 carried it: all five
+    now reach the checks above and pass, and their ledger entries are
+    gone rather than restated. Three faults told apart is worth nothing
+    on a message that is never read.
 
     Recorded because the first reading of this was wrong in the
     instructive way: the runner says `didResume is false, but we expected
@@ -582,6 +587,66 @@ name.
     send a psk_key_exchange_modes extension". An offer arriving without
     one was answered with a full handshake — a malformed offer hidden
     behind a working connection — and is now missing_extension.
+
+13. **FIXED — a PSK could not cross a HelloRetryRequest**, in either
+    direction, and the second ClientHello's own rule was missing with
+    it. Seven cases: two declined together because they are one scope
+    cut seen from two ends, and five that finding 10 had parked against
+    this one being fixed.
+
+    §4.2.11.2 computes the binder over
+    `Transcript-Hash(Truncate(ClientHello))`, and on a *second* hello
+    that transcript is not the hello: §4.4.1 has replaced CH1 with a
+    synthetic `message_hash` message and put the HelloRetryRequest
+    behind it, so the hash covers three things and the truncation is
+    only the last. Both halves hashed the truncation alone, so neither
+    could carry a PSK across a retry — the client dropped its offer
+    (`CurveID-Resume-Client-TLS13`) and the server ignored one
+    (`Resume-Server-OmitAllPSKsOnSecondClientHello`).
+
+    The surgery already existed on both machines, for the handshake
+    transcript. What was missing was a way to read that transcript with
+    a *non-message* on the end, which is what the truncated hello is —
+    its length header still counts the bytes that were cut, so
+    `Transcript.update` rejects it, and rightly. `Transcript.hashWith`
+    is that read: the prefix is asked for rather than rebuilt, so the
+    two sides cannot disagree about what CH1 hashed to.
+
+    Fixing the server exposed the rule underneath.
+    `Resume-Server-OmitAllPSKsOnSecondClientHello` is not about binders
+    at all — the client simply *omits* the extension on CH2 — and it
+    wants `missing_extension`. §4.1.2 is why: after a retry the client
+    "MUST send the same ClientHello without modification, except as
+    follows", and that list permits updating a `pre_shared_key`, never
+    dropping it. The server now remembers whether CH1 carried one,
+    because CH1's bytes are gone by the time CH2 arrives.
+
+    Two orderings turned out to be load-bearing, both for the same
+    reason — the binder is checked against a transcript keyed to a
+    suite. On the server, §4.1.4's "the retry keeps the suite" check
+    moved *ahead* of the PSK, or a CH2 that changed the suite would have
+    its binder verified under one hash against a ladder built for
+    another. On the client, the binder is patched before the transcript
+    absorbs CH2, because the binder is part of the message it absorbs.
+
+    The client also learned when *not* to carry the offer: §4.2.11's
+    "SHOULD NOT offer any pre-shared keys associated with a hash other
+    than that of the selected cipher suite". A ticket's PSK is a hash
+    long by §4.6.1's derivation, so its length is its hash, and a retry
+    naming a suite that hashes to another length leaves it behind.
+    `psk_offered` — what the hello on the wire actually carries — is now
+    what gates accepting a `selected_identity`, rather than what the
+    config holds; those were the same question until a retry could
+    change the hello, and telling them apart is what keeps a server from
+    naming an identity we never sent.
+
+    The five extra cases are finding 10's `-SecondBinder` variants, and
+    they came for free in the way that says the scope cut was hiding
+    something: a malformed binder on CH2 — one too many, one too few,
+    the wrong length, none at all — used to be *ignored* along with the
+    message carrying it, so three carefully distinguished faults met a
+    hello nobody read. They now reach the same checks their first-hello
+    twins do.
 
 None of these are exploitable as far as the runner can show; they are
 laxity, and laxity is what BoGo exists to find.

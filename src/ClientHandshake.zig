@@ -19,10 +19,12 @@
 //!   is `UnexpectedMessage`. A cookie-only retry is legal — the cookie
 //!   is the change — and re-sends the same share.
 //!
-//!   The PSK does not come along. §4.1.4 wants the second binder
-//!   computed over §4.4.1's reconstructed transcript, which is the
-//!   surgery the server half also leaves out, so a retried resumption
-//!   drops the identity and degrades to a full handshake.
+//!   The PSK comes along, bound to §4.4.1's reconstructed transcript —
+//!   message_hash(CH1), the retry, then the truncated CH2 — which is
+//!   the surgery the server half verifies from the other side. It stays
+//!   behind in one case, and that one is §4.2.11's: a PSK whose hash is
+//!   not the retry's suite has nowhere to go, so the offer is dropped
+//!   and the handshake degrades to a full one.
 //! - **Certificate policy is an explicit seam.** `.leaf_signature` proves
 //!   the peer holds the key its leaf names, via `std.crypto`'s ECDSA or
 //!   RSA-PSS over the leaf's own SPKI; chain building and RFC 9525 name
@@ -83,6 +85,17 @@ retried: bool,
 /// The group our *current* key_share is for — x25519 on the first hello,
 /// whatever the retry named on the second.
 share_group: u16,
+/// Whether the hello now on the wire carries a `pre_shared_key`.
+///
+/// Not the same question as `config.resume_session != null`, and the
+/// difference is a security one: §4.2.11 forbids a server to "select an
+/// identity that the client did not offer", and a second ClientHello may
+/// legitimately drop the offer the first one made — §4.2.11 says a
+/// client SHOULD NOT carry a PSK whose hash is not the retry's suite.
+/// The config still holds the resumption in that case, so gating the
+/// server's `selected_identity` on the config would let it name an
+/// identity CH2 never sent and still reach `connected` unauthenticated.
+psk_offered: bool,
 /// Whether this session came up on our offered PSK.
 resumed: bool,
 /// True once the leaf's CertificateVerify checked out under the policy.
@@ -353,6 +366,7 @@ pub fn init(config: *const Config) ClientHandshake {
         .hello_bytes = 0,
         .retried = false,
         .share_group = client_hello.group_x25519,
+        .psk_offered = false,
         .resumed = false,
         .certificate_verified = false,
         .certificate_seen = false,
@@ -409,10 +423,14 @@ pub fn start(self: *ClientHandshake, out: []u8) []const u8 {
         .psk = psk,
     });
     self.hello_bytes = @intCast(message.len);
+    self.psk_offered = psk != null;
     if (self.config.resume_session) |resumption| {
+        // Null: nothing precedes a first ClientHello, so §4.2.11.2's
+        // transcript is the truncation alone.
         client_messages.patchBinder(
             self.hello_storage[0..self.hello_bytes],
             resumption.psk[0..resumption.psk_bytes],
+            null,
         );
     }
     var builder = wire.Builder.init(out);
@@ -614,18 +632,21 @@ fn handleHelloRetryRequest(
         &share_storage,
     ) catch return error.HandshakeFailure;
 
-    // The PSK does not come with us. §4.1.4 requires the binder on a
-    // second ClientHello to be recomputed over §4.4.1's transcript —
-    // message_hash(CH1), the retry, then the truncated CH2 — and
-    // `client_messages.patchBinder` hashes the truncated hello alone.
-    // Offering the identity with a binder that cannot verify would be a
-    // handshake that fails later and blames the key; dropping it is one
-    // of the two answers §4.1.4 allows, and it degrades to a full
-    // handshake rather than to a lie.
-    //
-    // The server half declines the same surgery from the other side
-    // (DESIGN.md §6 slice 3), so this is one scope cut seen twice, not
-    // two.
+    // §4.2.11 on which offers may travel: "the client SHOULD NOT offer
+    // any pre-shared keys associated with a hash other than that of the
+    // selected cipher suite". A ticket's PSK is a hash long by §4.6.1's
+    // derivation, so its length *is* its hash, and a retry that names a
+    // suite hashing to another length leaves the offer behind. Dropping
+    // it degrades to a full handshake; carrying it would offer a binder
+    // the server cannot even parse against its own schedule.
+    const carried: ?client_messages.PskParams = if (self.config.resume_session) |resumption|
+        if (resumption.psk_bytes == suite.hashBytes()) .{
+            .identity = resumption.identity,
+            .obfuscated_age = resumption.obfuscated_age,
+            .binder_bytes = resumption.psk_bytes,
+        } else null
+    else
+        null;
     const second = client_messages.clientHello(&self.hello_storage, &.{
         .random = &self.config.client_random,
         .session_id = self.config.session_id,
@@ -635,11 +656,40 @@ fn handleHelloRetryRequest(
         .cookie = retry.cookie,
         .server_name = self.config.server_name,
         .alpn_protocols = self.config.alpn_protocols,
+        .psk = carried,
     });
     self.hello_bytes = @intCast(second.len);
     self.share_group = selected;
     self.retried = true;
+    self.psk_offered = carried != null;
     self.resumed = false;
+    // §4.2.11.2's binder over §4.4.1's transcript, which is the whole of
+    // what kept a PSK from crossing a retry: the hash is not the
+    // truncated CH2 alone but message_hash(CH1), the retry, and *then*
+    // the truncation. The ladder is standing at exactly that point — the
+    // surgery above absorbed both and CH2 has not gone in yet — so the
+    // prefix is asked for rather than rebuilt, and the two can never
+    // disagree about what CH1 hashed to.
+    //
+    // Ordered before the transcript takes CH2 because it must be: the
+    // binder is part of the message the transcript absorbs.
+    if (carried) |offer| {
+        // `carried` is built from `config.resume_session` and is null
+        // without it, so the unwrap below is that construction restated
+        // rather than a second assumption.
+        assert(self.config.resume_session != null);
+        assert(offer.binder_bytes == self.config.resume_session.?.psk_bytes);
+        const psk = self.config.resume_session.?.psk[0..offer.binder_bytes];
+        switch (self.ladder.?) {
+            inline else => |*arm| {
+                const hello = self.hello_storage[0..self.hello_bytes];
+                const digest = arm.transcript.hashWith(
+                    client_messages.binderTruncation(hello, offer.binder_bytes),
+                );
+                client_messages.patchBinder(hello, psk, &digest);
+            },
+        }
+    }
     // CH2 joins the transcript now; the ServerHello that answers it will
     // be absorbed on top, and `handleServerHello` must not re-absorb CH1.
     switch (self.ladder.?) {
@@ -827,14 +877,18 @@ fn readServerHelloExtensions(self: *ClientHandshake, body: *wire.Cursor) Error!S
                 // the client did not offer". The question is what *this*
                 // hello offered, not what the config holds — and those
                 // stopped being the same thing when a retry began
-                // dropping the PSK from CH2. Gating on the config alone
-                // let a server answer a hello with no identities at all
-                // and still set `resumed`, which is the flag
-                // `completeHandshake` reads to decide a certificate was
-                // not required. An unauthenticated connection reaching
-                // `connected` is the one thing that must not happen.
-                if (self.retried) return error.BadServerHello;
-                if (self.config.resume_session == null) return error.BadServerHello;
+                // deciding for itself whether the PSK comes along.
+                // Gating on the config alone let a server answer a hello
+                // with no identities at all and still set `resumed`,
+                // which is the flag `completeHandshake` reads to decide
+                // a certificate was not required. An unauthenticated
+                // connection reaching `connected` is the one thing that
+                // must not happen.
+                //
+                // `psk_offered` is that question asked of the hello
+                // itself, which is why it survived a retry learning to
+                // carry the PSK: the answer moved, the guard did not.
+                if (!self.psk_offered) return error.BadServerHello;
                 var selected = wire.Cursor.init(data);
                 // We offer exactly one identity, so index 0 is the only
                 // selection that can be answering us.

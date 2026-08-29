@@ -177,9 +177,10 @@ matter: a peer can spend the whole budget on padding.
    binder chain, truncation arithmetic, PSK ServerHello, and PSK-mixed
    ladder, all byte-exact; end-to-end ticket → resumed session with the
    client deriving every PSK from its own resumption_master. Deliberate
-   scope cuts: PSK offers on a retry ClientHello are ignored (the §4.4.1
-   surgery binder stays out until BoGo can pressure it), and psk_ke
-   without (EC)DHE is never accepted.
+   scope cut: psk_ke without (EC)DHE is never accepted. One more —
+   PSK offers on a retry ClientHello ignored, because the §4.4.1 surgery
+   binder stayed out "until BoGo can pressure it" — lasted until BoGo
+   did; see slice 5.
 4. **KeyUpdate, the kTLS switchover contract, and the client handshake**
    — done. §4.6.3 lives once, in `session_keys.zig`, shared by both
    machines: rotation resets the sequence space, a rotation ceiling turns
@@ -198,9 +199,9 @@ matter: a peer can spend the whole budget on padding.
    refused and are now told apart (a retry that changes nothing, or
    names a group never advertised, is `IllegalRetry`; a second retry is
    `UnexpectedMessage`), a cookie-only retry is legal and re-sends the
-   same share, and a retried *resumption* drops its PSK because the
-   second binder wants §4.4.1's reconstructed transcript — the same
-   surgery slice 3 leaves out on the server side.
+   same share, and a retried *resumption* carries its PSK across, bound
+   to §4.4.1's reconstructed transcript — see slice 5 for the pair of
+   BoGo cases that pressed both halves of that into existence.
    Oracle: both production machines end to end — handshake, resume,
    KeyUpdate both directions with kTLS exports agreeing across machines
    at every generation.

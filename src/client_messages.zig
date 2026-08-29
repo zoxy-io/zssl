@@ -200,21 +200,47 @@ fn helloPreSharedKey(builder: *wire.Builder, psk: *const PskParams) void {
     builder.patchU16(extension);
 }
 
+/// The bytes §4.2.11.2's binder covers: the hello up to but not
+/// including the binders section `helloPreSharedKey` left as a
+/// placeholder. Public because a caller computing the binder's
+/// transcript itself — see `patchBinder`'s `transcript_hash` — needs to
+/// know where the truncation falls before it can hash it.
+pub fn binderTruncation(message: []const u8, psk_bytes: u8) []const u8 {
+    assert(psk_bytes == 32 or psk_bytes == 48);
+    const binders_section_bytes = 2 + 1 + @as(usize, psk_bytes);
+    assert(message.len > binders_section_bytes + handshake.header_bytes);
+    return message[0 .. message.len - binders_section_bytes];
+}
+
 /// Compute and patch the binder over the finished message, with the hash
 /// the PSK itself is bound to — decided by its length, not by whatever
 /// suite the server will pick (§4.2.11.2).
-pub fn patchBinder(message: []u8, psk: []const u8) void {
+///
+/// `transcript_hash` is §4.2.11.2's `Transcript-Hash(Truncate(...))`,
+/// and null asks for the plain reading of it: the truncated hello
+/// hashed alone, which is right for a first ClientHello and wrong for
+/// every second one. After a HelloRetryRequest §4.4.1 replaces CH1 with
+/// a `message_hash` message and puts the retry behind it, so the binder
+/// covers three things and only the caller holds the first two —
+/// `ClientHandshake.handleHelloRetryRequest` passes them in as a hash
+/// taken off the ladder's transcript. Getting this wrong is not a
+/// handshake that fails here; it is one that fails at the server's
+/// binder check and blames the key.
+pub fn patchBinder(message: []u8, psk: []const u8, transcript_hash: ?[]const u8) void {
     assert(psk.len == 32 or psk.len == 48);
-    const binders_section_bytes = 2 + 1 + psk.len;
-    assert(message.len > binders_section_bytes + handshake.header_bytes);
-    const truncated = message[0 .. message.len - binders_section_bytes];
+    const truncated = binderTruncation(message, @intCast(psk.len));
+    if (transcript_hash) |given| assert(given.len == psk.len);
     switch (psk.len) {
         inline 32, 48 => |comptime_bytes| {
             const suite: CipherSuite = if (comptime_bytes == 32) .aes_128_gcm_sha256 else .aes_256_gcm_sha384;
             const Hash = CipherSuite.HashType(suite);
             const Schedule = key_schedule.KeySchedule(suite);
             var truncated_hash: [Hash.digest_length]u8 = undefined;
-            Hash.hash(truncated, &truncated_hash, .{});
+            if (transcript_hash) |given| {
+                @memcpy(&truncated_hash, given);
+            } else {
+                Hash.hash(truncated, &truncated_hash, .{});
+            }
             var schedule = Schedule.initEarly(psk);
             // Resumption by construction: this offer's PSK came from a
             // ticket this client was issued. Offering an *external* PSK
@@ -277,7 +303,7 @@ test "a PSK hello carries a well-formed offer and a patchable binder" {
         .psk = .{ .identity = "sealed-ticket", .obfuscated_age = 7, .binder_bytes = 32 },
     });
     // The mutable view for patching is the same bytes.
-    patchBinder(out[0..encoded.len], &psk);
+    patchBinder(out[0..encoded.len], &psk, null);
     const hello = try client_hello.parse(out[0..encoded.len]);
     try std.testing.expect(hello.offersPskDheKe());
     const offer = (try client_hello.parsePskOffer(&hello)).?;

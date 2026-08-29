@@ -8,6 +8,7 @@
 //! and the PSK it drops on the way.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const testing = std.testing;
 
 const ClientHandshake = @import("ClientHandshake.zig");
@@ -182,6 +183,21 @@ const Harness = struct {
 fn recordAt(bytes: []const u8, index: usize) []const u8 {
     const length = std.mem.readInt(u16, bytes[index + 3 ..][0..2], .big);
     return bytes[index..][0 .. record.header_bytes + length];
+}
+
+/// The last record in a run of them. A client flight may lead with §D.4's
+/// compatibility CCS, so a test after the handshake message walks to the
+/// end rather than assuming which record it is.
+fn lastRecord(bytes: []const u8) []const u8 {
+    assert(bytes.len >= record.header_bytes);
+    var index: usize = 0;
+    var last: []const u8 = &.{};
+    while (index < bytes.len) {
+        last = recordAt(bytes, index);
+        index += last.len;
+    }
+    assert(index == bytes.len);
+    return last;
 }
 
 fn expectExportAgreement(server: *const ServerHandshake, client: *const ClientHandshake) !void {
@@ -473,14 +489,7 @@ test "§4.1.4: a retry into a group we advertised produces a second hello" {
 
     // The second hello carries a share for the group we were sent to,
     // and an uncompressed SEC1 point at that — §4.2.8.2's only encoding.
-    // `send` may lead with D.4's compatibility CCS, so walk to the last
-    // record rather than assuming which one the hello is.
-    var index: usize = 0;
-    var hello_record: []const u8 = &.{};
-    while (index < event.send.len) {
-        hello_record = recordAt(event.send, index);
-        index += hello_record.len;
-    }
+    const hello_record = lastRecord(event.send);
     try testing.expectEqual(record.ContentType.handshake, try contentTypeOf(hello_record));
     const second = try client_hello_mod.parse(hello_record[record.header_bytes..]);
     const share = second.keyShareFor(client_hello_mod.group_secp256r1) orelse
@@ -492,17 +501,25 @@ test "§4.1.4: a retry into a group we advertised produces a second hello" {
     try testing.expectEqual(@as(?[]const u8, null), second.keyShareFor(client_hello_mod.group_x25519));
 }
 
-test "a retried hello offers no PSK, so a selected one is refused" {
-    // The hole this closes. `handleHelloRetryRequest` drops the PSK from
-    // CH2 — it cannot compute §4.4.1's binder — but the ServerHello
-    // parser gated `pre_shared_key` on the *config* holding a
-    // resumption, which stopped meaning "this hello offered one" the
-    // moment a retry could change the hello. A server answering with
-    // `selected_identity` anyway would set `resumed`, and `resumed` is
-    // what tells `completeHandshake` a certificate was not required.
+test "a PSK whose hash is not the retry's suite is dropped, and a selected one refused" {
+    // Two rules meeting. §4.2.11: a client "SHOULD NOT offer any
+    // pre-shared keys associated with a hash other than that of the
+    // selected cipher suite", and a ticket's PSK is a hash long by
+    // §4.6.1's derivation — so a 48-byte PSK against a retry naming
+    // AES-128-GCM-SHA256 has nowhere to go and stays behind.
     //
-    // §4.2.11 forbids selecting an identity the client did not offer, so
-    // this is the RFC's refusal as much as it is ours.
+    // And then the hole that guards. The ServerHello parser gated
+    // `pre_shared_key` on the *config* holding a resumption, which
+    // stopped meaning "this hello offered one" the moment a retry could
+    // change the hello. A server answering with `selected_identity`
+    // anyway would set `resumed`, and `resumed` is what tells
+    // `completeHandshake` a certificate was not required. §4.2.11
+    // forbids selecting an identity the client did not offer, so this is
+    // the RFC's refusal as much as it is ours.
+    //
+    // The guard outlived the reason it was written: CH2 now carries the
+    // PSK whenever the hashes agree (the test below), and this is the
+    // case where it still does not.
     var buffers: Buffers = .{};
     var store: TicketStore = .{
         .identity = undefined,
@@ -514,7 +531,7 @@ test "a retried hello offers no PSK, so a selected one is refused" {
         .identity = store.identity[0..6],
         .obfuscated_age = 0,
         .psk = store.psk,
-        .psk_bytes = 32,
+        .psk_bytes = 48, // SHA-384; the retry below names SHA-256.
     };
     var harness: Harness = undefined;
     try harness.init(.{ .retry_private = .{0x71} ** 48, .resume_session = resumption });
@@ -527,6 +544,11 @@ test "a retried hello offers no PSK, so a selected one is refused" {
     const event = (try harness.client.handleRecord(retry, &buffers.scratch)).?;
     try testing.expectEqual(std.meta.activeTag(event), .send);
     try testing.expect(!harness.client.resumed);
+    try testing.expect(!harness.client.psk_offered);
+    try testing.expectEqual(
+        @as(?[]const u8, null),
+        (try client_hello_mod.parse(lastRecord(event.send)[record.header_bytes..])).pre_shared_key_wire,
+    );
 
     // Now answer with a ServerHello that selects identity 0 anyway.
     var hello_buffer: [server_messages.server_hello_bytes_max]u8 = undefined;
@@ -562,6 +584,79 @@ test "a retried hello offers no PSK, so a selected one is refused" {
         harness.client.handleRecord(framed[0 .. record.header_bytes + hello.len], &buffers.scratch),
     );
     try testing.expect(!harness.client.resumed);
+}
+
+test "§4.4.1: a PSK crosses a retry, bound to the reconstructed transcript" {
+    // The binder on a second ClientHello is not over the second
+    // ClientHello. §4.2.11.2 asks for Transcript-Hash(Truncate(CH)), and
+    // after a HelloRetryRequest §4.4.1 has already put message_hash(CH1)
+    // and the retry into that transcript — so the hash covers three
+    // things and the truncation is only the last of them.
+    //
+    // Recomputed here from the wire bytes with `std.crypto` directly,
+    // not from the ladder that produced it. Agreement between two
+    // derivations is the check; one of them going through
+    // `Transcript.hashWith` would only prove the function equals itself.
+    var buffers: Buffers = .{};
+    const psk = [_]u8{0x5e} ** 32;
+    var store: TicketStore = .{
+        .identity = undefined,
+        .identity_bytes = 6,
+        .psk = .{0x5e} ** cipher_suite.hash_bytes_max,
+    };
+    @memcpy(store.identity[0..6], "ticket");
+    const resumption: ClientHandshake.Resumption = .{
+        .identity = store.identity[0..6],
+        .obfuscated_age = 0,
+        .psk = store.psk,
+        .psk_bytes = 32, // SHA-256, which is what the retry names.
+    };
+    var harness: Harness = undefined;
+    try harness.init(.{ .retry_private = .{0x71} ** 48, .resume_session = resumption });
+    defer harness.deinit();
+    const first = harness.client.start(&buffers.client_out);
+    const ch1 = lastRecord(first)[record.header_bytes..];
+
+    var wire_buffer: [record.header_bytes + server_messages.server_hello_bytes_max]u8 = undefined;
+    const retry = retryRecord(&wire_buffer, client_hello_mod.group_secp256r1);
+    const hrr = retry[record.header_bytes..];
+    const event = (try harness.client.handleRecord(retry, &buffers.scratch)).?;
+    try testing.expectEqual(std.meta.activeTag(event), .send);
+    try testing.expect(harness.client.psk_offered);
+
+    // CH2 carries the same identity CH1 did.
+    const ch2 = lastRecord(event.send)[record.header_bytes..];
+    const second = try client_hello_mod.parse(ch2);
+    const offer = (try client_hello_mod.parsePskOffer(&second)) orelse
+        return error.TestExpectedPskOffer;
+    try testing.expectEqual(@as(u8, 1), offer.count);
+    try testing.expectEqualSlices(u8, "ticket", offer.identities[0]);
+
+    // §4.4.1's reconstruction, spelled out: the synthetic message_hash
+    // message — type 254, a u24 length, and the hash of CH1 — then the
+    // HelloRetryRequest, then the truncated CH2.
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var ch1_hash: [32]u8 = undefined;
+    Sha256.hash(ch1, &ch1_hash, .{});
+    var reconstructed = Sha256.init(.{});
+    reconstructed.update(&[_]u8{ 254, 0, 0, 32 });
+    reconstructed.update(&ch1_hash);
+    reconstructed.update(hrr);
+    reconstructed.update(ch2[0 .. ch2.len - offer.binders_section_bytes]);
+    var digest: [32]u8 = undefined;
+    reconstructed.final(&digest);
+
+    var schedule = key_schedule.KeySchedule(.aes_128_gcm_sha256).initEarly(&psk);
+    defer schedule.wipe();
+    const expected = schedule.pskBinder(.resumption, &digest);
+    try testing.expectEqualSlices(u8, &expected, offer.binders[0]);
+
+    // And the truncation alone — what the binder used to be over — is a
+    // different value, so the test above could not pass by accident.
+    var truncated_hash: [32]u8 = undefined;
+    Sha256.hash(ch2[0 .. ch2.len - offer.binders_section_bytes], &truncated_hash, .{});
+    const wrong = schedule.pskBinder(.resumption, &truncated_hash);
+    try testing.expect(!std.mem.eql(u8, &wrong, offer.binders[0]));
 }
 
 test "§4.1.4: a second retry, and a retry we hold no scalar for" {
