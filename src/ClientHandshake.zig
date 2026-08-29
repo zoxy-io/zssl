@@ -406,6 +406,13 @@ pub fn handleRecord(self: *ClientHandshake, wire_record: []const u8, out: []u8) 
             // only after a harness deadline stopped hiding it: the
             // connection used to close on its own before the corpus
             // could see that we had accepted the record.
+            //
+            // What the record *contains* is asked first, and before
+            // anything about where we are — see the server side, which
+            // had the same hole and is where tlsfuzzer found it.
+            if (!record.isCompatibilityCcs(wire_record[record.header_bytes..])) {
+                return error.UnexpectedMessage;
+            }
             // `.closed` counts as after it too: the only way to reach
             // that state from a protected close_notify is with the
             // peer's Finished already behind us, and a machine in it

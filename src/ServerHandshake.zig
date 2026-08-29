@@ -287,6 +287,18 @@ pub fn handleRecord(self: *ServerHandshake, wire_record: []const u8, out: []u8) 
             // only after a harness deadline stopped hiding it: the
             // connection used to close on its own before the corpus
             // could see that we had accepted the record.
+            //
+            // What the record *contains* is asked first, and before
+            // anything about where we are: §5 admits "the single byte
+            // value 0x01" and nothing else, so a record that is not
+            // that is not the compatibility record at all and its
+            // position is beside the point. This used to go unread —
+            // `01 01` was accepted as filler, and so was a hundred
+            // `01`s in one record, which is tlsfuzzer's finding 8
+            // (docs/TLSFUZZER.md).
+            if (!record.isCompatibilityCcs(wire_record[record.header_bytes..])) {
+                return error.UnexpectedMessage;
+            }
             if (self.state == .awaiting_client_hello) return error.UnexpectedMessage;
             // `.closed` counts as after it too: the only way to reach
             // that state from a protected close_notify is with the

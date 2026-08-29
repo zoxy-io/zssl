@@ -101,6 +101,31 @@ pub fn parseHeader(bytes: *const [header_bytes]u8) HeaderError!Header {
     return .{ .content_type = content_type, .length = length };
 }
 
+/// §5's compatibility ChangeCipherSpec, and the only shape it may take.
+/// The section admits exactly one:
+///
+///   An implementation may receive an unencrypted record of type
+///   change_cipher_spec consisting of the single byte value 0x01 at
+///   certain points in the handshake ... An implementation which
+///   receives any other change_cipher_spec value or which receives a
+///   protected change_cipher_spec record MUST abort the handshake with
+///   an "unexpected_message" alert.
+///
+/// "any other value" covers both ways to be wrong — a byte that is not
+/// 0x01, and more than one byte of it — and neither is a
+/// ChangeCipherSpec message in the TLS 1.2 sense either, because 1.3
+/// keeps the record type and drops the message. There is nothing here
+/// to parse: the whole grammar is this one comparison.
+///
+/// Lives beside `parseHeader` because it is the same layer's rule and
+/// the same peer's bytes; both machines ask it so the answer cannot
+/// drift between them. A zero-length record never reaches this — §5.1
+/// makes that `EmptyFragment` at the header — but the length is the
+/// peer's, so this decides it rather than assuming it.
+pub fn isCompatibilityCcs(payload: []const u8) bool {
+    return payload.len == 1 and payload[0] == 0x01;
+}
+
 /// Write one record header. Always 0x0303: zssl never emits the 0x0301
 /// compatibility version — that is a client first-flight concession, and
 /// reading it is enough.
@@ -150,6 +175,30 @@ test "parseHeader rejects what the spec forbids" {
     try std.testing.expectError(error.NotATlsRecord, parseHeader(&.{ 0x16, 0x02, 0x00, 0x00, 0x10 }));
     try std.testing.expectError(error.NotATlsRecord, parseHeader(&.{ 0x16, 0xff, 0xff, 0x00, 0x10 }));
     try std.testing.expectError(error.EmptyFragment, parseHeader(&.{ 0x15, 0x03, 0x03, 0x00, 0x00 }));
+}
+
+test "§5 admits one ChangeCipherSpec payload and no other" {
+    try std.testing.expect(isCompatibilityCcs(&.{0x01}));
+
+    // The value that is not 0x01 — including 0x00, which is what a
+    // careless generator emits, and 0x14, which is the record *type*
+    // byte and a plausible confusion.
+    try std.testing.expect(!isCompatibilityCcs(&.{0x00}));
+    try std.testing.expect(!isCompatibilityCcs(&.{0x02}));
+    try std.testing.expect(!isCompatibilityCcs(&.{0x14}));
+    try std.testing.expect(!isCompatibilityCcs(&.{0xff}));
+
+    // More than one byte is "any other value" as much as a wrong byte
+    // is: the record's whole content is the message, so a correct first
+    // byte does not rescue it. This is the shape tlsfuzzer sends.
+    try std.testing.expect(!isCompatibilityCcs(&.{ 0x01, 0x01 }));
+    try std.testing.expect(!isCompatibilityCcs(&.{ 0x01, 0x00 }));
+    try std.testing.expect(!isCompatibilityCcs(&([_]u8{0x01} ** 64)));
+
+    // Empty never reaches this from the wire — §5.1 makes a zero-length
+    // non-application record `EmptyFragment` at the header — but the
+    // length is the peer's and the answer is decided, not assumed.
+    try std.testing.expect(!isCompatibilityCcs(&.{}));
 }
 
 test "writeHeader round-trips through parseHeader" {

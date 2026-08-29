@@ -1,6 +1,10 @@
 {
   "Run": [
     {
+      "name": "test-tls13-ccs.py",
+      "leaf": "rsa"
+    },
+    {
       "name": "test-tls13-connection-abort.py"
     },
     {
@@ -66,7 +70,6 @@
   ],
   "Disabled": {
     "test-tls13-0rtt-garbage.py": "0-RTT: deferred pending a replay analysis (DESIGN.md \u00a71).",
-    "test-tls13-ccs.py": "OPEN GAP \u2014 4 of 5 over the rsa leaf, and real OpenSSL passes all five. The one failure, 'two byte long CCS', is finding 8 in docs/TLSFUZZER.md: \u00a75 admits a change_cipher_spec record holding the single byte 0x01 and demands unexpected_message for any other value, and zssl never reads the payload.",
     "test-tls13-certificate-compression.py": "Compressed certificates: not implemented.",
     "test-tls13-certificate-request.py": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",
     "test-tls13-certificate-verify.py": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",
@@ -89,7 +92,7 @@
     "test-tls13-legacy-version.py": "OPEN GAP \u2014 2 of 10 over either leaf; real OpenSSL passes 9. zssl ignores ClientHello.legacy_version once supported_versions is present, which is what \u00a74.2.1 requires of *negotiation*; the script and OpenSSL both refuse implausible values outright with protocol_version. Finding 11 in docs/TLSFUZZER.md argues it both ways.",
     "test-tls13-mldsa-in-certificate-verify.py": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",
     "test-tls13-mlkem.py": "ML-KEM: post-quantum key exchange, not implemented (DESIGN.md \u00a71).",
-    "test-tls13-multiple-ccs-messages.py": "Not a defect, with one exception \u2014 3 of 7 over either leaf, and real OpenSSL scores 2 of 7, failing even the script's own 'sanity with one CCS message'. The script asks for unexpected_message on a *second* compatibility CCS; \u00a75 caps neither the count nor the placement inside its window, and zssl's own bound is two (ServerHandshake ccs_seen_max), which a HelloRetryRequest flight needs. The exception is 'multiple CCS Messages in one TLS record', which is finding 8 \u2014 a CCS payload we never read.",
+    "test-tls13-multiple-ccs-messages.py": "Not a defect \u2014 4 of 7 over either leaf, and real OpenSSL 3.6.3 scores 2 of 7, failing even the script's own 'sanity with one CCS message'. Finding 8 in docs/TLSFUZZER.md closed 'multiple CCS Messages in one TLS record', which was a payload we never read \u2014 OpenSSL still fails that one, so we are stricter than it is on \u00a75's MUST. The three that remain ask for unexpected_message on a *second* compatibility CCS; \u00a75 caps neither the count nor the placement inside its window, and zssl's own bound is two (ServerHandshake ccs_seen_max), which a HelloRetryRequest flight needs.",
     "test-tls13-no-unknown-groups.py": "Groups outside x25519/secp256r1/secp384r1 (DESIGN.md \u00a71).",
     "test-tls13-non-support.py": "TLS 1.2: the script expects a ServerHello at (3,3) followed by a ServerHelloDone, so every conversation asks for a version zssl does not implement (DESIGN.md \u00a71).",
     "test-tls13-obsolete-curves.py": "Groups outside x25519/secp256r1/secp384r1 (DESIGN.md \u00a71).",
