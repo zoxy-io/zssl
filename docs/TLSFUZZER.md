@@ -305,22 +305,33 @@ the library's until the OpenSSL oracle said otherwise.
     oversight — `lengths` and these want opposite things from the same
     loop — and it is recorded so the next reader does not spend the
     afternoon we spent proving it was not a record-layer bug.
-11. **`ClientHello.legacy_version` is ignored, not policed.** §4.2.1 is
-    unambiguous that a server "MUST NOT use the ClientHello.legacy_version
-    value for version negotiation" once `supported_versions` is present,
-    and zssl does not — it never reads the field. §4.1.2 is equally
-    unambiguous that the client "MUST" set it to 0x0303, and the two
-    together leave open whether a server should *refuse* a value that
-    cannot be conformant.
+11. **`ClientHello.legacy_version` is ignored, and that is the rule.**
+    §4.1.2 says the client "MUST" set it to 0x0303, and §4.2.1 says a
+    server "MUST NOT use the ClientHello.legacy_version value for version
+    negotiation and MUST use only the 'supported_versions' extension".
+    tlsfuzzer wants the first read and refuses anything below 0x0300 with
+    `protocol_version`; real OpenSSL agrees with it 9 times out of 10.
+    zssl never reads the field, so the script scores 2 of 10.
 
-    tlsfuzzer says yes, and real OpenSSL agrees with it 9 times out of
-    10: both answer `protocol_version` to a hello whose legacy_version is
-    below 0x0300, where zssl proceeds to a ServerHello. Enforcing
-    `== 0x0303` would take `test-tls13-legacy-version` from 2 of 10 to
-    10 — stricter than OpenSSL, which still accepts (3,0) — and costs
-    nothing at interop, because every implementation that speaks 1.3
-    sends 0x0303. Recorded as a gap rather than closed because the
-    argument runs both ways and §4.2.1's "MUST" is the louder of the two.
+    This was first recorded here as an open gap with the argument running
+    both ways. It is not open, and the tree had already settled it:
+    `9baf500` removed exactly this check, calling it one of "two fields
+    the spec says to ignore, and we did not", in the commit that took
+    BoGo from 133 passing to 221. Re-adding it was tried rather than
+    argued about, and BoGo answered in one run — **five cases break, and
+    the first is named `IgnoreLegacyVersion-TLS13`**, with
+    `VersionTolerance-TLS13`, `VersionTooLow`, and two
+    `ExtensionTrailingData-ServerName-Server-TLS-TLS1x` cases behind it.
+    BoringSSL asserts §4.2.1 by name; the pre-1.3 hellos have to reach
+    the version decline rather than die on a field nobody may negotiate
+    on.
+
+    So this is a `KEEP` and the ledger says so. Two corpora disagree, as
+    they did on finding 7, and the same tiebreak applies: the rule that
+    binds a *reader* wins over the rule that binds a writer. Worth
+    keeping the failure recorded rather than forgetting the question —
+    the next reader will notice `legacy-version` scoring 2 of 10 and
+    reach for the same fix.
 
 12. **An external PSK's binder cannot verify.** §4.2.11.2 derives
     `binder_key` from the early secret under one of two labels — "ext
@@ -365,9 +376,8 @@ the shape of the debt that was paid.
 
 | Verdict | Scripts |
 | --- | --- |
-| **OPEN GAP** — a defect we mean to fix | `legacy-version` (11) |
 | **SCOPE** — needs a capability or a fixture we chose not to carry | `ecdhe-curves`, `ecdsa-support`, `psk_dhe_ke`, `rsapss-signatures`, `serverhello-random`, `session-resumption`, `signature-algorithms` |
-| **KEEP** — we refuse the input and differ only in the alert, having argued ours | `finished` (7, with BoGo) |
+| **KEEP** — the corpus wants one reading of the RFC and a second corpus demands the other | `finished` (7), `legacy-version` (11) |
 | **Green, and now in `Run`** | `record-layer-limits` (findings 9 and 7), `ccs` (finding 8) |
 | **Not a defect** — the corpus is stating its own policy, or the harness's shape | `keyupdate`, `keyupdate-from-server`, `large-number-of-extensions`, `multiple-ccs-messages`, `shuffled-extentions`, `zero-content-type`, `zero-length-data` |
 

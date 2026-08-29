@@ -300,7 +300,7 @@ TLS 1.3-only server. That is why each carries a second, counted badge
 rather than a bare pass mark, and why each holds its passing count
 against a floor, so a regression or a quiet suppression stops the build.
 Nine findings sit on BoGo's ledger, tlsfuzzer's 40 declines are all
-triaged and one of them stands on an open finding, and TLS-Anvil has two
+triaged and none of them now stands on an open gap, and TLS-Anvil has two
 open failures it refuses to suppress; the three documents name every one,
 with a reason.
 
