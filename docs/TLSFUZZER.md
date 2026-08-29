@@ -89,10 +89,13 @@ RSA signature scripts, the 68 conversations of `record-layer-limits`
 walking §5.1's and §5.2's caps from both sides since finding 7 closed,
 and `ccs` since finding 8 did.
 
-**36 disabled, none of them untriaged.** 24 carry scope reasons that were
+**35 disabled, none of them untriaged.** 23 carry scope reasons that were
 always plain — client certificates, FFDHE, brainpool curves, EdDSA,
-ML-DSA, ML-KEM, 0-RTT, compressed certificates, `psk_ke` without (EC)DHE,
-TLS 1.2 fallback, AES-CCM — each pointing at a written decision. The
+ML-DSA, ML-KEM, compressed certificates, `psk_ke` without (EC)DHE,
+TLS 1.2 fallback, AES-CCM — each pointing at a written decision. 0-RTT
+left that list: `test-tls13-0rtt-garbage` runs now, because every one of
+its conversations is about a server *declining* early data, which is in
+scope and was the whole of docs/BOGO.md finding 14. The
 other 18 said "not yet triaged" for as long as this file has existed;
 they now say what they are, and the sweep that got them there is
 [the triage](#the-triage-of-the-eighteen) below.

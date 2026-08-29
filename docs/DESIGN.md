@@ -58,14 +58,44 @@ proxy needs instead of what a general TLS library carries.
 
 **Out, permanently** (a caller that needs these wants a different
 library): TLS 1.2, renegotiation, compression, RSA key exchange, DSA,
-SSLv3-era anything, post-handshake client auth.
+SSLv3-era anything, post-handshake client auth, and *accepting* 0-RTT.
 
-**Out, deliberately deferred**: *accepting* 0-RTT (a replay-analysis
-decision, not a protocol convenience) — the receive side of *rejecting*
-it is in, because that never needed the decision: a server that declines
-early data still has to skip past what the client already sent, and §5
-gives it no way to say so in time. See §6 slice 5 and docs/BOGO.md
-finding 14. Also out: X.509 chain *validation* — which stays out of
+That last one was carried as "deferred pending a replay analysis" for
+most of this library's life. The analysis has now been done, and the
+answer is that zssl is the wrong layer to make the decision — so it is
+a permanent exclusion rather than a queue item.
+
+§8 lets a server accept early data only with single-use tickets (§8.1)
+or a strike register over recorded ClientHellos (§8.2), and either way
+with a freshness check (§8.3). zssl can implement none of the three,
+and not for want of effort: §8.1 needs a ticket store, and tickets are
+the embedder's by design — sealing, lifetime and age policy all live
+behind `psk_lookup`; §8.2 needs storage we could take as a caller-owned
+buffer *and* a clock to bound the window; §8.3 is a clock outright. This
+library has no time source at all, deliberately, and adding one to
+serve 0-RTT would be the tail wagging the dog.
+
+That leaves acceptance as a seam — the embedder answers "is early data
+safe for this PSK?" having done §8 itself — and the seam is what settles
+it. `psk_lookup` is the same shape and it is fine, because an embedder
+that gets age policy wrong admits a resumption that should have expired:
+bad, and bounded. An embedder that gets §8 wrong hands *replayed
+application data to the application as if it were fresh*, zssl cannot
+tell that it happened, and `return true` is simultaneously the easiest
+implementation and the insecure one. A seam whose careless answer is the
+unsafe one does not belong in a library whose posture is refusing what
+the RFC says to refuse.
+
+Two consequences worth stating so the decision is not quietly reopened.
+The *receive* side of **rejecting** 0-RTT is in, and always was
+separable: a server that declines early data still has to skip past what
+the client already sent, because §5 gives it no way to say no in time
+(§6 slice 5, docs/BOGO.md finding 14). And accepting would have cost the
+event surface as well — Appendix E.5 requires the application to
+distinguish early data from ordinary data, so `Event.application_data`
+would have to carry a marker every embedder then has to thread through.
+
+Also out: X.509 chain *validation* — which stays out of
 zssl but is no longer out of reach: `ClientHandshake.Config.chain_verifier`
 shows the embedder the peer's chain, leaf first, and its refusal aborts
 the handshake. The split is possession here, identity there. It became

@@ -123,10 +123,11 @@ pub const ClientHello = struct {
     signature_algorithms_wire: ?[]const u8 = null,
     alpn_wire: ?[]const u8 = null,
     psk_modes_wire: ?[]const u8 = null,
-    /// §4.2.10: the client offered 0-RTT. zssl never accepts it (§1's
-    /// deferred replay analysis), so this exists only to say that the
-    /// records arriving behind this hello are early data to be skipped
-    /// rather than ciphertext we failed to open.
+    /// §4.2.10: the client offered 0-RTT. zssl never accepts it — §8's
+    /// anti-replay is the embedder's and DESIGN.md §1 puts acceptance
+    /// out permanently — so this exists only to say that the records
+    /// arriving behind this hello are early data to be skipped rather
+    /// than ciphertext we failed to open.
     early_data: bool = false,
     pre_shared_key_wire: ?[]const u8 = null,
 

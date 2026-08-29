@@ -338,7 +338,7 @@ fn applyFlag(connection: *Connection, name: []const u8, value: ?[]const u8) Pars
         // sends one when the offer is unusable, so "no HRR" holds by
         // construction; there is nothing to arm.
     } else if (std.mem.eql(u8, name, "-expect-early-data-reason")) {
-        // 0-RTT is deferred, not merely unused (DESIGN.md §1), so the only
+        // Accepting 0-RTT is out permanently (DESIGN.md §1), so the only
         // reason we can honestly report is the one that says it was never
         // on. Any other expectation belongs to a feature we do not have.
         if (!std.mem.eql(u8, value.?, "disabled")) return unimplemented(name);

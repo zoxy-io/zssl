@@ -653,8 +653,9 @@ name.
     had no business covering.
 
     §4.2.10 lets a client send 0-RTT data immediately behind its
-    ClientHello. zssl never accepts it — §1 defers that on a replay
-    analysis — but *declining* is not a decision we get to make in time:
+    ClientHello. zssl never accepts it — DESIGN.md §1 puts acceptance
+    out permanently, on §8 grounds — but *declining* is not a decision
+    we get to make in time:
     the client learns of it only when our flight arrives, so the records
     are already on the wire. "The server ... MUST skip past" them, and
     we were opening them instead, answering a decryption failure for a
