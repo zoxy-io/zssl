@@ -12,15 +12,15 @@ wide margin on bulk data. Every microsecond of the handshake gap is in
 the primitives.
 
 The harness has found two things and both have been fixed. It opened at
-a 3.9× full-handshake gap; it now reads 1.38×, and resumption 1.13×,
-with `handshake_full` down from 495 µs to 175 µs. Neither fix touched
+a 3.9× full-handshake gap; it now reads 1.36×, and resumption 1.11×,
+with `handshake_full` down from 495 µs to 172 µs. Neither fix touched
 the protocol layer:
 
 | | `handshake_full` | vs rustls |
 |---|---|---|
 | as measured | 495.14 µs | 3.90× slower |
 | ECDSA verification through libcrypto | 208.38 µs | 1.64× slower |
-| one key-exchange multiplication instead of two | **175.26 µs** | **1.38× slower** |
+| one key-exchange multiplication instead of two | **171.86 µs** | **1.36× slower** |
 
 Both predictions were made from the primitive rows before the code was
 touched — 207 µs and ~35 µs saved — and both landed within 2%. The
@@ -110,14 +110,14 @@ aws-lc-rs 1.18.0; Zig 0.16.0, rustc 1.97.1. Best of fifteen rounds.
 
 ```
 Handshake
-  handshake_full               175.26 us       127.28 us     1.38x slower
-  handshake_resume             107.22 us        95.22 us     1.13x slower
+  handshake_full               171.86 us       126.76 us     1.36x slower
+  handshake_resume             105.12 us        94.86 us     1.11x slower
 
 Handshake, by flight
-  phase_client_hello            18.21 us        15.33 us     1.19x slower
-  phase_server_flight           68.09 us        47.86 us     1.42x slower
-  phase_client_finish           85.02 us        61.76 us     1.38x slower
-  phase_server_finish            2.96 us         1.93 us     1.53x slower
+  phase_client_hello            17.97 us        15.25 us     1.18x slower
+  phase_server_flight           66.92 us        47.83 us     1.40x slower
+  phase_client_finish           83.18 us        61.34 us     1.36x slower
+  phase_server_finish            2.92 us         1.88 us     1.55x slower
 
 Bulk data (16 KiB record, sealed and opened)
   transfer_aes128     3.43 us  4.78 GB/s   4.39 us  3.73 GB/s  1.28x faster
@@ -125,18 +125,28 @@ Bulk data (16 KiB record, sealed and opened)
   transfer_chacha20  10.56 us  1.55 GB/s  10.73 us  1.53 GB/s  1.02x faster
 
 Primitives
-  aead_seal_aes128     1.62 us 10.11 GB/s  1.68 us  9.77 GB/s  1.03x faster
-  aead_seal_aes256     1.88 us  8.70 GB/s  1.95 us  8.42 GB/s  1.03x faster
-  aead_seal_chacha20   5.07 us  3.23 GB/s  4.94 us  3.32 GB/s  1.03x slower
-  aead_key_init                 747.8 ns         71.4 ns    10.47x slower
-  ecdsa_p256_sign                16.49 us        14.74 us     1.12x slower
-  ecdsa_p256_verify              44.59 us        34.63 us     1.29x slower
-  x25519_keygen_agree            44.31 us        23.16 us     1.91x slower
-  x25519_public                  17.88 us              —
-  x25519_shared                  25.93 us              —
-  x25519_shared_rederive         43.51 us              —
-  p256_verify_stdcrypto         333.82 us              —
+  aead_seal_aes128     1.63 us 10.08 GB/s  1.67 us  9.80 GB/s  1.03x faster
+  aead_seal_aes256     1.89 us  8.69 GB/s  1.94 us  8.44 GB/s  1.03x faster
+  aead_seal_chacha20   4.97 us  3.29 GB/s  4.92 us  3.33 GB/s  1.01x slower
+  aead_key_init                 737.3 ns         69.4 ns    10.63x slower
+  ecdsa_p256_sign                16.47 us        14.67 us     1.12x slower
+  ecdsa_p256_verify              43.80 us        34.53 us     1.27x slower
+  x25519_keygen_agree            44.04 us        23.01 us     1.91x slower
+  x25519_public                  17.85 us         4.57 us     3.91x slower
+  x25519_shared                  25.96 us        16.22 us     1.60x slower
+  x25519_shared_rederive         43.27 us              —
+  p256_verify_stdcrypto         333.15 us              —
 ```
+
+`x25519_keygen_agree` and the `x25519_public`/`x25519_shared` pair answer
+different questions and do not sum to each other. The split is
+per-*operation*, and it is what the analysis below reasons about: an
+import plus a fixed-base multiplication, then a variable-base one.
+`x25519_keygen_agree` is per-*handshake-side*, and for rustls that
+includes generating the ephemeral — ~2.2 µs of CSPRNG that zssl does not
+pay, because DESIGN.md's no-randomness rule has the scalar arrive through
+`Config`. Handshake arithmetic below uses the per-side row for rustls,
+because generating is what its handshake actually does.
 
 Two rows measure code no path reaches any more, and both are kept
 deliberately. `p256_verify_stdcrypto` is what the `verifyEcdsa` move
@@ -151,11 +161,11 @@ same rustls build:
 
 | | as measured | after `verifyEcdsa` | after `KeyShare` |
 |---|---|---|---|
-| `handshake_full` | 495.14 µs | 208.38 µs | **175.26 µs** |
-| `handshake_resume` | 141.29 µs | 140.97 µs | **107.22 µs** |
-| `phase_server_flight` | 86.63 µs | 84.51 µs | **68.09 µs** |
-| `phase_client_finish` | 386.01 µs | 101.34 µs | **85.02 µs** |
-| ratio against rustls | 3.90× | 1.64× | **1.38×** |
+| `handshake_full` | 495.14 µs | 208.38 µs | **171.86 µs** |
+| `handshake_resume` | 141.29 µs | 140.97 µs | **105.12 µs** |
+| `phase_server_flight` | 86.63 µs | 84.51 µs | **66.92 µs** |
+| `phase_client_finish` | 386.01 µs | 101.34 µs | **83.18 µs** |
+| ratio against rustls | 3.90× | 1.64× | **1.36×** |
 
 Each column is its own run, so the last one carries this page's rustls
 figures and the first two do not; run-to-run spread on this machine is
@@ -177,12 +187,12 @@ phase calls from the phase itself leaves the library's own work:
 
 | | zssl | rustls |
 |---|---|---|
-| crypto in a full handshake | 148.7 µs | 95.7 µs |
-| everything else | **26.6 µs** | **31.6 µs** |
-| crypto's share | 85% | 75% |
+| crypto in a full handshake | 147.9 µs | 95.2 µs |
+| everything else | **24.0 µs** | **31.5 µs** |
+| crypto's share | 86% | 75% |
 
 zssl's state machine, parsing, key schedule and transcript hashing cost
-about 27 µs per handshake against rustls's 32 — and zssl's figure is the
+about 24 µs per handshake against rustls's 32 — and zssl's figure is the
 more pessimistic of the two, because it also carries the `EVP_PKEY`
 import `ecFromPublic` does per verification, which the standalone
 `ecdsa_p256_verify` row does not pay. The same ordering holds on the
@@ -192,41 +202,74 @@ which is what the extra buffer copies between `writer()`, `sendable_tls`,
 `write_tls`, `read_tls` and `reader()` cost. Nothing in this tree needs
 to get faster for zssl to win those rows; it already does.
 
-**The remaining 48 µs gap is almost all one thing, and it is no longer
-ours.** It decomposes to within about 11%, the residue being the four
+**The remaining 45 µs gap is almost all one thing, and it is no longer
+ours.** It decomposes to within about 10%, the residue being the four
 clock reads the phase split adds:
 
-1. **X25519 — 41 µs, 86% of what is left.** zssl does four scalar
-   multiplications per handshake (each peer builds a share and agrees
-   against the other's) for 88 µs; rustls does the same four for 46 µs.
-   What is left is OpenSSL being about twice aws-lc-rs's cost per
-   multiplication — partly because OpenSSL routes the fixed-base one
-   through the C `ge_scalarmult_base` while only the variable-base one
-   reaches `x25519-x86_64.s`, partly EVP object construction around each
-   call. Neither is something this tree can act on without either
-   reaching for OpenSSL's internal `ossl_x25519` (an `ossl_`-prefixed
-   symbol, not public API, and a pin bump away from renaming) or adding
-   the second backend DESIGN.md §2 rules out. **This row is done.**
+1. **X25519 — 42 µs, 92% of what is left, and none of it ours.** The
+   split rows say where: a fixed-base multiplication to build a share
+   costs 17.85 µs against aws-lc-rs's 4.57 (**3.91×**), and a
+   variable-base one to agree costs 25.96 against 16.22 (**1.60×**). A
+   handshake does two of each.
 
-   What *was* ours is now fixed, and the `x25519_shared_rederive` row is
-   what it cost. `EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, …)`
-   reaches `ossl_ecx_key_fromdata` → `ossl_ecx_public_from_private`
-   (`crypto/ec/ecx_backend.c:99`, and a callgrind trace confirms it), so
-   constructing a private-key object from a scalar alone **eagerly
-   derives the public key**. An agreement handed only a scalar therefore
-   paid for a fixed-base multiplication it discarded: 43.51 µs against
-   the 25.93 µs the same agreement costs when the public half comes with
-   it. The server paid it twice over — once inside the agreement, once
-   again in a separate `keySharePublic` for the share on the wire.
-   `backend.KeyShare` now bundles the two halves so `init` multiplies
-   once and `agree` is handed the answer.
+   This was checked for "are we holding it wrong?" before being written
+   off, and the answer is no:
 
-2. **ECDSA verification — 10 µs.** 44.59 µs against aws-lc-rs's 34.63.
+   - **It is not EVP bookkeeping.** Importing a 32-byte public value and
+     freeing it — a full `EVP_PKEY` round trip with no scalar
+     multiplication anywhere in it — costs **667 ns**, and the
+     `OSSL_PARAM_BLD` + `EVP_PKEY_CTX_new_from_name` route `agree` takes
+     costs 732 ns. Against 17–26 µs of work that is 3–5%.
+   - **Caching the `EVP_PKEY` across `init` and `agree` buys 1.25 µs**
+     (26.04 → 24.79), about 5% of one agreement and 1.4% of a handshake.
+     Not taken: it would turn `KeyShare` from plain data into a type that
+     owns a libcrypto handle and therefore cannot be copied, and that is
+     a bad trade against a state machine for 1.4%.
+   - **The build is not missing assembly.** `X25519_ASM` is defined,
+     `x25519-x86_64.s` is compiled in, and `OPENSSL_ia32cap` has the ADX
+     bit, so `x25519_scalar_mulx` is the path taken. The external check
+     agrees: `openssl speed ecdhx25519` on the system's stock OpenSSL
+     3.6.3 reports 45,318 op/s — **22.06 µs**, against our 24.79 for the
+     same operation on the vendored 3.5.7.
+   - **The routing is already the right way round.** OpenSSL sends the
+     variable-base multiplication to the ADX assembly and the fixed-base
+     one to `ge_scalarmult_base`; going the other way and computing a
+     public value as X25519(scalar, 9) reaches the assembly but costs
+     23 µs against the 17 µs the C tables take. Slower, not faster.
+
+   What is left is upstream implementation quality, in two different
+   places. `ossl_x25519` uses OpenSSL's own fe64/ADX assembly, where
+   AWS-LC uses s2n-bignum's — a straight 1.6×. And
+   `ossl_x25519_public_from_private` has no assembly at all: it runs
+   `ge_scalarmult_base`, the ref10 Ed25519 code with base-2^25.5 `int32`
+   limbs, which is the portable representation OpenSSL never wired to the
+   2^51/2^64 field arithmetic it ships for the other direction. That one
+   is the 3.91×, and it is why the fixed-base row is the *larger* half of
+   the remaining gap even though the operation is cheaper.
+
+   Nothing in this tree can close either without reaching for OpenSSL's
+   internal `ossl_x25519` (an `ossl_`-prefixed symbol, not public API and
+   one pin bump from renaming) or a second backend, which DESIGN.md §2
+   rules out. **This row is done.**
+
+   What *was* ours is fixed, and `x25519_shared_rederive` is what it
+   cost. `EVP_PKEY_new_raw_private_key` reaches `ossl_ecx_key_fromdata` →
+   `ossl_ecx_public_from_private` (`crypto/ec/ecx_backend.c:99`, and a
+   callgrind trace confirms it), so building a key object from a scalar
+   alone **eagerly derives the public key**. An agreement handed only a
+   scalar therefore paid a fixed-base multiplication it discarded: 43.27
+   µs against the 25.96 the same agreement costs when the public half
+   comes with it. The server paid it twice over — once inside the
+   agreement, once again in a separate `keySharePublic` for the share on
+   the wire. `backend.KeyShare` bundles the two halves so `init`
+   multiplies once and `agree` is handed the answer.
+
+2. **ECDSA verification — 9 µs.** 43.80 µs against aws-lc-rs's 34.53.
    Both are assembly (`ecp_nistz256` against aws-lc's own); a 28%
    difference between two hand-written P-256 implementations is not
    something this tree can act on.
 
-3. **`aead_key_init` — 5.4 µs.** 747.8 ns against 71.4 ns, and a
+3. **`aead_key_init` — 5.3 µs.** 737.3 ns against 69.4 ns, and a
    handshake stands up eight traffic keys across both peers. Small, and
    listed only so it is not mistaken for the cause: an early guess that
    OpenSSL 3's implicit provider fetch in `EVP_EncryptInit_ex` was driving
