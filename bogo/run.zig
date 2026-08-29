@@ -39,7 +39,7 @@ const boringssl_commit = "193233b86d6cbbc20ce30c06a8775311c11be0c4";
 /// was a defect.
 /// Raise it whenever a fix moves the number up; a drop is either a
 /// regression or a suppression, and both deserve to stop the build.
-const passing_floor: u32 = 306;
+const passing_floor: u32 = 310;
 
 const work_dir = "zig-out/bogo";
 const checkout_dir = work_dir ++ "/boringssl";

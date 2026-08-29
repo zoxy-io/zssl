@@ -10,8 +10,8 @@ itself.
 It runs: `zig build tlsfuzzer`.
 
 ```
-tlsfuzzer: 21 scripts to run, 36 disabled (0 of those untriaged)
-tlsfuzzer: 21 scripts passed, 0 failed, 36 disabled, floor 21
+tlsfuzzer: 22 scripts to run, 35 disabled (0 of those untriaged)
+tlsfuzzer: 22 scripts passed, 0 failed, 35 disabled, floor 22
 tlsfuzzer: PASS
 ```
 
@@ -76,7 +76,7 @@ is reporting on the fixture.
 
 ## The numbers, and the debt
 
-**21 of 57** `test-tls13-*` scripts run, 1418 conversations between them.
+**22 of 57** `test-tls13-*` scripts run, 1428 conversations between them.
 `test-tls13-lengths` is 1002 of those on its own: every plaintext length
 from 1 to 2^14, each echoed back and checked for size.
 `test-tls13-connection-abort` is another 150, aborting the connection at

@@ -53,6 +53,20 @@ session_echo: [32]u8,
 /// Whether this session came up on an accepted PSK — the fact behind
 /// zoxy's `tls_resumed` counter.
 resumed: bool,
+/// §4.2.10's rejected-early-data window: the hello offered 0-RTT, we
+/// declined it by saying nothing, and the client is sending it anyway.
+/// Records that arrive while this stands are skipped rather than opened
+/// — we hold no key that could open them, so reporting a decryption
+/// failure would name a fault the peer did not commit.
+///
+/// It closes at a second ClientHello, because §4.1.2 removes the
+/// extension there and §4.2.10 forbids the data: past that point an
+/// application_data record is ciphertext we are meant to be able to
+/// open, and failing is the right answer.
+early_data_offered: bool,
+/// What the records skipped under that window have cost, in bytes of
+/// the budget below — their payloads, and never less than one each.
+early_data_skipped: u32,
 /// Whether the ClientHello that earned a HelloRetryRequest carried a
 /// `pre_shared_key`. §4.1.2 lets the second hello update that extension
 /// and not drop it, and CH1's bytes are gone by the time CH2 arrives —
@@ -260,6 +274,12 @@ pub const Error = backend.SignError || protect.Error || handshake.Assembler.Erro
     PeerAlert,
     /// A KeyUpdate whose body breaks §4.6.3's one-byte grammar.
     IllegalKeyUpdate,
+    /// More rejected early data than `early_data_skipped_max`. Not the
+    /// peer breaking a rule — the records are legal and we asked for
+    /// none of them — but discarding is work, and unbounded work a peer
+    /// buys for free is the shape flood.zig's three ceilings exist to
+    /// refuse.
+    TooMuchSkippedEarlyData,
 } || session_keys.Error || flood.Error;
 
 /// `out` for `handleRecord` must hold a whole flight or a whole decrypted
@@ -291,6 +311,8 @@ pub fn init(config: *const Config) ServerHandshake {
         .session_echo = undefined,
         .resumed = false,
         .ch1_offered_psk = false,
+        .early_data_offered = false,
+        .early_data_skipped = 0,
     };
 }
 
@@ -303,6 +325,27 @@ pub fn deinit(self: *ServerHandshake) void {
 }
 
 const ccs_seen_max: u8 = 2;
+
+/// How much rejected early data we will discard before giving up.
+///
+/// The number is BoringSSL's `kMaxEarlyDataSkipped`
+/// (`ssl/tls_record.cc`) and so is the reason: "without this limit an
+/// attacker could send records at a faster rate than we can process and
+/// cause trial decryption to loop forever". We never accept early data,
+/// so this is not a `max_early_data_size` — it is a work ceiling, and
+/// the only thing it has to do is bound the discarding.
+///
+/// What is counted differs from theirs by five bytes a record, and
+/// deliberately. BoringSSL adds what it consumed from the stream,
+/// header included; this adds the record's payload, which is what
+/// §4.2.10 measures early data in ("in units of bytes of application
+/// data") — with a floor of one byte a record, so that empty ones are
+/// paid for too. Both refuse BoGo's `SkipEarlyData-TooMuchData-TLS13`,
+/// which sends 2^14+1 in one record. Only this one admits a client that sends
+/// exactly 2^14 — the amount a server advertising the RFC's own example
+/// limit would have invited — and tlsfuzzer's `test-tls13-0rtt-garbage`
+/// is written around precisely that client.
+const early_data_skipped_max: u32 = 16384;
 
 /// Feed one whole wire record; act on what comes back. On any error the
 /// machine is `failed` and must not be fed again — the embedder closes.
@@ -383,8 +426,59 @@ pub fn handleRecord(self: *ServerHandshake, wire_record: []const u8, out: []u8) 
             return self.handlePlaintextAlert(wire_record[record.header_bytes..]);
         },
         .handshake => return self.handlePlaintextHandshake(wire_record, out),
-        .application_data => return self.handleProtectedRecord(wire_record, out),
+        .application_data => {
+            // Before our flight there is no receive key at all, so
+            // every protected record in that window is early data and
+            // nothing else could be. After it, the question cannot be
+            // answered by content type — see `handleProtectedRecord`.
+            if (self.early_data_offered and self.state == .awaiting_retry_client_hello) {
+                return self.skipEarlyData(wire_record);
+            }
+            return self.handleProtectedRecord(wire_record, out);
+        },
     }
+}
+
+/// Whether a record that would not open is early data rather than a
+/// fault. §4.2.10 again, on the far side of our flight: "the server ...
+/// must instead use trial decryption ... to find the first non-0-RTT
+/// message", and this is the "trial" half — the answer is only early
+/// data if opening it failed *and* the client told us some was coming.
+fn openFailureIsEarlyData(self: *const ServerHandshake, err: Error) bool {
+    assert(self.state != .failed);
+    if (!self.early_data_offered) return false;
+    if (self.state != .awaiting_finished) return false;
+    // Only the two ways a record can fail to be *this* key's ciphertext.
+    // A sequence number spent, or a header we refused, is our fault or a
+    // framing fault, and neither becomes early data by being adjacent to
+    // some.
+    return err == error.AuthenticationFailed or err == error.BadInnerPlaintext;
+}
+
+/// One rejected early-data record, counted and dropped.
+fn skipEarlyData(self: *ServerHandshake, wire_record: []const u8) Error!?Event {
+    assert(self.early_data_offered);
+    assert(wire_record.len >= record.header_bytes);
+    // §5.1 first, and it is not redundant with the skip: early data
+    // wedged into a handshake message being reassembled is the
+    // interleaving §5.1 forbids whatever the record turns out to hold,
+    // and BoGo checks it by name (`SkipEarlyData-Interleaved-TLS13`).
+    // A record we discard is still a record that arrived.
+    try self.refuseInterleavedRecord();
+    // A byte of budget minimum, because a record costs something to
+    // look at whether or not it carries anything — and §5.1 lets an
+    // application_data record be empty, so a peer paying only for
+    // headers would otherwise hold this window open forever at five
+    // bytes a turn. That is the same reason flood.zig counts empty
+    // records, and the ceiling below is meaningless without it.
+    //
+    // Saturating, so the ceiling is what refuses rather than a wrap.
+    const payload_bytes: u32 = @intCast(wire_record.len - record.header_bytes);
+    self.early_data_skipped +|= @max(payload_bytes, 1);
+    if (self.early_data_skipped > early_data_skipped_max) {
+        return error.TooMuchSkippedEarlyData;
+    }
+    return null;
 }
 
 /// §5.1: "Handshake messages MUST NOT be interleaved with other record
@@ -465,6 +559,16 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
         if (self.ch1_offered_psk and hello.pre_shared_key_wire == null) {
             return error.MissingExtension;
         }
+        // §4.1.2 again, the other direction: the exception list requires
+        // "removing the `early_data` extension ... if one was present.
+        // Early data is not permitted after a HelloRetryRequest." One
+        // that kept it is a second hello we may not answer.
+        if (hello.early_data) return error.IllegalRetry;
+        // And the window closes whether or not it was ever open: from
+        // here an application_data record is ciphertext we are meant to
+        // open, so failing to is the honest answer rather than a discard
+        // (BoGo's `SkipEarlyData-SecondClientHelloEarlyData-TLS13`).
+        self.early_data_offered = false;
         // §4.1.4: the retry must keep the suite and answer the demand.
         //
         // Ahead of the PSK, and that ordering is load-bearing now that a
@@ -492,6 +596,11 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
             return error.HandshakeFailure;
     }
     self.captureSessionEcho(&hello);
+    // §4.2.10 offers 0-RTT by the extension's presence alone, and this
+    // is the only thing zssl does with it: remember that records are
+    // coming so they can be skipped rather than mistaken for ciphertext.
+    // Accepting is the part §1 defers, and nothing here moves that.
+    if (self.state == .awaiting_client_hello) self.early_data_offered = hello.early_data;
 
     if (self.state == .awaiting_retry_client_hello) {
         return self.acceptClientHello(&hello, message, suite, selected_psk, out);
@@ -905,11 +1014,31 @@ fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: [
     // peer deserves. TLS-Anvil found this.
     switch (self.ladder.?) {
         inline else => |*arm| {
-            const opened = switch (self.state) {
-                .awaiting_finished => try arm.recv.?.open(wire_record, out),
-                .connected, .close_sent => try arm.session.?.recv.open(wire_record, out),
+            const opened = (switch (self.state) {
+                .awaiting_finished => arm.recv.?.open(wire_record, out),
+                .connected, .close_sent => arm.session.?.recv.open(wire_record, out),
                 else => unreachable, // The guard above admits only these three.
+            }) catch |err| {
+                // §4.2.10's trial decryption. A record that will not open
+                // under the handshake key, on a connection whose hello
+                // offered 0-RTT, is the early data we declined — and it
+                // has to be told from the client's Finished *here*,
+                // because that travels as an application_data record
+                // too. Skipping by content type discards the Finished
+                // and wedges the handshake.
+                if (self.openFailureIsEarlyData(err)) {
+                    return self.skipEarlyData(wire_record);
+                }
+                return err;
             };
+            // §4.2.10's search ends at the first record that opens: that
+            // is "the first non-0-RTT message", and everything after it
+            // is ours to read. Without this the window stays open and a
+            // peer can put early data *behind* the Finished — BoGo's
+            // `SkipEarlyData-Interleaved-TLS13` splits one across two
+            // records and wedges an early-data record into the gap,
+            // which must earn a decryption failure and not a discard.
+            self.early_data_offered = false;
             const plaintext = out[0..opened.plaintext_bytes];
             // §5.1/§4.6.3 flood ceilings, counted on every opened
             // record so that padding-only and empty ones — the cheapest

@@ -64,6 +64,16 @@ pub const Options = struct {
     psk_mode_byte: u8 = 0x01,
     /// Flip a binder bit — the offer must then be fatally refused.
     corrupt_binder: bool = false,
+    /// §4.2.10: offer 0-RTT. zssl never accepts it, so this is here to
+    /// open the server's skip window and nothing else — no early data
+    /// is actually sent, because the records a real client would send
+    /// are ones the server cannot open anyway, and a test writes them
+    /// directly.
+    offer_early_data: bool = false,
+    /// Bytes of body on that extension. §4.2.10 gives it `Empty` in a
+    /// ClientHello, so anything above zero is a message that does not
+    /// decode.
+    early_data_body_bytes: u8 = 0,
 };
 
 /// A captured NewSessionTicket plus the PSK the client derived for it
@@ -301,6 +311,15 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             builder.putByte(2);
             builder.putU16(0x0304);
             builder.patchU16(versions);
+            if (self.options.offer_early_data) {
+                builder.putU16(42); // early_data
+                const early = builder.markU16();
+                var written: u8 = 0;
+                while (written < self.options.early_data_body_bytes) : (written += 1) {
+                    builder.putByte(0);
+                }
+                builder.patchU16(early);
+            }
             // Stop here: supported_groups is written, key_share is not,
             // which is the §9.2 shape. The caller closes the extension
             // block.

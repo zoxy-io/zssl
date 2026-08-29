@@ -30,11 +30,11 @@ const tlsfuzzer_commit = "5eebc4464e5197a7f7392fb9acda99cfc32441f7";
 const tlslite_requirement = "tlslite-ng==0.9.0b2";
 const ecdsa_requirement = "ecdsa>=0.15";
 
-/// What the pin above scores on this tree: 21 scripts, 1418
+/// What the pin above scores on this tree: 22 scripts, 1428
 /// conversations between them. Raise it whenever a fix moves the number
 /// up; a drop is either a regression or a suppression, and both deserve
 /// to stop the build.
-const passing_floor: u32 = 21;
+const passing_floor: u32 = 22;
 
 const work_dir = "zig-out/tlsfuzzer";
 const checkout_dir = work_dir ++ "/tlsfuzzer";

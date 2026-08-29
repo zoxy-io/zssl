@@ -896,6 +896,9 @@ fn alertFor(err: anyerror) ?alert.Description {
         error.TooManyEmptyRecords,
         error.TooManyKeyUpdates,
         error.TooManyWarningAlerts,
+        // §4.2.10's ceiling on rejected early data, which is the same
+        // shape of refusal and gets the same alert from BoringSSL.
+        error.TooMuchSkippedEarlyData,
         => .unexpected_message,
         // Not a TLS record at all — the same answer BoringSSL gives an
         // HTTP request that arrived on the TLS port.

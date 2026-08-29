@@ -4,6 +4,7 @@
 //! HelloRetryRequest, ALPN, kTLS export, and the failure paths.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const testing = std.testing;
 
 const Credentials = @import("Credentials.zig");
@@ -454,5 +455,172 @@ test "§4.2.9 and §4.6.1: psk_key_exchange_modes gates both the offer and the t
         // The refusal is about the ticket, not the connection: a peer
         // that cannot resume is still a peer we are talking to.
         try testing.expectEqual(ServerHandshake.State.connected, harness.server.state);
+    }
+}
+
+/// A rejected-early-data record as a peer actually sends one: an
+/// application_data header over bytes we hold no key for. BoGo's
+/// `sendFakeEarlyData` writes exactly this — a header and zeros — which
+/// is fair, because to the server every byte of it is undecryptable
+/// either way.
+fn earlyDataRecord(out: []u8, body_bytes: u16) []const u8 {
+    assert(out.len >= record.header_bytes + body_bytes);
+    record.writeHeader(
+        .{ .content_type = .application_data, .length = body_bytes },
+        out[0..record.header_bytes],
+    );
+    @memset(out[record.header_bytes..][0..body_bytes], 0);
+    return out[0 .. record.header_bytes + body_bytes];
+}
+
+test "§4.2.10: early data we declined is skipped, and the handshake completes" {
+    // The client offers 0-RTT, we say nothing — which is how a server
+    // declines — and it sends the data anyway, because our flight has
+    // not reached it yet. Those records cannot be opened with any key we
+    // hold, so refusing them would report a fault the peer did not
+    // commit. §4.2.10: "the server ... MUST skip past".
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var harness: Harness = undefined;
+    try harness.init(null);
+    defer harness.deinit();
+    var client = Client.init(&client_x25519_private, &.{ .offer_early_data = true });
+    defer client.deinit();
+
+    const flight = (try harness.server.handleRecord(client.helloRecord(&client_out), &server_out)).?;
+    try testing.expectEqual(std.meta.activeTag(flight), .send);
+    try testing.expect(harness.server.early_data_offered);
+
+    // Two of them, to prove the window is a window and not one record's
+    // grace. Neither produces an event.
+    var early_storage: [record.wire_record_bytes_max]u8 = undefined;
+    for (0..2) |_| {
+        const early = earlyDataRecord(&early_storage, 4);
+        try testing.expect(try harness.server.handleRecord(early, &server_out) == null);
+    }
+    try testing.expectEqual(@as(u32, 2 * 4), harness.server.early_data_skipped);
+
+    // And the handshake the early data was riding in front of finishes.
+    var reply_storage: [2 * record.wire_record_bytes_max]u8 = undefined;
+    const reply = try client.absorb(flight.send, &client_out);
+    try testing.expectEqual(std.meta.activeTag(reply), .connected);
+    @memcpy(reply_storage[0..reply.connected.len], reply.connected);
+    const done = try feedRecords(&harness.server, reply_storage[0..reply.connected.len], &server_out);
+    try testing.expectEqual(std.meta.activeTag(done), .connected);
+    // The window shut on the first record that opened — the Finished —
+    // so early data arriving behind it is ciphertext we failed to read.
+    try testing.expect(!harness.server.early_data_offered);
+}
+
+test "§4.2.10: more skipped early data than the ceiling ends the connection" {
+    // Discarding is work, and a peer that can buy unbounded work for the
+    // price of a header is the shape flood.zig exists to refuse. The
+    // ceiling counts payload bytes — what §4.2.10 measures early data in
+    // — with a floor of one a record, so that a peer sending nothing but
+    // headers still spends the budget.
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var harness: Harness = undefined;
+    try harness.init(null);
+    defer harness.deinit();
+    var client = Client.init(&client_x25519_private, &.{ .offer_early_data = true });
+    defer client.deinit();
+    _ = (try harness.server.handleRecord(client.helloRecord(&client_out), &server_out)).?;
+
+    // The boundary from both sides, and the count accumulating across
+    // records rather than resetting per record. Exactly the ceiling is
+    // allowed — a client that sent 2^14 was sending what a server
+    // advertising §4.2.10's own example limit would have invited — and
+    // the byte after it is not.
+    var early_storage: [record.wire_record_bytes_max]u8 = undefined;
+    for (0..2) |_| {
+        const half = earlyDataRecord(&early_storage, 8192);
+        try testing.expect(try harness.server.handleRecord(half, &server_out) == null);
+    }
+    try testing.expectEqual(@as(u32, 16384), harness.server.early_data_skipped);
+    try testing.expectError(
+        error.TooMuchSkippedEarlyData,
+        harness.server.handleRecord(earlyDataRecord(&early_storage, 1), &server_out),
+    );
+}
+
+test "§4.2.10: an empty early-data record spends the budget too" {
+    // §5.1 lets an application_data record carry nothing, and a ceiling
+    // that counts only payload counts those as free — so a peer that
+    // sends nothing but headers holds the window open forever at five
+    // bytes a turn, which is the very thing the ceiling exists to
+    // refuse. Each record costs a byte of budget at least.
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var harness: Harness = undefined;
+    try harness.init(null);
+    defer harness.deinit();
+    var client = Client.init(&client_x25519_private, &.{ .offer_early_data = true });
+    defer client.deinit();
+    _ = (try harness.server.handleRecord(client.helloRecord(&client_out), &server_out)).?;
+
+    var early_storage: [record.header_bytes]u8 = undefined;
+    const empty = earlyDataRecord(&early_storage, 0);
+    try testing.expectEqual(@as(usize, record.header_bytes), empty.len);
+    try testing.expect(try harness.server.handleRecord(empty, &server_out) == null);
+    try testing.expectEqual(@as(u32, 1), harness.server.early_data_skipped);
+
+    // And the run of them ends, rather than going on for as long as the
+    // peer cares to keep sending. Bounded by the ceiling itself, which
+    // is what the loop is proving.
+    var sent: u32 = 1;
+    while (sent < 16384) : (sent += 1) {
+        try testing.expect(try harness.server.handleRecord(empty, &server_out) == null);
+    }
+    try testing.expectEqual(@as(u32, 16384), harness.server.early_data_skipped);
+    try testing.expectError(
+        error.TooMuchSkippedEarlyData,
+        harness.server.handleRecord(empty, &server_out),
+    );
+}
+
+test "§4.2.10: early_data carries no body in a ClientHello, and none on a retry" {
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+
+    // §4.2.10 gives the extension `Empty` here. A body is a message that
+    // did not decode, whatever it holds — and we read the grammar even
+    // though we decline everything it offers.
+    {
+        var harness: Harness = undefined;
+        try harness.init(null);
+        defer harness.deinit();
+        var client = Client.init(&client_x25519_private, &.{
+            .offer_early_data = true,
+            .early_data_body_bytes = 1,
+        });
+        defer client.deinit();
+        try testing.expectError(
+            error.MalformedExtension,
+            harness.server.handleRecord(client.helloRecord(&client_out), &server_out),
+        );
+    }
+
+    // §4.1.2's exception list requires "removing the early_data
+    // extension ... if one was present. Early data is not permitted
+    // after a HelloRetryRequest." A second hello that kept it is one we
+    // may not answer.
+    {
+        var harness: Harness = undefined;
+        try harness.init(null);
+        defer harness.deinit();
+        var client = Client.init(&client_x25519_private, &.{
+            .offer_x25519_share = false,
+            .offer_early_data = true,
+        });
+        defer client.deinit();
+        const retry = (try harness.server.handleRecord(client.helloRecord(&client_out), &server_out)).?;
+        try testing.expectEqual(std.meta.activeTag(retry), .send);
+        const second = try client.absorb(retry.send, &client_out);
+        try testing.expectEqual(std.meta.activeTag(second), .send);
+        try testing.expectError(
+            error.IllegalRetry,
+            harness.server.handleRecord(second.send, &server_out),
+        );
     }
 }

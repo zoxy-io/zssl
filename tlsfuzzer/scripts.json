@@ -1,6 +1,14 @@
 {
   "Run": [
     {
+      "name": "test-tls13-0rtt-garbage.py",
+      "leaf": "rsa",
+      "arguments": [
+        "-e",
+        "handshake with invalid 0-RTT and unknown version (downgrade to TLS 1.2)"
+      ]
+    },
+    {
       "name": "test-tls13-ccs.py",
       "leaf": "rsa"
     },
@@ -98,7 +106,6 @@
     }
   ],
   "Disabled": {
-    "test-tls13-0rtt-garbage.py": "0-RTT: deferred pending a replay analysis (DESIGN.md \u00a71).",
     "test-tls13-certificate-compression.py": "Compressed certificates: not implemented.",
     "test-tls13-certificate-request.py": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",
     "test-tls13-certificate-verify.py": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",

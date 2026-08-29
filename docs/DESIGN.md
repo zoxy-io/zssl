@@ -60,8 +60,12 @@ proxy needs instead of what a general TLS library carries.
 library): TLS 1.2, renegotiation, compression, RSA key exchange, DSA,
 SSLv3-era anything, post-handshake client auth.
 
-**Out, deliberately deferred**: 0-RTT (a replay-analysis decision, not a
-protocol convenience), X.509 chain *validation* — which stays out of
+**Out, deliberately deferred**: *accepting* 0-RTT (a replay-analysis
+decision, not a protocol convenience) — the receive side of *rejecting*
+it is in, because that never needed the decision: a server that declines
+early data still has to skip past what the client already sent, and §5
+gives it no way to say so in time. See §6 slice 5 and docs/BOGO.md
+finding 14. Also out: X.509 chain *validation* — which stays out of
 zssl but is no longer out of reach: `ClientHandshake.Config.chain_verifier`
 shows the embedder the peer's chain, leaf first, and its refusal aborts
 the handshake. The split is possession here, identity there. It became

@@ -62,6 +62,7 @@ const extension_supported_groups: u16 = 10;
 const extension_signature_algorithms: u16 = 13;
 const extension_alpn: u16 = 16;
 const extension_pre_shared_key: u16 = 41;
+const extension_early_data: u16 = 42;
 const extension_supported_versions: u16 = 43;
 const extension_psk_key_exchange_modes: u16 = 45;
 const extension_key_share: u16 = 51;
@@ -122,6 +123,11 @@ pub const ClientHello = struct {
     signature_algorithms_wire: ?[]const u8 = null,
     alpn_wire: ?[]const u8 = null,
     psk_modes_wire: ?[]const u8 = null,
+    /// §4.2.10: the client offered 0-RTT. zssl never accepts it (§1's
+    /// deferred replay analysis), so this exists only to say that the
+    /// records arriving behind this hello are early data to be skipped
+    /// rather than ciphertext we failed to open.
+    early_data: bool = false,
     pre_shared_key_wire: ?[]const u8 = null,
 
     /// Walk the offered suites for one of ours.
@@ -353,6 +359,15 @@ fn applyExtension(extension_type: u16, data: []const u8, hello: *ClientHello) Er
             // sends the length one short of its contents.
             if (data[0] != data.len - 1) return error.MalformedExtension;
             hello.psk_modes_wire = data;
+        },
+        extension_early_data => {
+            // §4.2.10 gives it `Empty` in a ClientHello: the offer is
+            // the extension's presence and there is nothing inside to
+            // read. A body here is a message that did not decode, and
+            // reading the grammar is not optional just because we
+            // decline everything the extension asks for.
+            if (data.len != 0) return error.MalformedExtension;
+            hello.early_data = true;
         },
         extension_pre_shared_key => {
             if (data.len < 12) return error.MalformedExtension;

@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 306 passed, 0 failed, 6918 declined by the shim (89), floor 306
+bogo: 310 passed, 0 failed, 6918 declined by the shim (89), floor 310
 bogo: PASS
 ```
 
@@ -41,7 +41,7 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**306 passed.** Cases the runner ran end to end and we satisfied —
+**310 passed.** Cases the runner ran end to end and we satisfied —
 including the alert we sent, which BoGo checks by name. It was 278 until
 the client could answer a HelloRetryRequest: a single-group client that
 refused every retry structurally kept 26 patterns declined, and
@@ -647,6 +647,67 @@ name.
     message carrying it, so three carefully distinguished faults met a
     hello nobody read. They now reach the same checks their first-hello
     twins do.
+
+14. **FIXED — early data we declined was mistaken for ciphertext.** Four
+    cases, and a blanket ledger reason that was covering three more it
+    had no business covering.
+
+    §4.2.10 lets a client send 0-RTT data immediately behind its
+    ClientHello. zssl never accepts it — §1 defers that on a replay
+    analysis — but *declining* is not a decision we get to make in time:
+    the client learns of it only when our flight arrives, so the records
+    are already on the wire. "The server ... MUST skip past" them, and
+    we were opening them instead, answering a decryption failure for a
+    fault the peer did not commit.
+
+    Skipping by content type is the obvious fix and it is wrong, which
+    cost a round of debugging: an encrypted handshake record is
+    `application_data` on the wire too, so a server that discards by
+    type discards the client's Finished and wedges. §4.2.10 says how
+    instead — "trial decryption ... to find the first non-0-RTT message"
+    — and that is two rules, not one:
+
+    - before our flight there is no receive key at all, so every
+      protected record in that window is early data and nothing else
+      could be. That is the HelloRetryRequest gap, where the client is
+      sending data at a server that has not keyed yet;
+    - after it, a record that will not open is early data and a record
+      that opens ends the search. The window shuts on the first success,
+      which is what makes `SkipEarlyData-Interleaved-TLS13` — early data
+      wedged into the gap between two fragments of the Finished — a
+      decryption failure rather than a discard.
+
+    The ceiling is BoringSSL's `kMaxEarlyDataSkipped` and so is the
+    reason for having one; what it counts is not. They add the bytes
+    consumed from the stream, header included, and we add the record's
+    payload, which is what §4.2.10 measures early data in. Both refuse
+    BoGo's 2^14+1; only ours admits the client that sends exactly 2^14,
+    and tlsfuzzer's `test-tls13-0rtt-garbage` is written around that
+    client. Five bytes a record decided a whole script.
+
+    That script is now the 22nd, at eight of its nine conversations —
+    the ninth wants a downgrade to TLS 1.2 and is excluded by name.
+
+    Counting payload alone left a hole the review found, and it is worth
+    recording because the fix is the whole reason the ceiling exists.
+    §5.1 lets an application_data record carry nothing, so a peer paying
+    only for headers spent none of the budget and could hold the window
+    open indefinitely at five bytes a turn — the exact attack the
+    ceiling is quoted as preventing, reintroduced by the accounting
+    chosen to satisfy a test. Every skipped record now costs a byte at
+    minimum, which is why flood.zig counts empty records too.
+
+    What the blanket reason was hiding is the part worth keeping. Three
+    cases were declined as "0-RTT: deferred pending a replay analysis"
+    and not one of them is blocked on that decision:
+    `SkipEarlyData-SecondClientHelloEarlyData-TLS13` is a §4.1.2
+    argument we now win one message earlier than BoringSSL does and is
+    marked KEEP; `TLS13-DuplicateTicketEarlyDataSupport` is a duplicate
+    extension we already refuse, differing only in the alert; and
+    `SkipEarlyData-HRR-FatalAlert-TLS13` is about how the shim ends a
+    connection after a peer's alert. A reason that covers a family
+    stops being read case by case, which is exactly when it starts
+    covering things it does not describe.
 
 None of these are exploitable as far as the runner can show; they are
 laxity, and laxity is what BoGo exists to find.

@@ -208,6 +208,9 @@
     ],
     ":SECOND_SERVERHELLO_VERSION_MISMATCH:": [
       "zssl:BadServerHello"
+    ],
+    ":TOO_MUCH_SKIPPED_EARLY_DATA:": [
+      "zssl:TooMuchSkippedEarlyData"
     ]
   },
   "DisabledTests": {
@@ -708,12 +711,8 @@
     "Shutdown-Shim-TLS-Sync-SplitHandshakeRecords": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "SkipChangeCipherSpec-Client": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "SkipChangeCipherSpec-Server": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
-    "SkipEarlyData-HRR-FatalAlert-TLS13": "0-RTT: deferred pending a replay analysis (DESIGN.md \u00a71).",
-    "SkipEarlyData-HRR-TLS13": "0-RTT: deferred pending a replay analysis (DESIGN.md \u00a71).",
-    "SkipEarlyData-HRR-TooMuchData-TLS13": "0-RTT: deferred pending a replay analysis (DESIGN.md \u00a71).",
-    "SkipEarlyData-SecondClientHelloEarlyData-TLS13": "0-RTT: deferred pending a replay analysis (DESIGN.md \u00a71).",
-    "SkipEarlyData-TLS13": "0-RTT: deferred pending a replay analysis (DESIGN.md \u00a71).",
-    "SkipEarlyData-TooMuchData-TLS13": "0-RTT: deferred pending a replay analysis (DESIGN.md \u00a71).",
+    "SkipEarlyData-HRR-FatalAlert-TLS13": "OPEN GAP: a fatal alert arriving inside the early-data window. We report `PeerAlert` \u2014 the alert is read and acted on \u2014 but the runner then times out reading from us, and `:SSLV3_ALERT_HANDSHAKE_FAILURE:` has no ErrorMap entry, so both halves of the answer are wrong. Not a 0-RTT gap: the skip window works (the other six SkipEarlyData cases pass), and what is left is how the shim ends a connection the peer already gave up on. docs/BOGO.md finding 14.",
+    "SkipEarlyData-SecondClientHelloEarlyData-TLS13": "KEEP: the second ClientHello keeps its `early_data` extension, which \u00a74.1.2's exception list forbids \u2014 \"removing the early_data extension ... if one was present. Early data is not permitted after a HelloRetryRequest.\" We refuse that hello with illegal_parameter; BoringSSL accepts it and lets the early-data record behind it fail to decrypt, so the case wants bad_record_mac. Both end the connection and ours ends it one message earlier, on the rule that was actually broken \u2014 the same \u00a74.1.2 list we enforce for `pre_shared_key`, where BoGo demanded it (`Resume-Server-OmitAllPSKsOnSecondClientHello`). docs/BOGO.md finding 14.",
     "SkipNewSessionTicket": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "SkipServerKeyExchange": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "StrayHelloRequest": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
@@ -799,7 +798,7 @@
     "TLS12SessionID-TLS13": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TLS13-Client-ClientAuth-ECDSA": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",
     "TLS13-Client-ClientAuth-RSA": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",
-    "TLS13-DuplicateTicketEarlyDataSupport": "0-RTT: deferred pending a replay analysis (DESIGN.md \u00a71).",
+    "TLS13-DuplicateTicketEarlyDataSupport": "OPEN GAP: a NewSessionTicket carrying `early_data` twice. We already refuse it \u2014 the duplicate-extension pre-pass answers `DuplicateExtension`, which is the error BoGo wants \u2014 and differ only on the alert: ours is decode_error, BoringSSL's is illegal_parameter. \u00a76.2 reads for theirs, since the message decodes and the fault is a field inconsistent with another. Nothing to do with 0-RTT; the blanket reason here was hiding an alert choice. docs/BOGO.md finding 14.",
     "Ticket-Forbidden-TLS13": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TicketSessionIDLength-0-TLS-TLS1": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "TicketSessionIDLength-0-TLS-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
