@@ -16,6 +16,7 @@ const anti_replay = @import("anti_replay.zig");
 const client_messages = @import("client_messages.zig");
 const key_schedule = @import("key_schedule.zig");
 const record = @import("record.zig");
+const server_messages = @import("server_messages.zig");
 const test_client = @import("test_client.zig");
 const vectors = @import("rfc8448_vectors.zig");
 
@@ -1001,4 +1002,102 @@ test "§4.6.1: early data past the ticket's own limit ends the connection" {
         error.TooMuchEarlyData,
         harness.server.handleRecord(second, &server_out),
     );
+}
+
+test "§4.6.1: a ticket advertises how much early data it permits" {
+    // The other half of accepting 0-RTT, and the half a server cannot
+    // skip: a client offers early data only against a ticket that told
+    // it how much it may send. A server that accepts and never
+    // advertises is one no client ever takes up on it.
+    var buffers_out: [record.wire_record_bytes_max]u8 = undefined;
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var store: TicketStore = .empty;
+    var harness: Harness = undefined;
+    try harness.init(&store);
+    defer harness.deinit();
+    var client = Client.init(&client_x25519_private, &.{});
+    defer client.deinit();
+    try completeHandshake(&harness.server, &client);
+
+    const sealed = try harness.server.sendNewSessionTicket(&.{
+        .lifetime_s = 3600,
+        .age_add = 0x1234,
+        .ticket_nonce = &.{0x01},
+        .ticket = "sealed",
+        .early_data_bytes_max = 16384,
+    }, &buffers_out);
+
+    // The harness client round-trips the bytes. It skips the extension
+    // block wholesale rather than parsing it, so this shows the message
+    // framing survives and nothing more — the production client is what
+    // proves finding 7's rule here, and `client_server_test`'s
+    // `issueTicket` is where it meets this extension.
+    const event = try client.absorb(sealed, &client_out);
+    try testing.expectEqual(std.meta.activeTag(event), .none);
+    try testing.expectEqual(@as(u8, 1), client.ticket_count);
+
+    // And the same ticket without one, which is every ticket this
+    // library issued before now.
+    const plain = try harness.server.sendNewSessionTicket(&.{
+        .lifetime_s = 3600,
+        .age_add = 0x1234,
+        .ticket_nonce = &.{0x02},
+        .ticket = "sealed2",
+    }, &server_out);
+    const second = try client.absorb(plain, &client_out);
+    try testing.expectEqual(std.meta.activeTag(second), .none);
+    try testing.expectEqual(@as(u8, 2), client.ticket_count);
+
+    // The bytes themselves, off the builder rather than the record —
+    // what went out above is sealed, and the shape is the point: type
+    // 42, a u16 length of 4, then the u32 §4.6.1 puts there.
+    var message_out: [256]u8 = undefined;
+    const advertised = server_messages.newSessionTicket(
+        &message_out,
+        3600,
+        0x1234,
+        &.{0x01},
+        "sealed",
+        16384,
+    );
+    const wanted = [_]u8{ 0x00, 0x2a, 0x00, 0x04, 0x00, 0x00, 0x40, 0x00 };
+    try testing.expect(std.mem.indexOf(u8, advertised, &wanted) != null);
+    const silent = server_messages.newSessionTicket(
+        &message_out,
+        3600,
+        0x1234,
+        &.{0x01},
+        "sealed",
+        null,
+    );
+    try testing.expect(std.mem.indexOf(u8, silent, &wanted) == null);
+    // Silence is an empty block, not an absent one: §4.6.1 makes
+    // `extensions` mandatory and a client reads it either way.
+    try testing.expectEqual(advertised.len - 8, silent.len);
+}
+
+test "§4.6.1: the largest legal ticket still fits with 0-RTT advertised" {
+    // `new_session_ticket_bytes_max` is not a guess, it is the entire
+    // safety net: `wire.Builder` bounds-checks nothing, so every write
+    // is an assertion against a buffer this constant sized. Advertising
+    // early data grew the worst case by eight bytes and the constant
+    // did not move with it — a legal maximum-size ticket would have run
+    // off the end of the buffer `sendNewSessionTicket` allocates.
+    var message_out: [server_messages.new_session_ticket_bytes_max]u8 = undefined;
+    const nonce = [_]u8{0x5a} ** 255;
+    const ticket = [_]u8{0xa5} ** server_messages.ticket_bytes_max;
+    const largest = server_messages.newSessionTicket(
+        &message_out,
+        server_messages.ticket_lifetime_s_max,
+        0xffff_ffff,
+        &nonce,
+        &ticket,
+        std.math.maxInt(u32),
+    );
+    try testing.expectEqual(@as(usize, server_messages.new_session_ticket_bytes_max), largest.len);
+    // And the declared length agrees with what was written, which is
+    // the property an over-run would break first.
+    const declared = std.mem.readInt(u24, largest[1..4], .big);
+    try testing.expectEqual(largest.len - 4, declared);
 }

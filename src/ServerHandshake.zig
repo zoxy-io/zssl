@@ -1561,6 +1561,14 @@ pub const NewSessionTicketParams = struct {
     ticket_nonce: []const u8,
     /// The sealed ticket, opaque here — sealing is the embedder's.
     ticket: []const u8,
+    /// §4.6.1's `max_early_data_size`, or null to advertise none.
+    ///
+    /// This is a promise, not a preference: a client that takes it up
+    /// has already spent the bytes by the time we see them, so whatever
+    /// goes here must match what `psk_lookup` will later answer for the
+    /// same ticket. zssl cannot check that for you — the two live on
+    /// opposite sides of the embedder's ticket store.
+    early_data_bytes_max: ?u32 = null,
 };
 
 /// Encode and seal one NewSessionTicket onto the application stream. The
@@ -1590,6 +1598,7 @@ pub fn sendNewSessionTicket(
         params.age_add,
         params.ticket_nonce,
         params.ticket,
+        params.early_data_bytes_max,
     );
     switch (self.ladder.?) {
         inline else => |*arm| return arm.session.?.send.seal(.handshake, message, out),

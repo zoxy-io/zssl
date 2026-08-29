@@ -201,27 +201,42 @@ pub fn finished(out: []u8, verify_data: []const u8) []const u8 {
 /// touches one. zoxy's tickets are ≤ 256 bytes; 512 leaves headroom.
 pub const ticket_bytes_max: u16 = 512;
 
+/// §4.6.1 caps `ticket_lifetime` at seven days: "Servers MUST NOT use
+/// any value greater than 604800 seconds (7 days)."
+pub const ticket_lifetime_s_max: u32 = 604800;
+
 /// A NewSessionTicket message never exceeds this (§4.6.1's fields at
 /// their caps), which is what sizes the sealing buffers above.
+///
+/// The trailing 8 is the `early_data` extension: four bytes of type and
+/// length, four of `max_early_data_size`. It is counted whether or not a
+/// given ticket carries one, because this is the *worst* case and
+/// `wire.Builder` bounds-checks nothing — every `put` is an assertion,
+/// so this constant is the entire safety net between a legal
+/// maximum-size ticket and an out-of-bounds write.
 pub const new_session_ticket_bytes_max: u16 =
-    @as(u16, handshake.header_bytes) + 4 + 4 + 1 + 255 + 2 + ticket_bytes_max + 2;
+    @as(u16, handshake.header_bytes) + 4 + 4 + 1 + 255 + 2 + ticket_bytes_max + 2 + 8;
 
-/// §4.6.1. Extensions are always empty: no `early_data` offer means
-/// 0-RTT stays a separate decision with its own replay analysis.
+/// §4.6.1, and the other half of accepting 0-RTT: a client offers early
+/// data only against a ticket that told it how much it may send, so a
+/// server that accepts and never advertises is one no client ever takes
+/// up on it. Null keeps the extension block empty, which is what every
+/// ticket looked like before the accept path existed.
 pub fn newSessionTicket(
     out: []u8,
     lifetime_s: u32,
     age_add: u32,
     ticket_nonce: []const u8,
     ticket: []const u8,
+    early_data_bytes_max: ?u32,
 ) []const u8 {
     assert(lifetime_s >= 1);
-    assert(lifetime_s <= 604800); // §4.6.1 caps the lifetime at seven days.
+    assert(lifetime_s <= ticket_lifetime_s_max);
     assert(ticket_nonce.len >= 1);
     assert(ticket_nonce.len <= 255);
     assert(ticket.len >= 1);
     assert(ticket.len <= ticket_bytes_max);
-    assert(out.len >= handshake.header_bytes + 4 + 4 + 1 + ticket_nonce.len + 2 + ticket.len + 2);
+    assert(out.len >= handshake.header_bytes + 4 + 4 + 1 + ticket_nonce.len + 2 + ticket.len + 2 + 8);
     var builder = wire.Builder.init(out);
     const message = handshake.beginMessage(&builder, .new_session_ticket);
     builder.putU32(lifetime_s);
@@ -231,7 +246,17 @@ pub fn newSessionTicket(
     const body = builder.markU16();
     builder.putSlice(ticket);
     builder.patchU16(body);
-    builder.putU16(0); // extensions
+    const extensions = builder.markU16();
+    if (early_data_bytes_max) |bytes_max| {
+        // §4.2.10's `early_data` again, and it carries a body here where
+        // in a ClientHello it carries none — the one extension in this
+        // library whose shape depends on the message holding it.
+        builder.putU16(extension_early_data);
+        const body_mark = builder.markU16();
+        builder.putU32(bytes_max);
+        builder.patchU16(body_mark);
+    }
+    builder.patchU16(extensions);
     handshake.endMessage(&builder, message);
     return builder.written();
 }

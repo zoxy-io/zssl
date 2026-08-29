@@ -282,6 +282,13 @@ fn issueTicket(
         .age_add = 0x5eed,
         .ticket_nonce = &.{0x0a},
         .ticket = "sealed-by-us!",
+        // Advertised so the *production* client's `checkTicketExtensions`
+        // meets §4.6.1's `early_data` — an extension it acts on nothing
+        // about and must still parse, which is finding 7's rule. The
+        // client cannot offer 0-RTT yet, so tolerating it is the whole
+        // of what this proves, and every resumption test downstream of
+        // this helper now carries it.
+        .early_data_bytes_max = 16384,
     }, &buffers.server_out);
     const ticket_event = (try harness.client.handleRecord(sealed, &buffers.scratch)).?;
     try testing.expectEqual(std.meta.activeTag(ticket_event), .ticket);
