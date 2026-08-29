@@ -714,10 +714,21 @@ const Pump = struct {
     /// alert to the embedder; this is where that decision is made, and
     /// BoGo's `expectedLocalError` cases are what check it.
     fn abort(pump: *Pump, machine: anytype, err: anyerror) anyerror {
-        const description = alertFor(err) orelse {
-            pump.linger();
-            return err;
-        };
+        // No alert, no linger, and the reason is the whole of it:
+        // draining is what lets the peer read the alert we just wrote
+        // (see `linger`), so with nothing written there is nothing for
+        // it to protect. That holds for every error reaching here, not
+        // only the ones where the peer has stopped talking — a
+        // `TooManyRecords` or an `UnexpectedEvent` is a ceiling of ours
+        // and the peer may still be mid-send, but it is still an
+        // unannounced close either way.
+        //
+        // Where it *was* the peer stopping, draining did active harm.
+        // BoGo's `SkipEarlyData-HRR-FatalAlert-TLS13` sends a fatal
+        // handshake_failure and then waits for us to close; we waited to
+        // read; and the case failed on the runner's deadline rather
+        // than on anything either of us did.
+        const description = alertFor(err) orelse return err;
         pump.write(machine.sendAlert(description, &pump.out)) catch {};
         pump.linger();
         return err;

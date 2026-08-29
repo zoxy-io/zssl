@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 310 passed, 0 failed, 6918 declined by the shim (89), floor 310
+bogo: 311 passed, 0 failed, 6918 declined by the shim (89), floor 311
 bogo: PASS
 ```
 
@@ -41,7 +41,7 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**310 passed.** Cases the runner ran end to end and we satisfied —
+**311 passed.** Cases the runner ran end to end and we satisfied —
 including the alert we sent, which BoGo checks by name. It was 278 until
 the client could answer a HelloRetryRequest: a single-group client that
 refused every retry structurally kept 26 patterns declined, and
@@ -705,7 +705,8 @@ name.
     marked KEEP; `TLS13-DuplicateTicketEarlyDataSupport` is a duplicate
     extension we already refuse, differing only in the alert, and is
     finding 15; and `SkipEarlyData-HRR-FatalAlert-TLS13` is about how
-    the shim ends a connection after a peer's alert. A reason that
+    the shim ends a connection after a peer's alert, and is finding 16.
+    A reason that
     covers a family stops being read case by case, which is exactly when
     it starts covering things it does not describe.
 
@@ -746,6 +747,52 @@ name.
     illegal_parameter here — and we satisfy the two and not the one,
     which is a majority worth naming honestly rather than leaning on: it
     is two against one.
+
+16. **FIXED — the shim waited for a peer that had already given up.**
+    `SkipEarlyData-HRR-FatalAlert-TLS13` sends a ClientHello, then a
+    fatal handshake_failure, then early data. The library read the alert
+    and answered `PeerAlert`, which is right and was right all along.
+    The shim then hung, and the case failed on the runner's read
+    deadline rather than on anything either side did.
+
+    `Pump.abort` drained the socket before closing whether or not it had
+    written an alert. Draining is what makes the close a FIN rather than
+    a reset, so that a peer can actually read the alert we just sent —
+    and with no alert written there is nothing for it to protect. That
+    is the whole justification, and it covers every error reaching the
+    branch: a ceiling of our own like `TooManyRecords` gets there too,
+    with the peer still mid-send, and an unannounced close is the right
+    answer there as well.
+
+    Where it *was* the peer that had stopped, draining did active harm.
+    It had sent a fatal alert and was waiting for us to close; we were
+    waiting to read; the drain blocked until the other side's deadline
+    fired. Two ends waiting to read.
+
+    Worth recording because of where the bug was: not in the library,
+    which returned the error the case wanted, but in the embedder's
+    error path. `tlsfuzzer/server.zig` — the same mapping written later
+    and kept separate on purpose — already had it right
+    (`alertFor(err) orelse return err`). The separation that stops two
+    harnesses from agreeing by sharing code also let one of them keep a
+    fault the other had fixed, and only a case that exercised the exact
+    ordering found it.
+
+    `:SSLV3_ALERT_HANDSHAKE_FAILURE:` also needed an `ErrorMap` entry.
+    zssl's `PeerAlert` does not carry which alert arrived, so the map
+    already points several of BoringSSL's alert-specific errors at it;
+    this is one more of the same, not a new kind of imprecision
+    (finding 6 records the limitation).
+
+    One asymmetry is left standing, deliberately and with a note rather
+    than a fix. The shim's `linger` drains and lets the connection's own
+    `defer close` send the FIN; `tlsfuzzer/server.zig`'s
+    `drainBeforeClose` half-closes with `shutdown(.send)` *first*, which
+    that harness needed to fix a real race — a peer waiting to see our
+    FIN before sending its trailing bytes (docs/TLSFUZZER.md). The TCP
+    mechanics are the same for both, so the difference looks like
+    history rather than design, and BoGo has simply not shaped a case
+    that hits it. Worth a slice of its own if one ever does.
 
 None of these are exploitable as far as the runner can show; they are
 laxity, and laxity is what BoGo exists to find.
