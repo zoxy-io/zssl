@@ -2024,3 +2024,88 @@ test "§6: an alert description this library does not name survives as its byte"
     }
     try testing.expectEqual(@as(?u8, decompression_failure), harness.server.peer_alert_description);
 }
+
+test "§2: 0.5-RTT data, and the nonce sequence that survives the handoff" {
+    // The server may answer after its own Finished and before the
+    // client's. `finishFlight` already moved the send side onto
+    // application keys, so these records are protected exactly as
+    // post-handshake ones are — same key, one continuous sequence.
+    //
+    // That continuity is the whole hazard. The session's send protector
+    // is built from the same secret, so a count that restarted would
+    // reuse a nonce under a key that had already seen it. There was an
+    // assertion demanding `sequence == 0` at the handoff precisely
+    // because nothing wrote in this window before; this walks the case
+    // that assertion was guarding against.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+
+    const hello = harness.client.start(&buffers.client_out);
+    const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
+    try testing.expectEqual(std.meta.activeTag(flight), .send);
+    try testing.expect(harness.server.halfRttWritable());
+    try testing.expect(!harness.server.writable());
+
+    // Two records written before the client has said anything at all.
+    var flight_storage: [2 * record.wire_record_bytes_max]u8 = undefined;
+    @memcpy(flight_storage[0..flight.send.len], flight.send);
+    const flight_bytes = flight_storage[0..flight.send.len];
+    var half_rtt: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var half_rtt_bytes: usize = 0;
+    for ([_][]const u8{ "half-rtt one", "half-rtt two" }) |payload| {
+        const sealed = try harness.server.sendApplicationData(payload, &buffers.server_out);
+        @memcpy(half_rtt[half_rtt_bytes..][0..sealed.len], sealed);
+        half_rtt_bytes += sealed.len;
+    }
+
+    // Now finish the handshake. The session inherits the sequence.
+    var reply_storage: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var reply_bytes: usize = 0;
+    var index: usize = 0;
+    var count: u8 = 0;
+    while (index < flight_bytes.len) : (count += 1) {
+        try testing.expect(count < 8);
+        const one = recordAt(flight_bytes, index);
+        if (try harness.client.handleRecord(one, &buffers.scratch)) |event| switch (event) {
+            .connected => |bytes| {
+                @memcpy(reply_storage[0..bytes.len], bytes);
+                reply_bytes = bytes.len;
+            },
+            else => return error.TestUnexpectedResult,
+        };
+        index += one.len;
+    }
+    const reply = reply_storage[0..reply_bytes];
+    var final: ?ServerHandshake.Event = null;
+    index = 0;
+    count = 0;
+    while (index < reply.len) : (count += 1) {
+        try testing.expect(count < 8);
+        const one = recordAt(reply, index);
+        if (try harness.server.handleRecord(one, &buffers.server_out)) |event| final = event;
+        index += one.len;
+    }
+    try testing.expectEqual(std.meta.activeTag(final.?), .connected);
+    // Two records went out early, so the session starts at two.
+    const transmit = harness.server.exportKeyMaterial(.transmit);
+    try testing.expectEqual(@as(u64, 2), transmit.next_sequence);
+
+    // And the client reads all three in order, which it can only do if
+    // every nonce was distinct and consecutive.
+    index = 0;
+    var seen: usize = 0;
+    const expected = [_][]const u8{ "half-rtt one", "half-rtt two", "after" };
+    const after = try harness.server.sendApplicationData("after", &buffers.server_out);
+    @memcpy(half_rtt[half_rtt_bytes..][0..after.len], after);
+    half_rtt_bytes += after.len;
+    while (index < half_rtt_bytes) : (seen += 1) {
+        try testing.expect(seen < expected.len);
+        const one = recordAt(half_rtt[0..half_rtt_bytes], index);
+        const event = (try harness.client.handleRecord(one, &buffers.scratch)).?;
+        try testing.expectEqualSlices(u8, expected[seen], event.application_data);
+        index += one.len;
+    }
+    try testing.expectEqual(expected.len, seen);
+}

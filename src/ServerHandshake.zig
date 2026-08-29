@@ -149,6 +149,23 @@ pub fn writable(self: *const ServerHandshake) bool {
     return self.state == .connected or self.state == .close_received;
 }
 
+/// §2's 0.5-RTT window: our flight is out, the client's Finished has not
+/// arrived, and application data may go out anyway. `finishFlight` moved
+/// the send side onto application keys, so these records are protected
+/// exactly as post-handshake ones are — it is the same key and one
+/// continuous nonce sequence.
+///
+/// What is *weaker* here is not the protection but the knowledge. We
+/// have not seen the client's Finished, so we do not yet know the
+/// handshake was not tampered with in ways the transcript would catch,
+/// and with 0-RTT accepted we do not know the hello was not a replay
+/// (§8 bounds that, it does not remove it). Appendix E.5 is the RFC's
+/// own account. An embedder that answers here is choosing a round trip
+/// over that confirmation, which is exactly the trade 0.5-RTT is.
+pub fn halfRttWritable(self: *const ServerHandshake) bool {
+    return self.state == .awaiting_finished or self.state == .awaiting_end_of_early_data;
+}
+
 pub fn readable(self: *const ServerHandshake) bool {
     return self.state == .connected or self.state == .close_sent;
 }
@@ -1448,15 +1465,24 @@ pub fn sendKeyUpdate(self: *ServerHandshake, request_update: bool, out: []u8) Er
     }
 }
 
-/// Seal application bytes for the peer. Valid only while connected. The
-/// failed-on-error guarantee covers this entry point too: a seal failure
-/// (sequence exhaustion included) retires the machine.
+/// Seal application bytes for the peer. Legal from `connected`, and also
+/// inside §2's 0.5-RTT window — see `halfRttWritable`, which is the
+/// question an embedder should ask before writing there.
+///
+/// The failed-on-error guarantee covers this entry point too: a seal
+/// failure (sequence exhaustion included) retires the machine.
 pub fn sendApplicationData(self: *ServerHandshake, bytes: []const u8, out: []u8) Error![]const u8 {
-    assert(self.writable());
+    assert(self.writable() or self.halfRttWritable());
     assert(bytes.len <= record.plaintext_bytes_max);
     errdefer self.state = .failed;
     switch (self.ladder.?) {
-        inline else => |*arm| return arm.session.?.sealApplicationData(bytes, out),
+        inline else => |*arm| {
+            if (arm.session) |*session| return session.sealApplicationData(bytes, out);
+            // The 0.5-RTT window, where there is no session yet. Same
+            // key, same sequence — `startApplicationKeys` carries the
+            // count into the session so the two never overlap.
+            return arm.send.?.seal(.application_data, bytes, out);
+        },
     }
 }
 
@@ -1920,14 +1946,13 @@ fn LadderOf(comptime suite: CipherSuite) type {
             assert(self.schedule.?.stage == .master);
             assert(self.session == null);
             // The session's send protector is built from the same secret
-            // `finishFlight` already keyed `send` with, so reaching here
-            // with that protector used would restart its nonce sequence
-            // under a key that had seen one. It cannot: the only writer
-            // in that window is `sendAlert`, which retires the machine to
-            // `failed` or `closed`, and neither state admits the client
-            // Finished that calls this. The assertion is what keeps that
-            // true as the code moves.
-            assert(self.send.?.sequence == 0);
+            // `finishFlight` already keyed `send` with, so its nonce
+            // sequence has to continue rather than restart — §2's
+            // 0.5-RTT data is written under exactly that key, before
+            // this runs. This assertion used to demand a sequence of
+            // zero, on the reasoning that `sendAlert` was the only
+            // writer in the window and it retires the machine; 0.5-RTT
+            // is the second writer, so the count travels instead.
             self.transcript.update(finished_message.bytes);
             // §7.1: resumption_master derives from the transcript through
             // the client Finished — this is the only window it exists in.
@@ -1935,6 +1960,7 @@ fn LadderOf(comptime suite: CipherSuite) type {
             self.session = try session_keys.SessionKeys(suite).init(
                 &self.server_application_traffic,
                 &self.client_application_traffic,
+                self.send.?.sequence,
             );
             // The session owns rotation from here, so these staged copies
             // are generation-0 material with no further use — wipe them

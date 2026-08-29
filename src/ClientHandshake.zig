@@ -1690,7 +1690,15 @@ fn ArmOf(comptime suite: CipherSuite) type {
             const sealed = try self.send.?.seal(.handshake, finished_message, builder.bytes[builder.index..]);
             builder.index += sealed.len;
 
-            self.session = try session_keys.SessionKeys(suite).init(&client_application, &server_application);
+            // Zero: a client has no 0.5-RTT window. Its own Finished
+            // is the last thing it writes under the handshake keys, and
+            // nothing goes out on the application ones until the
+            // session exists.
+            self.session = try session_keys.SessionKeys(suite).init(
+                &client_application,
+                &server_application,
+                0,
+            );
             self.recv.?.deinit();
             self.send.?.deinit();
             self.recv = null;
