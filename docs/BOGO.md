@@ -703,11 +703,49 @@ name.
     `SkipEarlyData-SecondClientHelloEarlyData-TLS13` is a §4.1.2
     argument we now win one message earlier than BoringSSL does and is
     marked KEEP; `TLS13-DuplicateTicketEarlyDataSupport` is a duplicate
-    extension we already refuse, differing only in the alert; and
-    `SkipEarlyData-HRR-FatalAlert-TLS13` is about how the shim ends a
-    connection after a peer's alert. A reason that covers a family
-    stops being read case by case, which is exactly when it starts
-    covering things it does not describe.
+    extension we already refuse, differing only in the alert, and is
+    finding 15; and `SkipEarlyData-HRR-FatalAlert-TLS13` is about how
+    the shim ends a connection after a peer's alert. A reason that
+    covers a family stops being read case by case, which is exactly when
+    it starts covering things it does not describe.
+
+15. **A duplicate extension earns one alert, not two.**
+    `TLS13-DuplicateTicketEarlyDataSupport` sends a NewSessionTicket
+    carrying `early_data` twice and wants illegal_parameter; we answer
+    decode_error, and mean to.
+
+    We refuse the ticket — the error is `DuplicateExtension`, which is
+    what the case maps `:DUPLICATE_EXTENSION:` to — so the whole
+    disagreement is one alert on one case.
+
+    §4.2 is a single sentence covering "a given extension block" and
+    names no alert for breaking it. §6.2 admits both readings: it is
+    decode_error if "there MUST NOT be more than one" is part of the
+    block's syntax, and illegal_parameter if it is a message that
+    "conform[s] to the formal protocol syntax but [is] otherwise
+    incorrect". The RFC does not decide it, so an implementation does.
+
+    Ours is decided by a constraint the RFC does not have: zssl returns
+    errors and leaves alerting to the embedder. One rule, enforced by
+    one pre-pass over every block we read (finding 9), is one error —
+    and an error is the whole of what the library says. Answering two
+    alerts would mean carrying two error names for one sentence of §4.2,
+    which is API surface bought for a single case, and it would put
+    "which message was it in?" into an embedder's alert table.
+
+    BoringSSL's split is not principled either, and reading it is what
+    settled this. A duplicate in a ClientHello or ServerHello fails
+    inside `tls1_check_duplicate_extensions` during the parse, which
+    reports `SSL_R_CLIENTHELLO_PARSE_FAILED` and sends decode_error; a
+    duplicate anywhere else fails in `ssl_parse_extensions`
+    (`ssl/handshake.cc`), which sets `SSL_AD_ILLEGAL_PARAMETER` under
+    the comment "Duplicate ext_types are forbidden". Same violation, two
+    answers, chosen by which function happened to catch it. Their own
+    corpus asks for both — decode_error in
+    `DuplicateExtensionClient-TLS-TLS13` and `-Server-`,
+    illegal_parameter here — and we satisfy the two and not the one,
+    which is a majority worth naming honestly rather than leaning on: it
+    is two against one.
 
 None of these are exploitable as far as the runner can show; they are
 laxity, and laxity is what BoGo exists to find.
