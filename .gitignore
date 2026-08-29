@@ -10,3 +10,8 @@ zig-out/
 .direnv/
 .devenv*
 devenv.local.nix
+
+# Git worktrees an agent session parked here. The branch and its commits
+# live in this repository already; the checkout is working state, and
+# committing the directory would embed a repository inside the repository.
+.claude/worktrees/

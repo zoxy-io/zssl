@@ -32,8 +32,7 @@
     ],
     ":BAD_ALERT:": [
       "zssl:BadAlert",
-      "zssl:MalformedAlert",
-      "zssl:PeerAlert"
+      "zssl:MalformedAlert"
     ],
     ":DECODE_ERROR:": [
       "zssl:MalformedMessage",
@@ -182,7 +181,7 @@
       "zssl:TrailingBytes"
     ],
     ":TLSV1_ALERT_RECORD_OVERFLOW:": [
-      "zssl:PeerAlert"
+      "zssl:PeerAlert:record_overflow"
     ],
     ":MISSING_EXTENSION:": [
       "zssl:MissingExtension",
@@ -198,7 +197,7 @@
       "zssl:NoCloseNotify"
     ],
     ":SSLV3_ALERT_DECOMPRESSION_FAILURE:": [
-      "zssl:PeerAlert"
+      "zssl:PeerAlert:30"
     ],
     ":EMPTY_HELLO_RETRY_REQUEST:": [
       "zssl:IllegalRetry"
@@ -213,7 +212,7 @@
       "zssl:TooMuchSkippedEarlyData"
     ],
     ":SSLV3_ALERT_HANDSHAKE_FAILURE:": [
-      "zssl:PeerAlert"
+      "zssl:PeerAlert:handshake_failure"
     ]
   },
   "DisabledTests": {
@@ -233,6 +232,7 @@
     "ALPNServer-EmptyProtocolName-TLS-TLS11": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "ALPNServer-EmptyProtocolName-TLS-TLS12": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "Agree-Digest-Default": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
+    "AlertAfterChangeCipherSpec": "Not a defect: TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated. Its name does not say so and its config does (`MaxVersion: VersionTLS12`), which is why the sweep that declined the rest of the family missed it. It counted as passing until finding 17 made the PeerAlert mapping exact: the runner rejects our 1.3-only hello with protocol_version and the record_overflow the case is named for is never sent. docs/BOGO.md finding 17.",
     "AlternateEmptyRecordsAndTooManyWarningAlerts": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "AlternateEmptyRecordsAndWarningAlerts": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",
     "AlternateTooManyEmptyRecordsAndWarningAlerts": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71) \u2014 the version is declined, never negotiated.",

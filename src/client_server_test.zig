@@ -17,6 +17,7 @@ const ServerHandshake = @import("ServerHandshake.zig");
 const cipher_suite = @import("cipher_suite.zig");
 const record = @import("record.zig");
 const flood = @import("flood.zig");
+const alert = @import("alert.zig");
 const backend = @import("crypto/backend_openssl.zig");
 const key_schedule = @import("key_schedule.zig");
 const protect = @import("protect.zig");
@@ -1948,4 +1949,71 @@ test "§5.1: a record packing three post-handshake messages yields all three" {
             try testing.expectEqualStrings("after", event.application_data);
         },
     }
+}
+
+test "§6: a fatal alert from the peer says which alert it was" {
+    // `PeerAlert` is one error for every refusal a peer can send, and a
+    // Zig error carries no payload — so an embedder that logs or
+    // re-maps the peer's alert had nothing to read. BoGo's ErrorMap was
+    // the same problem from outside: a case expecting record_overflow
+    // was satisfied by any fatal alert at all, and one of them had been
+    // passing on that (docs/BOGO.md finding 17).
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+    try harness.connect(&buffers);
+    try testing.expectEqual(@as(?u8, null), harness.server.peer_alert_description);
+
+    // A fatal alert the client would never send, so the byte read back
+    // can only have come from this record.
+    switch (harness.client.ladder.?) {
+        inline else => |*arm| {
+            const sealed = try arm.session.?.send.seal(
+                .alert,
+                &alert.encode(.record_overflow),
+                &buffers.client_out,
+            );
+            try testing.expectError(
+                error.PeerAlert,
+                harness.server.handleRecord(sealed, &buffers.server_out),
+            );
+        },
+    }
+    try testing.expectEqual(
+        @as(?u8, @intFromEnum(alert.Description.record_overflow)),
+        harness.server.peer_alert_description,
+    );
+}
+
+test "§6: an alert description this library does not name survives as its byte" {
+    // §6 lets a peer send any byte, and `alert.Description` names only
+    // the ones zssl uses. Reporting the wire value rather than the enum
+    // is what keeps `decompression_failure` — a TLS 1.2-era alert with
+    // no place in this library — readable by an embedder that meets one.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+    try harness.connect(&buffers);
+
+    const decompression_failure: u8 = 30;
+    try testing.expectEqual(
+        @as(?alert.Description, null),
+        std.enums.fromInt(alert.Description, decompression_failure),
+    );
+    switch (harness.client.ladder.?) {
+        inline else => |*arm| {
+            const sealed = try arm.session.?.send.seal(
+                .alert,
+                &.{ 2, decompression_failure },
+                &buffers.client_out,
+            );
+            try testing.expectError(
+                error.PeerAlert,
+                harness.server.handleRecord(sealed, &buffers.server_out),
+            );
+        },
+    }
+    try testing.expectEqual(@as(?u8, decompression_failure), harness.server.peer_alert_description);
 }

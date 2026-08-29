@@ -714,6 +714,7 @@ const Pump = struct {
     /// alert to the embedder; this is where that decision is made, and
     /// BoGo's `expectedLocalError` cases are what check it.
     fn abort(pump: *Pump, machine: anytype, err: anyerror) anyerror {
+        reportPeerAlert(machine, err);
         // No alert, no linger, and the reason is the whole of it:
         // draining is what lets the peer read the alert we just wrote
         // (see `linger`), so with nothing written there is nothing for
@@ -803,12 +804,14 @@ const Pump = struct {
             // written. `Unclean-Shutdown-Alert` is the case that reads
             // it.
             var event = machine.handleRecord(one, &pump.out) catch |err| {
+                reportPeerAlert(machine, err);
                 pump.linger();
                 return err;
             };
             while (event) |ready| {
                 if (std.meta.activeTag(ready) == .closed) return;
                 event = machine.drain(&pump.out) catch |err| {
+                    reportPeerAlert(machine, err);
                     pump.linger();
                     return err;
                 };
@@ -900,6 +903,25 @@ fn captureTicket(machine: anytype, event: anytype, store: *TicketStore) void {
     store.identity_bytes = @intCast(ticket.ticket.len);
     store.psk_bytes = @intCast(machine.resumptionPsk(ticket.nonce, &store.psk).len);
     store.age_add = ticket.age_add;
+}
+
+/// `PeerAlert` names the refusal and not which refusal it was — a Zig
+/// error carries no payload — so the machine records the description
+/// byte and this puts it beside the error name. BoGo matches on a
+/// substring of stderr, so this line and `main`'s bare `zssl:PeerAlert`
+/// both count, and the `ErrorMap` can tell
+/// `:SSLV3_ALERT_HANDSHAKE_FAILURE:` from `:TLSV1_ALERT_RECORD_OVERFLOW:`
+/// instead of accepting either for both.
+fn reportPeerAlert(machine: anytype, err: anyerror) void {
+    if (err != error.PeerAlert) return;
+    const description = machine.peer_alert_description orelse return;
+    if (std.enums.fromInt(alert.Description, description)) |named| {
+        std.debug.print("zssl:PeerAlert:{t}\n", .{named});
+    } else {
+        // §6 lets a peer send any byte; the ones this library does not
+        // name are still worth reporting, and by their number.
+        std.debug.print("zssl:PeerAlert:{d}\n", .{description});
+    }
 }
 
 /// zssl error → RFC 8446 §6 alert: the mapping an embedder must make,

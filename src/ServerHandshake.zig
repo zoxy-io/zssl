@@ -53,6 +53,21 @@ session_echo: [32]u8,
 /// Whether this session came up on an accepted PSK — the fact behind
 /// zoxy's `tls_resumed` counter.
 resumed: bool,
+/// The description byte of the fatal alert the peer sent, or null while
+/// it has sent none.
+///
+/// It exists because a Zig error carries no payload: `PeerAlert` says
+/// the peer refused us and never which refusal it was, so an embedder
+/// that logs or re-maps the peer's alert had nothing to read. The wire
+/// byte rather than an `alert.Description`, because §6 lets a peer send
+/// any byte and this library names only the ones it uses — a caller
+/// wanting the name asks `alert.Description` and gets null for the rest.
+///
+/// Fatal alerts only, and that is a line rather than an omission: a
+/// warning-level alert we decline to interpret earns `BadAlert`, where
+/// the alert that follows is *ours*, and recording the peer's byte
+/// there would describe a refusal it did not make.
+peer_alert_description: ?u8,
 /// §4.2.10's rejected-early-data window: the hello offered 0-RTT, we
 /// declined it by saying nothing, and the client is sending it anyway.
 /// Records that arrive while this stands are skipped rather than opened
@@ -311,6 +326,7 @@ pub fn init(config: *const Config) ServerHandshake {
         .session_echo = undefined,
         .resumed = false,
         .ch1_offered_psk = false,
+        .peer_alert_description = null,
         .early_data_offered = false,
         .early_data_skipped = 0,
     };
@@ -515,7 +531,10 @@ fn handlePlaintextAlert(self: *ServerHandshake, payload: []const u8) Error!?Even
             return null;
         },
         .refuse => return error.BadAlert,
-        .peer_fatal => return error.PeerAlert,
+        .peer_fatal => {
+            self.peer_alert_description = parsed.description_wire;
+            return error.PeerAlert;
+        },
     }
 }
 

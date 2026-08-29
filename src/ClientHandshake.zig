@@ -85,6 +85,21 @@ retried: bool,
 /// The group our *current* key_share is for — x25519 on the first hello,
 /// whatever the retry named on the second.
 share_group: u16,
+/// The description byte of the fatal alert the peer sent, or null while
+/// it has sent none.
+///
+/// It exists because a Zig error carries no payload: `PeerAlert` says
+/// the peer refused us and never which refusal it was, so an embedder
+/// that logs or re-maps the peer's alert had nothing to read. The wire
+/// byte rather than an `alert.Description`, because §6 lets a peer send
+/// any byte and this library names only the ones it uses — a caller
+/// wanting the name asks `alert.Description` and gets null for the rest.
+///
+/// Fatal alerts only, and that is a line rather than an omission: a
+/// warning-level alert we decline to interpret earns `BadAlert`, where
+/// the alert that follows is *ours*, and recording the peer's byte
+/// there would describe a refusal it did not make.
+peer_alert_description: ?u8,
 /// Whether the hello now on the wire carries a `pre_shared_key`.
 ///
 /// Not the same question as `config.resume_session != null`, and the
@@ -366,6 +381,7 @@ pub fn init(config: *const Config) ClientHandshake {
         .hello_bytes = 0,
         .retried = false,
         .share_group = client_hello.group_x25519,
+        .peer_alert_description = null,
         .psk_offered = false,
         .resumed = false,
         .certificate_verified = false,
@@ -549,7 +565,10 @@ fn handleAlertPayload(self: *ClientHandshake, payload: []const u8) Error!?Event 
             return null;
         },
         .refuse => return error.BadAlert,
-        .peer_fatal => return error.PeerAlert,
+        .peer_fatal => {
+            self.peer_alert_description = parsed.description_wire;
+            return error.PeerAlert;
+        },
     }
 }
 

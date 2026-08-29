@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 311 passed, 0 failed, 6918 declined by the shim (89), floor 311
+bogo: 310 passed, 0 failed, 6918 declined by the shim (89), floor 310
 bogo: PASS
 ```
 
@@ -41,7 +41,7 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**311 passed.** Cases the runner ran end to end and we satisfied —
+**310 passed.** Cases the runner ran end to end and we satisfied —
 including the alert we sent, which BoGo checks by name. It was 278 until
 the client could answer a HelloRetryRequest: a single-group client that
 refused every retry structurally kept 26 patterns declined, and
@@ -385,9 +385,9 @@ name.
    BoringSSL's vocabulary. `Unexpected SSL_shutdown result: -1 != 1` is
    our `NoCloseNotify`, and `:SSLV3_ALERT_DECOMPRESSION_FAILURE:` is our
    `PeerAlert` — which is worth noticing as a limit rather than a
-   translation: zssl reports *that* the peer sent a fatal alert and
-   never *which*, so an embedder needing the description does not have
-   it.
+   translation: zssl reported *that* the peer sent a fatal alert and
+   never *which*, so an embedder needing the description did not have
+   it. Finding 17 closed that, and the mapping named here is exact now.
 7. **FIXED — NewSessionTicket extension bodies were not checked** for a
    minimal encoding. §4.6.1's `extensions` block was read as a length
    and skipped, which is not the same as ignoring it: zssl acts on none
@@ -800,6 +800,44 @@ name.
     the difference survived this long. It is fixed on the argument
     rather than on a red run, and that is the honest description: the
     other harness had already paid for this lesson.
+
+17. **FIXED — `PeerAlert` never said which alert**, and a case had been
+    passing on that.
+
+    zssl reports that the peer sent a fatal alert and, until now, never
+    which one: a Zig error carries no payload, so an embedder that
+    wanted to log or re-map the peer's refusal had nothing to read.
+    Finding 6 recorded that as a limit five findings ago. Both machines
+    now keep the description byte in `peer_alert` — the wire value, not
+    an `alert.Description`, because §6 lets a peer send any byte and
+    this library names only the ones it uses.
+
+    The ErrorMap is where it showed. Three of BoringSSL's
+    alert-specific errors pointed at a bare `zssl:PeerAlert`, so a case
+    expecting record_overflow was satisfied by *any* fatal alert. The
+    shim now prints the description beside the error name and the three
+    entries name it, which is a mapping that can be wrong — the point of
+    having one. A fourth, `:BAD_ALERT:`, listed `zssl:PeerAlert` among
+    several names and had the same hole; the review traced it as
+    unreachable — those cases are caught as `MalformedAlert` or
+    `BadAlert` first — and it is removed rather than left resting on
+    which entry happens to win.
+
+    It was wrong immediately. `AlertAfterChangeCipherSpec` had been
+    counted as passing, and it is a `MaxVersion: VersionTLS12` test: the
+    runner rejects our 1.3-only hello with protocol_version long before
+    the record_overflow the case is named for, and the coarse mapping
+    accepted that. Its name does not carry a version, which is why the
+    sweep that declined the rest of the 1.2 family walked past it. It is
+    declined now, on the same by-design reason as its siblings.
+
+    So the passing count goes **down** by one, 311 to 310, and the floor
+    with it. That is the one direction the floor is not supposed to
+    move, so it is worth being exact about why: no behaviour changed
+    here, and nothing regressed. A case left the corpus we count,
+    which is what declining a case always does — and this one was never
+    testing us in the first place. A number that drops because a
+    measurement got honest is worth more than the number it replaced.
 
 None of these are exploitable as far as the runner can show; they are
 laxity, and laxity is what BoGo exists to find.
