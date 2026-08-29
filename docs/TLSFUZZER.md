@@ -10,8 +10,8 @@ itself.
 It runs: `zig build tlsfuzzer`.
 
 ```
-tlsfuzzer: 15 scripts to run, 42 disabled (0 of those untriaged)
-tlsfuzzer: 15 scripts passed, 0 failed, 42 disabled, floor 15
+tlsfuzzer: 16 scripts to run, 41 disabled (0 of those untriaged)
+tlsfuzzer: 16 scripts passed, 0 failed, 41 disabled, floor 16
 tlsfuzzer: PASS
 ```
 
@@ -59,7 +59,7 @@ is reporting on the fixture.
 
 ## The numbers, and the debt
 
-**15 of 57** `test-tls13-*` scripts run, 1261 conversations between them.
+**16 of 57** `test-tls13-*` scripts run, 1329 conversations between them.
 `test-tls13-lengths` is 1002 of those on its own: every plaintext length
 from 1 to 2^14, each echoed back and checked for size.
 `test-tls13-connection-abort` is another 150, aborting the connection at
@@ -67,10 +67,12 @@ every point in the handshake and checking the server neither hangs nor
 crashes, and `test-tls13-invalid-ciphers` 52. The rest are the basic
 conversation, alert handling encrypted and not, Minerva timing-signal
 sanity, HelloRetryRequest and the §9.2 hello that must not get one, empty
-and unrecognised cipher lists, record padding, ticket counting, and the
-two RSA signature scripts.
+and unrecognised cipher lists, record padding, ticket counting, the two
+RSA signature scripts, and — since finding 7 closed — the 68
+conversations of `record-layer-limits`, which walk §5.1's and §5.2's
+caps from both sides.
 
-**42 disabled, none of them untriaged.** 24 carry scope reasons that were
+**41 disabled, none of them untriaged.** 24 carry scope reasons that were
 always plain — client certificates, FFDHE, brainpool curves, EdDSA,
 ML-DSA, ML-KEM, 0-RTT, compressed certificates, `psk_ke` without (EC)DHE,
 TLS 1.2 fallback, AES-CCM — each pointing at a written decision. The
@@ -101,7 +103,7 @@ and a debt that is not counted is a debt that is not paid. A new script
 arriving with a pin bump may push it back above zero; triage it before
 the commit lands, never after.
 
-**The floor** is 15. `scripts.json` can disable a script, but not quietly:
+**The floor** is 16. `scripts.json` can disable a script, but not quietly:
 the passing count falls with it and the gate goes red.
 
 ## What it cost to get here
@@ -190,30 +192,55 @@ library's until the OpenSSL oracle said otherwise.
    present is a client not offering (EC)DHE at all, which §9.2 does not
    reach, and zssl's refusal of that stays `handshake_failure`.
 
-7. **A handshake message's declared length is never checked against its
-   type.** Finished carries `verify_data` and nothing else, so its length
-   is the hash's; KeyUpdate carries one byte. zssl takes the declared
-   length from the wire and never asks whether the type admits it, so
-   both ways it can be wrong get the wrong answer. Inside the reassembly
-   buffer the message is assembled and handed to its own parser, where a
-   short or padded Finished fails the `verify_data` comparison —
-   `decrypt_error` — and a zero- or over-length KeyUpdate falls out of
-   the `request_update` switch — `illegal_parameter`. Past the buffer,
-   `Assembler.next` refuses the declared length as a *capacity* failure,
-   `BufferOverflow`, which the harness's table can only call
-   `internal_error`.
+7. **A handshake message's declared length was never checked against
+   its type.** Finished carries `verify_data` and nothing else, so its
+   length is the negotiated hash's; KeyUpdate carries one byte. zssl took
+   the declared length from the wire and never asked whether the type
+   admitted it, so a length no message of that type could have was
+   decided by whatever it happened to reach: a zero- or over-length
+   KeyUpdate fell out of the `request_update` switch as
+   `illegal_parameter`, and a declared length past the reassembly buffer
+   was refused as a *capacity* failure, `BufferOverflow`, which the
+   harness's table can only call `internal_error`.
 
-   §6.2 names one alert for all three: `decode_error`, "a message could
-   not be decoded because some field was out of the specified range **or
-   the length of the message was incorrect**". Real OpenSSL answers
-   `decode_error` in every one of these cases and passes all three
-   scripts outright. The capacity path is the one that reads worst: a
-   Finished declaring 16 MiB is not a message we lack room for, it is a
-   message that cannot exist, and saying so needs no buffer at all.
+   §6.2 is plain about the answer: `decode_error`, "a message could not
+   be decoded because some field was out of the specified range **or the
+   length of the message was incorrect**". The fix asks the question the
+   type already answers, and asks it before capacity, because the two
+   are different verdicts and the order decides which one the peer
+   hears. `handshake.Assembler` now refuses a declared length the type
+   cannot have — `key_update` is one byte by §4.6.3's grammar, `finished`
+   is at most the largest hash any suite here negotiates — on four header
+   bytes, before a peer can make anyone hold the body it promised. A
+   Finished declaring 16 MiB is not a message we lack room for; it is a
+   message that cannot exist, and the old answer told the embedder its
+   own buffer was too small about a message no buffer would have helped.
 
-   Costs `test-tls13-finished` (5 of 42), `test-tls13-keyupdate` (2 of
-   62), `test-tls13-record-layer-limits` (the 2 that survive finding 9),
-   and 2 of `test-tls13-signature-algorithms`.
+   **Then BoGo said no, and it was right to.** The obvious other half of
+   this fix — telling a Finished of the wrong *length* from one that does
+   not verify, decode_error against decrypt_error — broke
+   `TrailingMessageData-TLS13-ServerFinished` and its client twin, which
+   want `decrypt_error` and say so with `:DIGEST_CHECK_FAILED:`. The two
+   corpora genuinely disagree, and each is reading a real sentence:
+   §6.2's rule for lengths, against §4.4.4's "Recipients of Finished
+   messages MUST verify that the contents are correct and if incorrect
+   MUST terminate the connection with a `decrypt_error` alert". A
+   Finished has exactly one field, so its length being wrong *is* its
+   contents being incorrect. §4.4.4 is the more specific rule and this
+   tree follows it, with BoringSSL; OpenSSL and tlsfuzzer take §6.2.
+
+   That leaves the finding split, and the split is the useful part. The
+   length **no hash could be** is settled in the assembler, where the two
+   corpora agree and where it costs nothing to decide. The length that
+   is merely *not this hash* stays `decrypt_error` at the message, where
+   §4.4.4 put it. Shipping only the half both oracles accept is why BoGo
+   is still 278 of 278.
+
+   Moved: `test-tls13-record-layer-limits` **66 of 68 -> 68**, and into
+   `Run` — the two that remained declared 16380 bytes of Finished, which
+   no hash is; and `test-tls13-keyupdate`'s two length cases to green,
+   leaving only finding 10's. `test-tls13-finished` stays at 39 of 42 on
+   the three §4.4.4 costs us, which is a `KEEP` and not a gap.
 8. **A ChangeCipherSpec record's payload is never read.** §5 admits "an
    unencrypted record of type change_cipher_spec **consisting of the
    single byte value 0x01**" inside a stated window, and an
@@ -292,9 +319,11 @@ the shape of the debt that was paid.
 
 | Verdict | Scripts |
 | --- | --- |
-| **OPEN GAP** — a defect we mean to fix | `ccs` (8), `finished` (7), `keyupdate` (7, 10), `legacy-version` (11), `record-layer-limits` (7; 9 closed) |
+| **OPEN GAP** — a defect we mean to fix | `ccs` (8), `legacy-version` (11) |
 | **SCOPE** — needs a capability or a fixture we chose not to carry | `ecdhe-curves`, `ecdsa-support`, `psk_dhe_ke`, `rsapss-signatures`, `serverhello-random`, `session-resumption`, `signature-algorithms` |
-| **Not a defect** — the corpus is stating its own policy, or the harness's shape | `keyupdate-from-server`, `large-number-of-extensions`, `multiple-ccs-messages`, `shuffled-extentions`, `zero-content-type`, `zero-length-data` |
+| **KEEP** — we refuse the input and differ only in the alert, having argued ours | `finished` (7, with BoGo) |
+| **Green, and now in `Run`** | `record-layer-limits` (findings 9 and 7) |
+| **Not a defect** — the corpus is stating its own policy, or the harness's shape | `keyupdate`, `keyupdate-from-server`, `large-number-of-extensions`, `multiple-ccs-messages`, `shuffled-extentions`, `zero-content-type`, `zero-length-data` |
 
 Two patterns are worth carrying forward. The **SCOPE** column is mostly
 fixtures, not protocol: `ecdsa-support` wants a P-384 and a P-521 leaf,

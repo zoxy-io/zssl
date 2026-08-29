@@ -7,6 +7,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const cipher_suite = @import("cipher_suite.zig");
 const wire = @import("wire.zig");
 
 pub const header_bytes: u8 = 4;
@@ -54,6 +55,33 @@ pub const Message = struct {
     }
 };
 
+/// Can a message of this type declare this length at all? §4 fixes the
+/// answer for two of them, and both are decidable from the four header
+/// bytes — before a peer can make anyone hold the body it promised.
+///
+/// Only those two. Every other message is variable-length by grammar,
+/// and its own parser is what bounds it; guessing a ceiling for a
+/// ClientHello here would be a second policy competing with
+/// `client_hello.zig`'s. An unknown type byte passes too — it is
+/// refused as `unexpected_message` a layer up, and answering
+/// decode_error for it here would be the wrong alert for the right
+/// input.
+fn declaredLengthPossible(type_wire: u8, declared: u24) bool {
+    const message_type = MessageType.fromWire(type_wire) orelse return true;
+    return switch (message_type) {
+        // §4.6.3: `struct { KeyUpdateRequest request_update; }` — one
+        // enum byte, and the grammar admits no other size.
+        .key_update => declared == 1,
+        // §4.4.4: verify_data is exactly the negotiated hash's length.
+        // Which hash that is only the caller knows, so this is the
+        // ceiling and not the value — enough to stop the buffering,
+        // while `ServerHandshake` and `ClientHandshake` check the exact
+        // length where the suite is in scope.
+        .finished => declared <= cipher_suite.hash_bytes_max,
+        else => true,
+    };
+}
+
 pub const Assembler = struct {
     buffer: []u8,
     /// Consumed prefix; compacted away on the next push that needs room.
@@ -95,6 +123,15 @@ pub const Assembler = struct {
         if (available < header_bytes) return null;
         const head = self.buffer[self.start..self.used];
         const declared = std.mem.readInt(u24, head[1..4], .big);
+        // Before capacity, because the two are different verdicts and
+        // the order decides which one the peer hears. A length the
+        // message *type* cannot have is a message that cannot exist —
+        // §6.2's decode_error, "the length of the message was
+        // incorrect" — where the capacity failure below says only that
+        // this embedder's buffer is smaller than what arrived. Asking
+        // in the other order let a Finished declaring 16 MiB be
+        // reported as our own buffer being too small.
+        if (!declaredLengthPossible(head[0], declared)) return error.MalformedMessage;
         const total = @as(usize, declared) + header_bytes;
         // A message its own buffer can never hold will never complete;
         // report it now rather than stalling forever at "still arriving".
@@ -134,6 +171,65 @@ test "a message larger than the buffer is an error, not a stall" {
     var storage: [16]u8 = undefined;
     var assembler = Assembler.init(&storage);
     // Declared length 64 in a 16-byte buffer: can never complete.
+    // certificate, because the verdict here is about capacity and a
+    // type whose length is fixed would be refused for the other reason
+    // first — which is the whole point of the test below.
     try assembler.push(&.{ 11, 0, 0, 64 });
     try std.testing.expectError(error.BufferOverflow, assembler.next());
+}
+
+test "a length the message type cannot have is decode_error, not capacity" {
+    // §4.6.3: a KeyUpdate is one byte. Zero and two are both refused,
+    // and refused as malformed rather than as anything about the body,
+    // because four header bytes already settle it.
+    for ([_]u8{ 0, 2, 0xff }) |declared| {
+        var storage: [64]u8 = undefined;
+        var assembler = Assembler.init(&storage);
+        try assembler.push(&.{ 24, 0, 0, declared });
+        try std.testing.expectError(error.MalformedMessage, assembler.next());
+    }
+
+    // §4.4.4: verify_data is the negotiated hash's length, so 48 is the
+    // ceiling across every suite here. One past it is malformed.
+    {
+        var storage: [64]u8 = undefined;
+        var assembler = Assembler.init(&storage);
+        try assembler.push(&.{ 20, 0, 0, 49 });
+        try std.testing.expectError(error.MalformedMessage, assembler.next());
+    }
+
+    // And a Finished declaring far more than any buffer holds is the
+    // same verdict, not a capacity one. This is the ordering that
+    // matters: asked the other way round, a peer's impossible message
+    // came back as *our* buffer being too small, which an embedder
+    // reads as its own misconfiguration.
+    {
+        var storage: [64]u8 = undefined;
+        var assembler = Assembler.init(&storage);
+        try assembler.push(&.{ 20, 0xff, 0xff, 0xff });
+        try std.testing.expectError(error.MalformedMessage, assembler.next());
+    }
+
+    // The lengths the grammar does admit still pass — 48 exactly, and a
+    // one-byte KeyUpdate.
+    {
+        var storage: [64]u8 = undefined;
+        var assembler = Assembler.init(&storage);
+        try assembler.push(&.{ 20, 0, 0, 48 });
+        try std.testing.expectEqual(@as(?Message, null), try assembler.next());
+        try assembler.push(&([_]u8{0xab} ** 48));
+        try std.testing.expectEqual(MessageType.finished, (try assembler.next()).?.messageType().?);
+        try assembler.push(&.{ 24, 0, 0, 1, 1 });
+        try std.testing.expectEqual(MessageType.key_update, (try assembler.next()).?.messageType().?);
+    }
+
+    // A type this parser does not know keeps the capacity answer: it is
+    // refused as unexpected_message a layer up, and decode_error here
+    // would be the wrong alert for the right input.
+    {
+        var storage: [16]u8 = undefined;
+        var assembler = Assembler.init(&storage);
+        try assembler.push(&.{ 0x63, 0, 0, 64 });
+        try std.testing.expectError(error.BufferOverflow, assembler.next());
+    }
 }

@@ -1146,6 +1146,22 @@ fn LadderOf(comptime suite: CipherSuite) type {
             self.send = application_send;
         }
 
+        /// §4.4.4, and one verdict for both ways to fail it: "Recipients
+        /// of Finished messages MUST verify that the contents are
+        /// correct and if incorrect MUST terminate the connection with a
+        /// `decrypt_error` alert." A body that is not the negotiated
+        /// hash's length is contents that are incorrect — the only field
+        /// this message has — so it takes the same answer as one that
+        /// decodes and does not match.
+        ///
+        /// §6.2's decode_error would be the other reading, and tlsfuzzer
+        /// and OpenSSL take it. BoringSSL takes this one, and BoGo's
+        /// `TrailingMessageData-TLS13-*Finished` is where it says so.
+        /// Both corpora run here and they disagree; §4.4.4 is the more
+        /// specific rule and this follows it. docs/TLSFUZZER.md finding 7
+        /// records the split, and the length that *no* hash could be is
+        /// settled earlier, in `handshake.Assembler`, where the two
+        /// corpora agree.
         fn verifyClientFinished(self: *const Self, message: handshake.Message) bool {
             assert(self.schedule != null);
             assert(self.schedule.?.stage == .master);

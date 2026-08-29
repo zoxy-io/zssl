@@ -135,6 +135,13 @@ pub fn SessionKeys(comptime suite: CipherSuite) type {
         /// due. Identical for both roles, which is why it lives here.
         pub fn processKeyUpdate(self: *Self, body: []const u8, out: []u8) Error!?[]const u8 {
             assert(out.len >= record.wire_record_bytes_max);
+            // Unreachable from the wire: `handshake.Assembler` refuses a
+            // KeyUpdate whose *declared* length is not 1 before it ever
+            // becomes a message, and answers decode_error for it, which
+            // is what §6.2 asks of a wrong length. Kept as an error
+            // rather than an assertion because it also guards a caller
+            // that hands this a body it did not get from the assembler,
+            // and that is a mistake to report, not to abort on.
             if (body.len != 1) return error.IllegalKeyUpdate;
             const request_update = switch (body[0]) {
                 0 => false,

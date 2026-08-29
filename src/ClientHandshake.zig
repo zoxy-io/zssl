@@ -1172,6 +1172,10 @@ fn ArmOf(comptime suite: CipherSuite) type {
         fn finishHandshake(self: *Self, message: handshake.Message, send_ccs: bool, out: []u8) Error![]const u8 {
             assert(self.schedule != null);
             assert(self.schedule.?.stage == .handshake);
+            // §4.4.4 gives one verdict to both ways a Finished can be
+            // wrong — see `verifyClientFinished` on the server side for
+            // why this is decrypt_error and not §6.2's decode_error, and
+            // for the two corpora that disagree about it.
             if (message.body().len != hash_bytes) return error.DecryptError;
             const server_key = Schedule.finishedKey(&self.server_handshake_traffic);
             const expected = Schedule.verifyData(&server_key, &self.transcriptHash());
