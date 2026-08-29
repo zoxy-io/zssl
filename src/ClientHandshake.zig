@@ -142,6 +142,9 @@ const LeafKeyKind = enum { none, ecdsa, rsa };
 /// draft-ietf-tls-tlsflags. Not a flag zssl acts on — the extension is
 /// validated and dropped — but §4.6.1's block is checked rather than
 /// skipped, so its grammar has to be known.
+/// §4.2.10, and its shape is the message's: empty in a ClientHello, a
+/// `uint32 max_early_data_size` in a NewSessionTicket.
+const extension_early_data: u16 = 42;
 const extension_tls_flags: u16 = 62;
 
 /// A NewSessionTicket's extension block is short by nature: early data,
@@ -282,6 +285,16 @@ pub const Ticket = struct {
     age_add: u32,
     nonce: []const u8,
     ticket: []const u8,
+    /// §4.6.1's `max_early_data_size`, or null where the ticket
+    /// advertised none — which is every ticket from a server that does
+    /// not accept 0-RTT.
+    ///
+    /// Surfaced rather than acted on: what a client may offer next time
+    /// is a fact about the ticket, and the ticket is the embedder's to
+    /// store. §4.2.10 lets a client offer early data only against a
+    /// ticket that named a limit, so an embedder that drops this number
+    /// has decided against 0-RTT whether it meant to or not.
+    early_data_bytes_max: ?u32 = null,
 };
 
 /// One thing that happened, as `handleRecord` and `drain` hand it back.
@@ -1352,9 +1365,10 @@ fn dispatchPostHandshake(
 ///
 /// §4.2's duplicate rule applies to this block like any other, so the
 /// same pre-pass finding 9 added runs here first.
-fn checkTicketExtensions(block: []const u8) Error!void {
+fn checkTicketExtensions(block: []const u8) Error!?u32 {
     try wire.refuseDuplicateExtensions(ticket_extensions_max, block);
     var cursor = wire.Cursor.init(block);
+    var early_data_bytes_max: ?u32 = null;
     var seen: u16 = 0;
     while (cursor.remaining() > 0) : (seen += 1) {
         if (seen == ticket_extensions_max) return error.ExtensionOverflow;
@@ -1365,8 +1379,18 @@ fn checkTicketExtensions(block: []const u8) Error!void {
         // extension's body is opaque by definition and there is nothing
         // to check it against.
         if (extension_type == extension_tls_flags) try checkTlsFlags(data);
+        if (extension_type == extension_early_data) {
+            // §4.6.1 gives it `uint32 max_early_data_size` here, where a
+            // ClientHello gives it nothing at all — the one extension in
+            // this library whose shape depends on the message carrying
+            // it, and the reason reading the block is not optional.
+            var body = wire.Cursor.init(data);
+            early_data_bytes_max = try body.takeU32();
+            if (body.remaining() != 0) return error.MalformedMessage;
+        }
     }
     assert(cursor.remaining() == 0);
+    return early_data_bytes_max;
 }
 
 /// The `tls_flags` extension: `flags<1..255>`, one bit per flag, and the
@@ -1411,7 +1435,7 @@ fn parseTicket(body: []const u8) Error!Ticket {
     const extensions_bytes = try cursor.takeU16();
     const extensions = try cursor.takeSlice(extensions_bytes);
     if (cursor.remaining() != 0) return error.MalformedMessage;
-    try checkTicketExtensions(extensions);
+    ticket.early_data_bytes_max = try checkTicketExtensions(extensions);
     assert(ticket.nonce.len >= 1);
     assert(ticket.ticket.len >= 1);
     return ticket;

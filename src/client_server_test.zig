@@ -293,6 +293,10 @@ fn issueTicket(
     const ticket_event = (try harness.client.handleRecord(sealed, &buffers.scratch)).?;
     try testing.expectEqual(std.meta.activeTag(ticket_event), .ticket);
     try testing.expectEqual(@as(u32, 3600), ticket_event.ticket.lifetime_s);
+    // §4.6.1's limit reaches the embedder, which is the only way it can
+    // ever decide to offer 0-RTT next time: what a client may send is a
+    // fact about the ticket, and the ticket is the embedder's to store.
+    try testing.expectEqual(@as(?u32, 16384), ticket_event.ticket.early_data_bytes_max);
     var resumption: ClientHandshake.Resumption = .{
         .identity = "sealed-by-us!",
         .obfuscated_age = ticket_event.ticket.age_add,
@@ -2108,4 +2112,72 @@ test "§2: 0.5-RTT data, and the nonce sequence that survives the handoff" {
         index += one.len;
     }
     try testing.expectEqual(expected.len, seen);
+}
+
+test "§4.6.1: a ticket's early_data limit is read, and its grammar held to" {
+    // The extension is empty in a ClientHello and a u32 here — one code
+    // point, two shapes — so the body has to be read rather than
+    // skipped. A block we ignore is still a block we parse, which is
+    // docs/BOGO.md finding 7's rule; this is that rule applied to a
+    // field we now act on.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+    try harness.connect(&buffers);
+
+    // A ticket with no early_data extension at all: null, not zero.
+    // "Advertised nothing" and "advertised a limit of zero" are
+    // different statements and a client must not confuse them.
+    const plain = try harness.server.sendNewSessionTicket(&.{
+        .lifetime_s = 7200,
+        .age_add = 1,
+        .ticket_nonce = &.{0x11},
+        .ticket = "no-early-data",
+    }, &buffers.server_out);
+    const plain_event = (try harness.client.handleRecord(plain, &buffers.scratch)).?;
+    try testing.expectEqual(@as(?u32, null), plain_event.ticket.early_data_bytes_max);
+
+    // Zero is a real answer and reaches the embedder as one.
+    const zero = try harness.server.sendNewSessionTicket(&.{
+        .lifetime_s = 7200,
+        .age_add = 1,
+        .ticket_nonce = &.{0x12},
+        .ticket = "zero-early-data",
+        .early_data_bytes_max = 0,
+    }, &buffers.server_out);
+    const zero_event = (try harness.client.handleRecord(zero, &buffers.scratch)).?;
+    try testing.expectEqual(@as(?u32, 0), zero_event.ticket.early_data_bytes_max);
+
+    // And a body that is not four bytes is a message that did not
+    // decode, whatever it holds.
+    var storage: [256]u8 = undefined;
+    var builder = wire.Builder.init(&storage);
+    const message = handshake.beginMessage(&builder, .new_session_ticket);
+    builder.putU32(7200);
+    builder.putU32(1);
+    builder.putByte(1);
+    builder.putByte(0x13);
+    builder.putU16(5);
+    builder.putSlice("short");
+    const extensions = builder.markU16();
+    builder.putU16(42); // early_data
+    const body = builder.markU16();
+    builder.putU16(0xbeef); // two bytes where §4.6.1 writes four
+    builder.patchU16(body);
+    builder.patchU16(extensions);
+    handshake.endMessage(&builder, message);
+    switch (harness.server.ladder.?) {
+        inline else => |*arm| {
+            const malformed = try arm.session.?.send.seal(
+                .handshake,
+                builder.written(),
+                &buffers.server_out,
+            );
+            try testing.expectError(
+                error.Truncated,
+                harness.client.handleRecord(malformed, &buffers.scratch),
+            );
+        },
+    }
 }
