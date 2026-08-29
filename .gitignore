@@ -15,3 +15,17 @@ devenv.local.nix
 # live in this repository already; the checkout is working state, and
 # committing the directory would embed a repository inside the repository.
 .claude/worktrees/
+
+# Cargo build output for the rustls comparison harness. Cargo.lock is
+# tracked next to it: the numbers in bench/README.md are about one
+# resolved version of rustls, and a lockfile is the only record of which.
+/bench/rustls-bench/target/
+
+# One benchmark run's JSON lines. Generated, and rewritten by every run;
+# the table in bench/README.md is the record that is meant to last.
+/bench/results/
+
+# valgrind drops these next to the binary when a profiled run dies, and
+# they are 8 MiB each. One profiling attempt against the bench harness
+# left two of them a `git add bench/` away from the history.
+vgcore.*

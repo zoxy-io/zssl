@@ -65,7 +65,7 @@
   scripts.zb.exec = ''zig build "$@"'';
   scripts.zt.exec = ''zig build test --summary all "$@"'';
   scripts.zc.exec = ''
-    zig fmt --check src interop bogo tlsanvil tlsfuzzer scripts build.zig build.zig.zon \
+    zig fmt --check src interop bench bogo tlsanvil tlsfuzzer scripts build.zig build.zig.zon \
       && zig build test --summary all \
       && zig build test -Doptimize=ReleaseSafe --summary all \
       && zig build interop
@@ -88,7 +88,7 @@
   # network do not belong in the thing you reach for to check a shell
   # still works. tlsanvil also wants a daemon this shell cannot promise.
   enterTest = ''
-    zig fmt --check src interop bogo tlsanvil tlsfuzzer scripts build.zig build.zig.zon
+    zig fmt --check src interop bench bogo tlsanvil tlsfuzzer scripts build.zig build.zig.zon
     zig build test --summary all
     zig build test -Doptimize=ReleaseSafe --summary all
     zig build interop
