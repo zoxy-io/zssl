@@ -227,24 +227,41 @@ pub fn build(b: *std.Build) void {
     // The rustls comparison harness. Not a gate: it asserts nothing and
     // gates nothing, it only reports numbers.
     //
-    // It pins `ReleaseFast` for itself *and* rebuilds the library and
-    // libcrypto underneath it at `ReleaseFast`, rather than following
-    // `-Doptimize`. A module's optimize mode is its own, so a ReleaseFast
-    // harness importing the default-Debug `zssl_module` would time Debug
-    // zssl through a fast wrapper and report a number about a binary
-    // nobody ships. Cargo has no such trap — `--release` is the whole
-    // dependency graph — so making the two sides agree has to happen
-    // here. See bench/README.md.
+    // It builds the harness *and* the library and libcrypto underneath it
+    // at one mode of its own, rather than following `-Doptimize`. A
+    // module's optimize mode is its own, so a ReleaseFast harness
+    // importing the default-Debug `zssl_module` would time Debug zssl
+    // through a fast wrapper and report a number about a binary nobody
+    // ships. Cargo has no such trap — `--release` is the whole dependency
+    // graph — so making the two sides agree has to happen here.
+    //
+    // `-Dbench-optimize` exists because this tree ships two answers.
+    // ReleaseFast is the default and is what compares against rustls's
+    // `--release`; ReleaseSafe is what CLAUDE.md says release builds
+    // actually ship, and it keeps Zig's bounds and overflow checks *and*
+    // turns libcrypto's UBSan on by default. Quoting one number without
+    // the other would describe a configuration nobody runs. Both are in
+    // bench/README.md. See also the `sanitize_c` note below.
+    const bench_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "bench-optimize",
+        "Optimize mode for the bench harness and everything under it (default ReleaseFast)",
+    ) orelse .ReleaseFast;
     const bench_openssl = b.dependency("openssl", .{
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = bench_optimize,
     });
     const bench_libcrypto = bench_openssl.artifact("crypto");
+    // Load-bearing at ReleaseSafe and Debug, a no-op at ReleaseFast:
+    // Zig turns `-fsanitize=undefined -fsanitize-trap=undefined` on for
+    // C in the first two and off in the last. Set unconditionally so the
+    // bench measures the same libcrypto the gate at line 18 does, whichever
+    // mode it is asked for.
     bench_libcrypto.root_module.sanitize_c = .off;
     const bench_zssl = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = bench_optimize,
     });
     bench_zssl.link_libc = true;
     bench_zssl.linkLibrary(bench_libcrypto);
@@ -252,7 +269,7 @@ pub fn build(b: *std.Build) void {
     const bench_module = b.createModule(.{
         .root_source_file = b.path("bench/zssl_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = bench_optimize,
     });
     bench_module.addImport("zssl", bench_zssl);
     bench_module.addAnonymousImport("cert_pem", .{ .root_source_file = b.path("src/testdata/cert.pem") });
