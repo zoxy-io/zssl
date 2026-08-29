@@ -277,6 +277,7 @@ fn serve(
 
 const Pump = struct {
     io: Io,
+    stream: Io.net.Stream,
     records: zssl.record_buffer.RecordBuffer,
     reader: Io.net.Stream.Reader,
     writer: Io.net.Stream.Writer,
@@ -291,6 +292,7 @@ const Pump = struct {
 
     fn init(pump: *Pump, io: Io, stream: Io.net.Stream) void {
         pump.io = io;
+        pump.stream = stream;
         pump.records = zssl.record_buffer.RecordBuffer.init(&pump.storage);
         pump.reader = stream.reader(io, &pump.read_buffer);
         pump.writer = stream.writer(io, &pump.write_buffer);
@@ -446,10 +448,51 @@ const Pump = struct {
     /// zssl reports the error and leaves the alert to the embedder; the
     /// scripts check which alert arrives, so this table is under test
     /// just as much as the state machine is.
+    /// Send the alert this error deserves, then close in the order that
+    /// lets the peer actually read it.
+    ///
+    /// Writing the alert is not enough, and this cost a day to see. Most
+    /// of these conversations put more bytes on the wire behind the one
+    /// we refuse — `test-tls13-keyupdate` sends its bad KeyUpdate and an
+    /// HTTP request in the same breath — so when we close, those bytes
+    /// are still sitting unread in our receive queue. A `close()` with
+    /// unread data does not send FIN: it sends **RST**, and an RST tells
+    /// the peer to discard its receive buffer, including the alert we
+    /// just wrote. tlsfuzzer reports that as "Unexpected closure from
+    /// peer", which reads exactly like a server that answered nothing.
+    ///
+    /// Whether the peer's trailing bytes had arrived yet is a race, so
+    /// the same conversation passed or failed run to run and the script
+    /// looked flaky rather than broken — 48 to 62 of 62 on an unmodified
+    /// binary, and it was never the connection budget the ledger used to
+    /// blame.
+    ///
+    /// So: half-close first, which flushes the alert and sends FIN, then
+    /// read what the peer had in flight until it closes its own side.
+    /// The drain is bounded because a peer is entitled to never close —
+    /// `connection-abort` has 150 conversations that do exactly that,
+    /// and the watchdog is the backstop for the rest.
     fn abort(pump: *Pump, server: *ServerHandshake, err: anyerror) anyerror {
         const description = alertFor(err) orelse return err;
         pump.write(server.sendAlert(description, &pump.out)) catch {};
+        pump.drainBeforeClose();
         return err;
+    }
+
+    /// Reads left before we stop waiting for a peer to close its side.
+    /// Small: the peer we are talking to has just been sent a fatal
+    /// alert and every well-behaved one closes immediately.
+    const drain_reads_max: u8 = 16;
+
+    fn drainBeforeClose(pump: *Pump) void {
+        pump.stream.shutdown(pump.io, .send) catch return;
+        var reads: u8 = 0;
+        while (reads < drain_reads_max) : (reads += 1) {
+            pump.reader.interface.fill(1) catch return; // EOF, or the watchdog.
+            const available = pump.reader.interface.buffered();
+            if (available.len == 0) return;
+            pump.reader.interface.toss(available.len);
+        }
     }
 };
 

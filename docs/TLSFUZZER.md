@@ -120,13 +120,15 @@ the passing count falls with it and the gate goes red.
 
 ## What it cost to get here
 
-Thirteen defects, all found by running things rather than reading them,
+Fourteen defects, all found by running things rather than reading them,
 and each worth recording because each looked like something else. 1
 through 3 are the harness's and the gate's; 4 through 8, 11, 12 and 13
-are the library's; 9 and 10 are the harness's again, and both were
-mistaken for the library's until the OpenSSL oracle said otherwise —
-while 13 went the other way, filed under 10 as a harness shape until the
-script's *expectation* was read instead of our reply.
+are the library's; 9, 10 and 14 are the harness's again. 9 and 10 were
+mistaken for the library's until the OpenSSL oracle said otherwise; 13
+went the other way, filed under 10 as a harness shape until the script's
+*expectation* was read instead of our reply; and 14 was blamed on two
+different innocent mechanisms before anyone instrumented the line that
+actually sends the alert.
 
 1. **The listener starved.** It is sequential, and tlsfuzzer's abort
    cases deliberately leave sockets that never send again — one held the
@@ -457,10 +459,49 @@ script's *expectation* was read instead of our reply.
     BoGo 278 passed / 0 failed with it, including the compatibility-CCS
     half, which was the part most likely to object.
 
-Five of the thirteen were the harness's or the gate's — three at the
-start, and 9 and 10 found here, both of which read as library defects
-until the oracle disagreed. The other eight are the library's. None of
-the thirteen would have been visible to a gate that was only read.
+14. **(harness) A fatal alert was written, and then thrown away by the
+    close.** `Pump.abort` wrote the alert the table names and returned,
+    and the accept loop closed the socket. That is not enough, and it
+    took three explanations to find out why.
+
+    Most of these conversations put more bytes on the wire behind the
+    one we refuse — `test-tls13-keyupdate` sends its bad KeyUpdate and
+    an HTTP request in the same breath — so at close time those bytes
+    are still unread in our receive queue. A `close()` with unread data
+    does not send FIN, it sends **RST**, and an RST tells the peer to
+    discard its receive buffer *including the alert we just wrote*.
+    tlsfuzzer calls that "Unexpected closure from peer", which reads
+    exactly like a server that answered nothing.
+
+    Whether the peer's trailing bytes had arrived yet is a race, so the
+    same conversation passed or failed run to run: 48 to 62 of 62 on an
+    unmodified binary, with collapses to 35. This ledger blamed the
+    connection budget first and the echo rule second, and both were
+    innocent — an instrumented watchdog fires **zero** times in a run
+    that scores 48, and a full 62-conversation sweep takes 0.65 s
+    against a 5-second deadline. What settled it was instrumenting
+    `abort` itself: **167 alerts sent, zero unmapped errors**. The alert
+    was always written. It was never arriving.
+
+    `abort` now half-closes before draining. `shutdown(.send)` flushes
+    the alert and sends FIN, then the peer's in-flight bytes are read
+    and discarded until it closes its own side. The drain is bounded at
+    16 reads because a peer is entitled never to close —
+    `connection-abort` has 150 conversations that do exactly that — and
+    the connection watchdog stays the backstop. The gate's wall time did
+    not move.
+
+    `test-tls13-keyupdate` **48-62 -> 60-62 of 62**, with the collapses
+    gone. What remains is 0 to 2 conversations, always the same two, and
+    they belong to finding 10 and to §4.6.3's answer-once rather than to
+    this.
+
+Six of the fourteen were the harness's or the gate's — three at the
+start, and 9, 10 and 14 found here. The other eight are the library's.
+None of the fourteen would have been visible to a gate that was only
+read, and three were not visible to a gate that was only *run* either:
+12, 13 and 14 each needed a print statement in the path under suspicion
+before they gave up what they were.
 
 ## The triage of the eighteen
 
