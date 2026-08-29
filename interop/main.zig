@@ -1,21 +1,32 @@
 //! The real-OpenSSL interop gate (slice 5).
 //!
-//! Three legs, all against the `openssl` binary — genuine libssl, a TLS
+//! Four legs, all against the `openssl` binary — genuine libssl, a TLS
 //! stack sharing no line of code with this one, written by different
 //! people over thirty years:
 //!
 //!   1. `openssl s_client` handshakes with our `ServerHandshake`, with
 //!      openssl's own X.509 verifying our Certificate against the
 //!      fixture CA. Its `Verify return code: 0 (ok)` is the assertion.
-//!   2. Our `ClientHandshake` handshakes with `openssl s_server -rev`,
+//!   2. The same leg over a **P-384** leaf. DESIGN.md §1 puts ECDSA
+//!      P-384 in the signing policy and `backend.SignatureScheme` has
+//!      always carried `ecdsa_secp384r1_sha384`, but every fixture in
+//!      this tree was P-256 or RSA — so nothing had ever asked that
+//!      signer for a signature, let alone had one checked. Our own
+//!      tests now sign and verify the curve, and that is one tree
+//!      agreeing with itself; openssl is the first party here that did
+//!      not also produce the signature. The leg asserts the negotiated
+//!      scheme too, because one that quietly settled on P-256 would
+//!      pass while proving nothing.
+//!   3. Our `ClientHandshake` handshakes with `openssl s_server -rev`,
 //!      our certificate policy checking *their* CertificateVerify, and
 //!      our record layer opening the reversed echo they seal back.
-//!   3. The same leg again against an **RSA** server certificate,
+//!   4. The same leg again against an **RSA** server certificate,
 //!      generated here by openssl itself. ECDSA and RSA are different
 //!      code paths in `ClientHandshake.verifyCertificate`, and the RSA
 //!      one exists precisely for upstreams we do not control — so it is
-//!      proven against a real RSA signer rather than a vector. Both legs
-//!      also run the `chain_verifier` seam and assert it saw the chain.
+//!      proven against a real RSA signer rather than a vector. Both
+//!      client legs also run the `chain_verifier` seam and assert it
+//!      saw the chain.
 //!
 //! In both directions application bytes cross afterwards, because a
 //! handshake that completes but cannot carry traffic has proven the
@@ -37,16 +48,27 @@ const zssl = @import("zssl");
 const ClientHandshake = zssl.ClientHandshake;
 const Credentials = zssl.Credentials;
 const ServerHandshake = zssl.ServerHandshake;
+const backend = zssl.backend;
 const record = zssl.record;
 
 const cert_pem = @embedFile("cert_pem");
 const key_pem = @embedFile("key_pem");
+/// The P-384 pair. `backend.SignatureScheme` has carried
+/// `ecdsa_secp384r1_sha384` since the beginning and DESIGN.md §1 puts
+/// P-384 in the signing policy, but every fixture in this tree was P-256
+/// or RSA — so until this leg existed, nothing had ever asked the P-384
+/// signer for a signature a third party then checked.
+const p384_cert_pem = @embedFile("p384_cert_pem");
+const p384_key_pem = @embedFile("p384_key_pem");
 
 /// Written beside the binary so the openssl child can read them; the
 /// fixture is throwaway self-signed material, not a credential.
 const cert_path = "zig-out/interop/cert.pem";
 const key_path = "zig-out/interop/key.pem";
+const p384_cert_path = "zig-out/interop/p384-cert.pem";
+const p384_key_path = "zig-out/interop/p384-key.pem";
 const s_client_log_path = "zig-out/interop/s_client.log";
+const s_client_p384_log_path = "zig-out/interop/s_client_p384.log";
 const s_server_log_path = "zig-out/interop/s_server.log";
 /// Generated at run time rather than embedded: an RSA fixture would be a
 /// second key pair to keep in `src/testdata/`, which is shared with
@@ -93,14 +115,9 @@ pub fn main(init: std.process.Init) !u8 {
     std.debug.print("interop: using {s}\n", .{openssl});
     try writeFixtures(io);
 
-    watchdog_stage.store(1, .release);
-    runServerLeg(io, arena, openssl) catch |err| {
-        std.debug.print("interop: FAIL — s_client against our server ({t})\n", .{err});
-        return 1;
-    };
-    std.debug.print("interop: ok — openssl s_client completed against ServerHandshake\n", .{});
+    if (!runServerLegs(io, arena, openssl)) return 1;
 
-    watchdog_stage.store(2, .release);
+    watchdog_stage.store(3, .release);
     runClientLeg(io, arena, openssl, .{
         .cert_path = cert_path,
         .key_path = key_path,
@@ -113,7 +130,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
     std.debug.print("interop: ok — ClientHandshake completed against openssl s_server (ECDSA)\n", .{});
 
-    watchdog_stage.store(3, .release);
+    watchdog_stage.store(4, .release);
     generateRsaFixture(io, arena, openssl) catch |err| {
         std.debug.print("interop: FAIL — could not generate the RSA fixture ({t})\n", .{err});
         return 1;
@@ -130,9 +147,51 @@ pub fn main(init: std.process.Init) !u8 {
     };
     std.debug.print("interop: ok — ClientHandshake completed against openssl s_server (RSA)\n", .{});
 
-    watchdog_stage.store(4, .release);
-    std.debug.print("interop: PASS — all three legs\n", .{});
+    watchdog_stage.store(5, .release);
+    std.debug.print("interop: PASS — all four legs\n", .{});
     return 0;
+}
+
+/// Legs 1 and 2, which differ only in the leaf they present. Split out
+/// of `main` because `main` should read as the list of phases and was at
+/// TIGER_STYLE's line limit with no room for the next one.
+///
+/// Answers `true` when both passed; the message is printed here, beside
+/// the leg that produced it, rather than handed back for `main` to
+/// re-describe.
+fn runServerLegs(io: Io, arena: std.mem.Allocator, openssl: []const u8) bool {
+    watchdog_stage.store(1, .release);
+    runServerLeg(io, arena, openssl, .{
+        .cert_pem = cert_pem,
+        .key_pem = key_pem,
+        .cert_path = cert_path,
+        .log_path = s_client_log_path,
+        .expect_scheme = .ecdsa_secp256r1_sha256,
+    }) catch |err| {
+        std.debug.print("interop: FAIL — s_client against our server ({t})\n", .{err});
+        return false;
+    };
+    std.debug.print("interop: ok — openssl s_client completed against ServerHandshake\n", .{});
+
+    // The same leg over a P-384 leaf, and its own watchdog stage: folded
+    // into leg 1's, a hang here would be reported under leg 1's name.
+    //
+    // Our own tests sign and verify this curve, but they are one tree
+    // agreeing with itself; openssl verifying the CertificateVerify is
+    // the first party here that did not also produce the signature.
+    watchdog_stage.store(2, .release);
+    runServerLeg(io, arena, openssl, .{
+        .cert_pem = p384_cert_pem,
+        .key_pem = p384_key_pem,
+        .cert_path = p384_cert_path,
+        .log_path = s_client_p384_log_path,
+        .expect_scheme = .ecdsa_secp384r1_sha384,
+    }) catch |err| {
+        std.debug.print("interop: FAIL — s_client against our server, P-384 ({t})\n", .{err});
+        return false;
+    };
+    std.debug.print("interop: ok — openssl s_client completed against ServerHandshake (P-384)\n", .{});
+    return true;
 }
 
 fn watchdogTask(io: Io) void {
@@ -140,9 +199,10 @@ fn watchdogTask(io: Io) void {
     const stage = watchdog_stage.load(.acquire);
     const name = switch (stage) {
         0 => "startup",
-        1 => "s_client against our server",
-        2 => "our client against s_server (ECDSA)",
-        3 => "our client against s_server (RSA)",
+        1 => "s_client against our server (P-256)",
+        2 => "s_client against our server (P-384)",
+        3 => "our client against s_server (ECDSA)",
+        4 => "our client against s_server (RSA)",
         else => "teardown",
     };
     std.debug.print("interop: FAIL — wedged in: {s}\n", .{name});
@@ -198,6 +258,12 @@ fn writeFixtures(io: Io) !void {
     const key = try Io.Dir.cwd().createFile(io, key_path, .{});
     defer key.close(io);
     try key.writeStreamingAll(io, key_pem);
+    const p384_cert = try Io.Dir.cwd().createFile(io, p384_cert_path, .{});
+    defer p384_cert.close(io);
+    try p384_cert.writeStreamingAll(io, p384_cert_pem);
+    const p384_key = try Io.Dir.cwd().createFile(io, p384_key_path, .{});
+    defer p384_key.close(io);
+    try p384_key.writeStreamingAll(io, p384_key_pem);
 }
 
 /// Bind the first free loopback port at or after `port_base`.
@@ -213,14 +279,31 @@ fn listenLoopback(io: Io) !struct { server: Io.net.Server, port: u16 } {
     return error.NoFreePort;
 }
 
-/// Leg 1: `openssl s_client` drives a handshake against our server, then
-/// sends a line of application data which we echo back.
-fn runServerLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8) !void {
+/// What one server leg presents. Two legs differ only in the leaf, and
+/// the leaf is the whole point of the second one: openssl verifying our
+/// CertificateVerify is the only oracle here that did not also produce
+/// the signature.
+const ServerLeg = struct {
+    cert_pem: []const u8,
+    key_pem: []const u8,
+    /// Where `writeFixtures` put the certificate, for openssl's -CAfile.
+    cert_path: []const u8,
+    log_path: []const u8,
+    /// The scheme this leaf must make the server choose. Asserted rather
+    /// than assumed: a leg that silently negotiated P-256 would pass
+    /// while proving nothing about P-384.
+    expect_scheme: backend.SignatureScheme,
+};
+
+/// Legs 1 and 2: `openssl s_client` drives a handshake against our
+/// server, then sends a line of application data which we echo back.
+/// Which leaf we present is `leg`'s to say.
+fn runServerLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8, leg: ServerLeg) !void {
     var listener = try listenLoopback(io);
     defer listener.server.deinit(io);
 
     const connect_arg = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{listener.port});
-    const log = try Io.Dir.cwd().createFile(io, s_client_log_path, .{});
+    const log = try Io.Dir.cwd().createFile(io, leg.log_path, .{});
     defer log.close(io);
     var child = try std.process.spawn(io, .{
         .argv = &.{
@@ -231,7 +314,7 @@ fn runServerLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8) !void {
             // point of the leg is that openssl's X.509 accepts what we
             // present, not that we ship a public CA's signature.
                 "-CAfile",
-            cert_path,     "-verify_return_error",
+            leg.cert_path, "-verify_return_error",
             "-servername", "spike.zoxy.test",
             "-quiet",      "-no_ign_eof",
         },
@@ -248,7 +331,7 @@ fn runServerLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8) !void {
     defer stream.close(io);
 
     var chain_storage: [Credentials.chain_bytes_max]u8 = undefined;
-    var credentials = try Credentials.load(cert_pem, key_pem, &chain_storage, false);
+    var credentials = try Credentials.load(leg.cert_pem, leg.key_pem, &chain_storage, false);
     defer credentials.deinit();
     var reassembly: [16384]u8 = undefined;
     var flight: [Credentials.chain_bytes_max + 1024]u8 = undefined;
@@ -266,6 +349,7 @@ fn runServerLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8) !void {
     var pump: Pump = undefined;
     pump.init(io, stream);
     try pump.handshakeServer(&server);
+    if (server.signature_scheme != leg.expect_scheme) return error.WrongSignatureScheme;
 
     // The peer talks first here: s_client sends what we write to its
     // stdin. One line in, the same line back out.
@@ -285,14 +369,14 @@ fn runServerLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8) !void {
     // assertion this leg exists for.
     switch (term) {
         .exited => |code| if (code != 0) {
-            try printFile(io, arena, s_client_log_path);
+            try printFile(io, arena, leg.log_path);
             return error.SclientFailed;
         },
         else => return error.SclientSignalled,
     }
 }
 
-/// Have openssl mint a throwaway RSA-2048 self-signed leaf for leg 3.
+/// Have openssl mint a throwaway RSA-2048 self-signed leaf for leg 4.
 ///
 /// 2048 bits because it is what the public web overwhelmingly presents,
 /// and because it exercises the 256-byte modulus arm of
@@ -378,7 +462,7 @@ const ClientLegOptions = struct {
     expect_algo: std.meta.Tag(std.crypto.Certificate.Parsed.PubKeyAlgo),
 };
 
-/// Legs 2 and 3: `openssl s_server` accepts one connection from our
+/// Legs 3 and 4: `openssl s_server` accepts one connection from our
 /// client, presenting whichever key type `options` names.
 fn runClientLeg(
     io: Io,

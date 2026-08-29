@@ -132,6 +132,8 @@ pub fn build(b: *std.Build) void {
     interop_module.addImport("zssl", zssl_module);
     interop_module.addAnonymousImport("cert_pem", .{ .root_source_file = b.path("src/testdata/cert.pem") });
     interop_module.addAnonymousImport("key_pem", .{ .root_source_file = b.path("src/testdata/key.pem") });
+    interop_module.addAnonymousImport("p384_cert_pem", .{ .root_source_file = b.path("src/testdata/p384-cert.pem") });
+    interop_module.addAnonymousImport("p384_key_pem", .{ .root_source_file = b.path("src/testdata/p384-key.pem") });
     const interop_exe = b.addExecutable(.{ .name = "zssl-interop", .root_module = interop_module });
     const interop_run = b.addRunArtifact(interop_exe);
     interop_run.has_side_effects = true;

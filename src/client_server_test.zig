@@ -78,7 +78,7 @@ const Harness = struct {
         chain_verifier: ?ClientHandshake.ChainVerifier = null,
         /// The leaf the server presents. RSA draws a fresh PSS salt per
         /// signature, so it cannot run with deterministic nonces.
-        leaf: enum { ecdsa_p256, rsa_2048 } = .ecdsa_p256,
+        leaf: enum { ecdsa_p256, ecdsa_p384, rsa_2048 } = .ecdsa_p256,
     };
 
     fn init(harness: *Harness, options: Options) !void {
@@ -88,6 +88,12 @@ const Harness = struct {
             .ecdsa_p256 => try Credentials.load(
                 @embedFile("testdata/cert.pem"),
                 @embedFile("testdata/key.pem"),
+                &harness.chain_storage,
+                true,
+            ),
+            .ecdsa_p384 => try Credentials.load(
+                @embedFile("testdata/p384-cert.pem"),
+                @embedFile("testdata/p384-key.pem"),
                 &harness.chain_storage,
                 true,
             ),
@@ -678,6 +684,43 @@ test "an RSA leaf signs the server's CertificateVerify and our client accepts it
     const ping = try harness.client.sendApplicationData("rsa", &buffers.client_out);
     const event = try harness.server.handleRecord(ping, &buffers.server_out);
     try testing.expectEqualSlices(u8, "rsa", event.application_data);
+}
+
+test "a P-384 leaf signs with ecdsa_secp384r1_sha384 and our client accepts it" {
+    // DESIGN.md §1 puts ECDSA P-384 in the signing policy, and
+    // `backend.SignatureScheme` has carried `ecdsa_secp384r1_sha384`
+    // since the beginning — but every fixture in this tree was P-256 or
+    // RSA, so no oracle had ever asked the P-384 signer for a signature.
+    // A declared capability nothing exercises is a claim, not a feature.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{ .leaf = .ecdsa_p384 });
+    defer harness.deinit();
+
+    // One scheme, not three: an EC key signs under exactly the digest
+    // its curve names, where an RSA modulus admits all three. That is
+    // the assertion that says the curve reached the policy, rather than
+    // the load merely succeeding.
+    try testing.expectEqualSlices(
+        backend.SignatureScheme,
+        &.{.ecdsa_secp384r1_sha384},
+        harness.credentials.signer.supported(),
+    );
+
+    try harness.connect(&buffers);
+    try testing.expectEqual(ClientHandshake.State.connected, harness.client.state);
+    // Signed by libcrypto, verified by `std.crypto` — the same
+    // no-shared-code split the P-256 and RSA paths draw, and the reason
+    // this is worth a fixture rather than a unit test over the signer.
+    try testing.expect(harness.client.certificate_verified);
+    try testing.expectEqual(
+        backend.SignatureScheme.ecdsa_secp384r1_sha384,
+        harness.server.signature_scheme,
+    );
+
+    const ping = try harness.client.sendApplicationData("p384", &buffers.client_out);
+    const event = try harness.server.handleRecord(ping, &buffers.server_out);
+    try testing.expectEqualSlices(u8, "p384", event.application_data);
 }
 
 test "the signing policy is a load-time refusal, not a mid-flight surprise" {

@@ -108,11 +108,11 @@ the passing count falls with it and the gate goes red.
 
 ## What it cost to get here
 
-Eleven defects, all found by running things rather than reading them, and
+Twelve defects, all found by running things rather than reading them, and
 each worth recording because each looked like something else. 1 through 3
-are the harness's and the gate's; 4 through 8 and 11 are the library's;
-9 and 10 are the harness's again, and both were mistaken for the
-library's until the OpenSSL oracle said otherwise.
+are the harness's and the gate's; 4 through 8, 11 and 12 are the
+library's; 9 and 10 are the harness's again, and both were mistaken for
+the library's until the OpenSSL oracle said otherwise.
 
 1. **The listener starved.** It is sequential, and tlsfuzzer's abort
    cases deliberately leave sockets that never send again — one held the
@@ -322,9 +322,39 @@ library's until the OpenSSL oracle said otherwise.
     sends 0x0303. Recorded as a gap rather than closed because the
     argument runs both ways and §4.2.1's "MUST" is the louder of the two.
 
-Five of the eleven were the harness's or the gate's — three at the start,
+12. **An external PSK's binder cannot verify.** §4.2.11.2 derives
+    `binder_key` from the early secret under one of two labels — "ext
+    binder" for a PSK established out of band, "res binder" for one that
+    came from a NewSessionTicket — and `key_schedule.zig` only ever
+    writes `"res binder"`. So an external PSK is not merely unsupported;
+    it is refused with `decrypt_error`, which reads like a bad key
+    rather than a capability we do not have.
+
+    This was measured, not read. `tlsfuzzer/server.zig` grew `--psk` and
+    `--psk-iden`, the harness's `psk_lookup` answered the script's
+    identity with the script's own 32-byte secret, and a debug print
+    confirmed the lookup matched — `identity=74657374` is `test` — and
+    still every conversation died. The alert is the tell: an identity we
+    do not recognise falls through to a certificate handshake the hello
+    cannot support and yields `handshake_failure`, which is what the
+    first triage saw; an identity we *do* recognise whose binder does
+    not verify yields `decrypt_error`, which is what appeared the moment
+    the flags worked. tlslite writes `"ext binder"` here
+    (`handshakehelpers.py:55`), so the two implementations disagree on
+    the label and on nothing else.
+
+    Closing it is not a fixture and not a flag. `Config.psk_lookup`
+    returns a length and nothing else, so the machine cannot tell which
+    label the PSK it just received deserves — the seam would have to
+    carry the PSK's *kind*, which is a public API change on top of a
+    DESIGN.md §1 that scopes this to "PSK resumption" and a
+    `psk_lookup` whose own doc comment calls itself the resumption seam.
+    The capability was never claimed; the flags were reverted rather
+    than left as machinery with nothing behind them.
+
+Five of the twelve were the harness's or the gate's — three at the start,
 and 9 and 10 found here, both of which read as library defects until the
-oracle disagreed. The other six are the library's. None of the eleven
+oracle disagreed. The other seven are the library's. None of the twelve
 would have been visible to a gate that was only read.
 
 ## The triage of the eighteen
@@ -341,12 +371,34 @@ the shape of the debt that was paid.
 | **Green, and now in `Run`** | `record-layer-limits` (findings 9 and 7), `ccs` (finding 8) |
 | **Not a defect** — the corpus is stating its own policy, or the harness's shape | `keyupdate`, `keyupdate-from-server`, `large-number-of-extensions`, `multiple-ccs-messages`, `shuffled-extentions`, `zero-content-type`, `zero-length-data` |
 
-Two patterns are worth carrying forward. The **SCOPE** column is mostly
-fixtures, not protocol: `ecdsa-support` wants a P-384 and a P-521 leaf,
-`rsapss-signatures` wants a certificate whose key is `id-RSASSA-PSS`, and
-`psk_dhe_ke` wants `--psk`/`--psk-iden` on the harness to seed
-`psk_lookup` with an out-of-band key. Three leaves and two flags would
-move five scripts, and none of that is protocol work.
+Two patterns are worth carrying forward. The **SCOPE** column looked at
+first like mostly fixtures rather than protocol, and an earlier draft of
+this paragraph said three leaves and two flags would move five scripts.
+Building them showed that was optimistic in both directions, so here is
+the measured version:
+
+- **A P-384 leaf is a fixture, and it existed nowhere.** That is the one
+  that was purely missing material: `backend.SignatureScheme` has always
+  carried `ecdsa_secp384r1_sha384`, so the leaf alone was enough. It is
+  now in `src/testdata/` with an interop leg behind it — though
+  `ecdsa-support` still does not go green, because its other four
+  failures are brainpool and P-521.
+- **A P-521 or an `id-RSASSA-PSS` leaf is not a fixture question at
+  all.** Neither `ecdsa_secp521r1_sha512` nor `rsa_pss_pss_*` is in
+  `backend.SignatureScheme`, and DESIGN.md §1 names P-256/P-384 and
+  RSA-PSS-`rsae`. Adding either leaf is a policy change first and a
+  `.pem` second, which is what keeps `ecdsa-support` and
+  `rsapss-signatures` in this column.
+- **`psk_dhe_ke` is not two flags either**, and that took building them
+  to find out — finding 12 below. An external PSK's binder is derived
+  under a different label than a resumption PSK's, and zssl only writes
+  the resumption one.
+
+So: one fixture that was genuinely just a fixture, and three scripts
+that need DESIGN.md to move before any `.pem` or flag would help. The
+estimate this paragraph used to carry was wrong in the same direction
+each time — a missing *capability* reads like a missing fixture right up
+until you supply the fixture.
 
 And every **Not a defect** in the table is a number, not an opinion:
 `shuffled-extentions` and `large-number-of-extensions` score identically
