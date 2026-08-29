@@ -49,6 +49,7 @@ const ClientHandshake = zssl.ClientHandshake;
 const Credentials = zssl.Credentials;
 const ServerHandshake = zssl.ServerHandshake;
 const backend = zssl.backend;
+const client_hello = zssl.client_hello;
 const record = zssl.record;
 
 const cert_pem = @embedFile("cert_pem");
@@ -69,6 +70,7 @@ const p384_cert_path = "zig-out/interop/p384-cert.pem";
 const p384_key_path = "zig-out/interop/p384-key.pem";
 const s_client_log_path = "zig-out/interop/s_client.log";
 const s_client_p384_log_path = "zig-out/interop/s_client_p384.log";
+const s_client_retry_log_path = "zig-out/interop/s_client_retry.log";
 const s_server_log_path = "zig-out/interop/s_server.log";
 /// Generated at run time rather than embedded: an RSA fixture would be a
 /// second key pair to keep in `src/testdata/`, which is shared with
@@ -117,7 +119,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (!runServerLegs(io, arena, openssl)) return 1;
 
-    watchdog_stage.store(3, .release);
+    watchdog_stage.store(4, .release);
     runClientLeg(io, arena, openssl, .{
         .cert_path = cert_path,
         .key_path = key_path,
@@ -130,7 +132,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
     std.debug.print("interop: ok — ClientHandshake completed against openssl s_server (ECDSA)\n", .{});
 
-    watchdog_stage.store(4, .release);
+    watchdog_stage.store(5, .release);
     generateRsaFixture(io, arena, openssl) catch |err| {
         std.debug.print("interop: FAIL — could not generate the RSA fixture ({t})\n", .{err});
         return 1;
@@ -147,16 +149,16 @@ pub fn main(init: std.process.Init) !u8 {
     };
     std.debug.print("interop: ok — ClientHandshake completed against openssl s_server (RSA)\n", .{});
 
-    watchdog_stage.store(5, .release);
-    std.debug.print("interop: PASS — all four legs\n", .{});
+    watchdog_stage.store(6, .release);
+    std.debug.print("interop: PASS — all five legs\n", .{});
     return 0;
 }
 
-/// Legs 1 and 2, which differ only in the leaf they present. Split out
-/// of `main` because `main` should read as the list of phases and was at
-/// TIGER_STYLE's line limit with no room for the next one.
+/// Legs 1 to 3, every one of them `openssl s_client` against our server.
+/// Split out of `main` because `main` should read as the list of phases
+/// and was at TIGER_STYLE's line limit with no room for the next one.
 ///
-/// Answers `true` when both passed; the message is printed here, beside
+/// Answers `true` when all passed; each message is printed here, beside
 /// the leg that produced it, rather than handed back for `main` to
 /// re-describe.
 fn runServerLegs(io: Io, arena: std.mem.Allocator, openssl: []const u8) bool {
@@ -191,6 +193,35 @@ fn runServerLegs(io: Io, arena: std.mem.Allocator, openssl: []const u8) bool {
         return false;
     };
     std.debug.print("interop: ok — openssl s_client completed against ServerHandshake (P-384)\n", .{});
+
+    // §4.1.4 against a foreign implementation. Our server refuses to
+    // speak x25519 here, s_client is told to offer it first — and
+    // openssl sends a key_share only for the first group it names — so
+    // the handshake cannot complete without a HelloRetryRequest and a
+    // second ClientHello answering it.
+    //
+    // `client_server_test` drives the same shape with both of our own
+    // machines, which is one tree agreeing with itself. This is the
+    // first party that did not also build the retry it is answering.
+    watchdog_stage.store(3, .release);
+    runServerLeg(io, arena, openssl, .{
+        .cert_pem = cert_pem,
+        .key_pem = key_pem,
+        .cert_path = cert_path,
+        .log_path = s_client_retry_log_path,
+        .expect_scheme = .ecdsa_secp256r1_sha256,
+        .groups = &.{ client_hello.group_secp256r1, client_hello.group_secp384r1 },
+        .offer_groups = "X25519:P-256",
+        .expect_group = .secp256r1,
+        .expect_retry = true,
+    }) catch |err| {
+        std.debug.print("interop: FAIL — s_client against our server, retry ({t})\n", .{err});
+        return false;
+    };
+    std.debug.print(
+        "interop: ok — openssl s_client completed against ServerHandshake (HelloRetryRequest)\n",
+        .{},
+    );
     return true;
 }
 
@@ -201,8 +232,9 @@ fn watchdogTask(io: Io) void {
         0 => "startup",
         1 => "s_client against our server (P-256)",
         2 => "s_client against our server (P-384)",
-        3 => "our client against s_server (ECDSA)",
-        4 => "our client against s_server (RSA)",
+        3 => "s_client against our server (HelloRetryRequest)",
+        4 => "our client against s_server (ECDSA)",
+        5 => "our client against s_server (RSA)",
         else => "teardown",
     };
     std.debug.print("interop: FAIL — wedged in: {s}\n", .{name});
@@ -293,11 +325,73 @@ const ServerLeg = struct {
     /// than assumed: a leg that silently negotiated P-256 would pass
     /// while proving nothing about P-384.
     expect_scheme: backend.SignatureScheme,
+    /// Our server's group preference. Leaving x25519 out is what makes
+    /// it answer s_client's x25519 share with a HelloRetryRequest.
+    groups: []const u16 = &client_hello.groups_supported,
+    /// What s_client is told to offer, most preferred first; it sends a
+    /// key_share for the first alone, so this decides whether a retry
+    /// happens. Null leaves openssl's default list.
+    offer_groups: ?[]const u8 = null,
+    /// The group the completed handshake must have settled on. Asserted
+    /// for the same reason `expect_scheme` is: a leg that quietly took
+    /// the share it was first offered would pass while proving nothing
+    /// about the preference it set.
+    expect_group: backend.Group = .x25519,
+    /// Whether a HelloRetryRequest must have gone out. Separate from
+    /// `expect_group` on purpose — landing on the demanded group does
+    /// not mean we demanded it, since a peer that key_shares everything
+    /// it offers gets there in one round trip — and asserted in both
+    /// directions, so a leg that means not to retry says so.
+    expect_retry: bool = false,
 };
 
-/// Legs 1 and 2: `openssl s_client` drives a handshake against our
-/// server, then sends a line of application data which we echo back.
-/// Which leaf we present is `leg`'s to say.
+/// The most arguments `serverLegArgv` can write: twelve fixed, plus one
+/// flag and its value.
+const argv_bytes_max: usize = 14;
+
+/// The `s_client` command line for one leg, into caller-owned storage.
+///
+/// Built rather than written out at the call site because `-groups` is
+/// conditional, and a leg that does not care which groups openssl offers
+/// must not silently pin its default list — which is what naming the
+/// flag unconditionally would do.
+fn serverLegArgv(
+    openssl: []const u8,
+    connect_arg: []const u8,
+    leg: ServerLeg,
+    storage: *[argv_bytes_max][]const u8,
+) []const []const u8 {
+    var len: usize = 0;
+    for ([_][]const u8{
+        openssl,       "s_client",
+        "-connect",    connect_arg,
+        "-tls1_3",
+        // Verify our chain against the fixture as its own root: the
+        // point of the leg is that openssl's X.509 accepts what we
+        // present, not that we ship a public CA's signature.
+            "-CAfile",
+        leg.cert_path, "-verify_return_error",
+        "-servername", "spike.zoxy.test",
+        "-quiet",      "-no_ign_eof",
+    }) |arg| {
+        assert(len < storage.len);
+        storage[len] = arg;
+        len += 1;
+    }
+    assert(len == argv_bytes_max - 2);
+    if (leg.offer_groups) |groups| {
+        storage[len] = "-groups";
+        storage[len + 1] = groups;
+        len += 2;
+    }
+    assert(len <= storage.len);
+    return storage[0..len];
+}
+
+/// One `s_client` leg: openssl drives a handshake against our server,
+/// then sends a line of application data which we echo back. What leaf
+/// we present, which groups either side will speak, and what the result
+/// must have negotiated are all `leg`'s to say.
 fn runServerLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8, leg: ServerLeg) !void {
     var listener = try listenLoopback(io);
     defer listener.server.deinit(io);
@@ -305,19 +399,9 @@ fn runServerLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8, leg: Serv
     const connect_arg = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{listener.port});
     const log = try Io.Dir.cwd().createFile(io, leg.log_path, .{});
     defer log.close(io);
+    var argv_storage: [argv_bytes_max][]const u8 = undefined;
     var child = try std.process.spawn(io, .{
-        .argv = &.{
-            openssl,       "s_client",
-            "-connect",    connect_arg,
-            "-tls1_3",
-            // Verify our chain against the fixture as its own root: the
-            // point of the leg is that openssl's X.509 accepts what we
-            // present, not that we ship a public CA's signature.
-                "-CAfile",
-            leg.cert_path, "-verify_return_error",
-            "-servername", "spike.zoxy.test",
-            "-quiet",      "-no_ign_eof",
-        },
+        .argv = serverLegArgv(openssl, connect_arg, leg, &argv_storage),
         .stdin = .pipe,
         .stdout = .{ .file = log },
         .stderr = .{ .file = log },
@@ -341,6 +425,7 @@ fn runServerLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8, leg: Serv
         .credentials = &credentials,
         .server_random = entropy[0..32].*,
         .key_share_private = entropy[32..80].*,
+        .groups = leg.groups,
         .reassembly = &reassembly,
         .flight = &flight,
     });
@@ -348,8 +433,10 @@ fn runServerLeg(io: Io, arena: std.mem.Allocator, openssl: []const u8, leg: Serv
 
     var pump: Pump = undefined;
     pump.init(io, stream);
-    try pump.handshakeServer(&server);
+    const retried = try pump.handshakeServer(&server);
     if (server.signature_scheme != leg.expect_scheme) return error.WrongSignatureScheme;
+    if (server.key_share_group != leg.expect_group) return error.WrongGroup;
+    if (retried != leg.expect_retry) return error.WrongRetryOutcome;
 
     // The peer talks first here: s_client sends what we write to its
     // stdin. One line in, the same line back out.
@@ -685,8 +772,14 @@ const Pump = struct {
         }
     }
 
-    fn handshakeServer(pump: *Pump, server: *ServerHandshake) !void {
+    /// Answers whether a HelloRetryRequest went out on the way. The
+    /// caller cannot infer it from the finished connection: a peer that
+    /// sends a key_share for every group it offers lands on the same
+    /// negotiated group with no retry at all, so the leg that means to
+    /// exercise §4.1.4 has to watch it happen.
+    fn handshakeServer(pump: *Pump, server: *ServerHandshake) !bool {
         var records_seen: u16 = 0;
+        var retried = false;
         while (server.state != .connected) : (records_seen += 1) {
             assert(records_seen < 64);
             const one = try pump.nextRecord();
@@ -695,7 +788,9 @@ const Pump = struct {
                 .connected => {},
                 else => return error.UnexpectedEvent,
             };
+            if (server.state == .awaiting_retry_client_hello) retried = true;
         }
+        return retried;
     }
 
     fn handshakeClient(pump: *Pump, client: *ClientHandshake) !void {

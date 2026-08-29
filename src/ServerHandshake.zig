@@ -145,6 +145,18 @@ pub const Config = struct {
     /// The one protocol this server will negotiate via ALPN, or null to
     /// skip the extension entirely.
     alpn: ?[]const u8 = null,
+    /// Our key-exchange group preference, most wanted first. §4.2.8
+    /// leaves the choice to the server among what the client offered,
+    /// and this is where that choice is made.
+    ///
+    /// Any subset of `client_hello.groups_supported`, in any order;
+    /// `init` asserts each entry is one we can complete, because a group
+    /// we cannot complete is a HelloRetryRequest we would send and then
+    /// be unable to answer. Narrowing it is how a deployment requires a
+    /// curve — and, since a server that accepts x25519 never needs to
+    /// send a retry at all, it is also the only way to put a retry under
+    /// an in-tree test rather than leaving it to BoGo.
+    groups: []const u16 = &client_hello.groups_supported,
     /// Caller-owned space for handshake-message reassembly (client side
     /// of the conversation). A ClientHello budget: 8 KiB is generous.
     reassembly: []u8,
@@ -259,10 +271,16 @@ pub fn init(config: *const Config) ServerHandshake {
     assert(config.flight.len >= Credentials.chain_bytes_max + 1024);
     assert(config.credentials.certificate_count >= 1);
     if (config.alpn) |protocol| assert(protocol.len >= 1);
+    assert(config.groups.len >= 1);
+    assert(config.groups.len <= client_hello.groups_supported.len);
+    for (config.groups) |group| assert(client_hello.groupShareBytes(group) != null);
     return .{
         .state = .awaiting_client_hello,
         .config = config.*,
-        .key_share_group = .x25519,
+        // Overwritten by the first hello, either with what it shared or
+        // with what the retry demands. The default matters only if an
+        // embedder reads it before then.
+        .key_share_group = backend.Group.fromWire(config.groups[0]).?,
         .signature_scheme = config.credentials.signer.supported()[0],
         .ticket_permitted = false,
         .assembler = handshake.Assembler.init(config.reassembly),
@@ -520,14 +538,15 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
         return error.MissingExtension;
     }
     self.ticket_permitted = hello.psk_modes_wire == null or hello.offersPskDheKe();
-    if (hello.preferredKeyShare()) |offered| {
+    if (hello.preferredKeyShare(self.config.groups)) |offered| {
         // §4.2.8 leaves the choice to us among what the client sent.
         self.key_share_group = backend.Group.fromWire(offered.group).?;
         return self.acceptClientHello(&hello, message, suite, selected_psk, out);
     }
     // No share we can use. If the client says it supports a group we
     // hold, demand it (§4.1.4); if it does not, there is no handshake.
-    const wanted = hello.preferredSupportedGroup() orelse return error.HandshakeFailure;
+    const wanted = hello.preferredSupportedGroup(self.config.groups) orelse
+        return error.HandshakeFailure;
     self.key_share_group = backend.Group.fromWire(wanted).?;
     // Remembered rather than re-derived: CH1's bytes are gone by the
     // time CH2 arrives, and §4.1.2 asks what *that* hello carried.
@@ -551,7 +570,7 @@ fn selectPsk(
     suite: CipherSuite,
 ) Error!?SelectedPsk {
     const lookup = self.config.psk_lookup orelse return null;
-    if (hello.preferredKeyShare() == null) return null; // psk_dhe_ke needs a share.
+    if (hello.preferredKeyShare(self.config.groups) == null) return null; // psk_dhe_ke needs a share.
     if (!hello.offersPskDheKe()) return null;
     const offer = (try client_hello.parsePskOffer(hello)) orelse return null;
     assert(offer.count >= 1);

@@ -204,7 +204,12 @@ matter: a peer can spend the whole budget on padding.
    BoGo cases that pressed both halves of that into existence.
    Oracle: both production machines end to end — handshake, resume,
    KeyUpdate both directions with kTLS exports agreeing across machines
-   at every generation.
+   at every generation, and the same pair driven *through* a retry, to
+   `connected` and back with application data. That last one needed
+   `ServerHandshake.Config.groups`, the server's group preference: with
+   x25519 in the list it takes the share our client always sends and
+   never retries, so until the preference could be narrowed the retry
+   path had no in-tree oracle at all and rested on BoGo alone.
 5. **The assurance ladder** — done, in the sense that every rung is
    built; what it *found* is a queue. Landed: nine coverage-guided fuzz
    targets over every parser and both state machines, asserting the one
@@ -213,8 +218,11 @@ matter: a peer can spend the whole budget on padding.
    a panic; `zig build interop`, which runs both directions against the
    real `openssl` binary (genuine libssl, no shared code, real sockets):
    `s_client` completes against `ServerHandshake` with openssl's own
-   X.509 verifying our Certificate, and `ClientHandshake` completes
-   against `s_server` with our policy verifying theirs; and `zig build
+   X.509 verifying our Certificate — over a P-256 leaf, a P-384 one, and
+   a §4.1.4 HelloRetryRequest that openssl answers, asserted to have
+   happened rather than inferred from the group it landed on — and
+   `ClientHandshake` completes against `s_server` with our policy
+   verifying theirs; and `zig build
    bogo`, the adversarial rung — BoringSSL's own hostile-peer runner, at
    a pinned commit, asking what we *refuse*. It found three bugs on its
    first run (a client that never advertised `psk_key_exchange_modes`

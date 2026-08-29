@@ -71,10 +71,15 @@ pub const group_secp256r1: u16 = 0x0017;
 pub const group_secp384r1: u16 = 0x0018;
 pub const group_x25519: u16 = 0x001d;
 
-/// The groups zssl can complete, in the order it prefers them. x25519
-/// first because it is the fastest and the one every modern peer offers;
-/// the NIST curves behind it because a terminating proxy meets clients
-/// that offer nothing else.
+/// The groups zssl can complete, in the order it prefers them by
+/// default. x25519 first because it is the fastest and the one every
+/// modern peer offers; the NIST curves behind it because a terminating
+/// proxy meets clients that offer nothing else.
+///
+/// A *default*, not the only order: `ServerHandshake.Config.groups`
+/// takes any subset in any order, which is what lets a deployment
+/// require a curve — and what lets a test drive a HelloRetryRequest end
+/// to end, since a server that accepts x25519 never needs to send one.
 pub const groups_supported = [_]u16{ group_x25519, group_secp256r1, group_secp384r1 };
 
 /// A KeyShareEntry's share length is fixed by its group (§4.2.8.2): a
@@ -145,18 +150,27 @@ pub const ClientHello = struct {
     /// The first offered share we can complete, in *our* preference
     /// order rather than the client's — §4.2.8 leaves the choice to the
     /// server, and a client's ordering is a hint.
-    pub fn preferredKeyShare(self: *const ClientHello) ?KeyShareEntry {
+    ///
+    /// `preference` is the server's list, most wanted first; every entry
+    /// must be one `groupShareBytes` knows, which `ServerHandshake.init`
+    /// asserts of the config it came from.
+    pub fn preferredKeyShare(self: *const ClientHello, preference: []const u16) ?KeyShareEntry {
         assert(self.key_share_count <= groups_supported.len);
-        for (groups_supported) |group| {
+        assert(preference.len >= 1);
+        for (preference) |group| {
+            assert(groupShareBytes(group) != null);
             if (self.keyShareFor(group)) |share| return .{ .group = group, .share = share };
         }
         return null;
     }
 
-    /// The group we would ask for in a HelloRetryRequest: the first we
-    /// hold that the client says it supports, share or no share.
-    pub fn preferredSupportedGroup(self: *const ClientHello) ?u16 {
-        for (groups_supported) |group| {
+    /// The group we would ask for in a HelloRetryRequest: the first in
+    /// our preference that the client says it supports, share or no
+    /// share.
+    pub fn preferredSupportedGroup(self: *const ClientHello, preference: []const u16) ?u16 {
+        assert(preference.len >= 1);
+        for (preference) |group| {
+            assert(groupShareBytes(group) != null);
             if (self.supportsGroup(group)) return group;
         }
         return null;
@@ -517,7 +531,13 @@ test "parses RFC 8448's ClientHello field for field" {
         &vectors.client_x25519_public,
         hello.keyShareFor(group_x25519).?,
     );
-    try std.testing.expectEqual(group_x25519, hello.preferredKeyShare().?.group);
+    try std.testing.expectEqual(group_x25519, hello.preferredKeyShare(&groups_supported).?.group);
+    // The same hello under a preference that leaves x25519 out has no
+    // share we would take, which is the shape that earns a retry.
+    try std.testing.expectEqual(
+        @as(?KeyShareEntry, null),
+        hello.preferredKeyShare(&.{ group_secp256r1, group_secp384r1 }),
+    );
     // The trace offers 0x1301, 0x1303, 0x1302 in that order.
     try std.testing.expect(hello.offersSuite(.aes_128_gcm_sha256));
     try std.testing.expect(hello.offersSuite(.aes_256_gcm_sha384));

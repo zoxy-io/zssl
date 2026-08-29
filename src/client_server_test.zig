@@ -84,6 +84,10 @@ const Harness = struct {
         /// The client's second key-exchange scalar, and the switch that
         /// lets it answer a HelloRetryRequest at all.
         retry_private: ?[backend.group_private_bytes_max]u8 = null,
+        /// The server's group preference. Leaving x25519 out is what
+        /// makes it retry a client that shares only x25519, which is
+        /// every client this library builds.
+        server_groups: []const u16 = &client_hello_mod.groups_supported,
     };
 
     fn init(harness: *Harness, options: Options) !void {
@@ -114,6 +118,7 @@ const Harness = struct {
             .server_random = .{0x6d} ** 32,
             .key_share_private = server_key_share_private,
             .alpn = options.server_alpn,
+            .groups = options.server_groups,
             .reassembly = &harness.server_reassembly,
             .flight = &harness.flight,
             .psk_lookup = if (store) |context| .{
@@ -141,11 +146,51 @@ const Harness = struct {
         harness.credentials.deinit();
     }
 
-    /// Drive the handshake to `connected` on both machines.
+    /// Drive the handshake to `connected` on both machines, through a
+    /// HelloRetryRequest if the server asks for one.
     fn connect(harness: *Harness, buffers: *Buffers) !void {
         const hello = harness.client.start(&buffers.client_out);
-        const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
+        var flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
         try testing.expectEqual(std.meta.activeTag(flight), .send);
+        if (harness.server.state == .awaiting_retry_client_hello) {
+            // §4.1.4 costs one extra round trip: what came back is the
+            // retry and §D.4's CCS, and the flight proper is what the
+            // second ClientHello earns.
+            var second_storage: [2 * record.wire_record_bytes_max]u8 = undefined;
+            var second_bytes: usize = 0;
+            var index: usize = 0;
+            var count: u8 = 0;
+            while (index < flight.send.len) : (count += 1) {
+                try testing.expect(count < 4);
+                const one = recordAt(flight.send, index);
+                if (try harness.client.handleRecord(one, &buffers.scratch)) |event| {
+                    try testing.expectEqual(std.meta.activeTag(event), .send);
+                    // Copied out rather than held as a slice: the retry
+                    // flight is two records, the second hello comes back
+                    // on the first of them, and the `handleRecord` that
+                    // takes the second is free to write over `scratch` —
+                    // which is where these bytes live until they are
+                    // somewhere else.
+                    @memcpy(second_storage[0..event.send.len], event.send);
+                    second_bytes = event.send.len;
+                }
+                index += one.len;
+            }
+            try testing.expect(second_bytes >= 1);
+            index = 0;
+            count = 0;
+            var answered: ?ServerHandshake.Event = null;
+            while (index < second_bytes) : (count += 1) {
+                try testing.expect(count < 4);
+                const one = recordAt(second_storage[0..second_bytes], index);
+                if (try harness.server.handleRecord(one, &buffers.server_out)) |event| {
+                    answered = event;
+                }
+                index += one.len;
+            }
+            flight = answered orelse return error.TestExpectedFlight;
+            try testing.expectEqual(std.meta.activeTag(flight), .send);
+        }
 
         var reply_storage: [2 * record.wire_record_bytes_max]u8 = undefined;
         var reply_bytes: usize = 0;
@@ -212,6 +257,48 @@ fn expectExportAgreement(server: *const ServerHandshake, client: *const ClientHa
     try testing.expectEqual(server_receive.next_sequence, client_transmit.next_sequence);
 }
 
+/// Issue one NewSessionTicket over a connected pair and hand back what
+/// a second session needs to resume on it: `store` is filled in for the
+/// server's `psk_lookup`, and the `Resumption` is the client's half.
+///
+/// Both ends derive the PSK from their own `resumption_master` and never
+/// exchange it, so the agreement checked here is the whole point of the
+/// derivation — a helper that took one side's copy and handed it to the
+/// other would test nothing.
+fn issueTicket(
+    harness: *Harness,
+    buffers: *Buffers,
+    store: *TicketStore,
+) !ClientHandshake.Resumption {
+    var psk_buffer: [cipher_suite.hash_bytes_max]u8 = undefined;
+    const server_psk = harness.server.resumptionPsk(&.{0x0a}, &psk_buffer);
+    @memset(&store.psk, 0);
+    @memcpy(store.psk[0..server_psk.len], server_psk);
+    @memcpy(store.identity[0..13], "sealed-by-us!");
+    store.identity_bytes = 13;
+    const sealed = try harness.server.sendNewSessionTicket(&.{
+        .lifetime_s = 3600,
+        .age_add = 0x5eed,
+        .ticket_nonce = &.{0x0a},
+        .ticket = "sealed-by-us!",
+    }, &buffers.server_out);
+    const ticket_event = (try harness.client.handleRecord(sealed, &buffers.scratch)).?;
+    try testing.expectEqual(std.meta.activeTag(ticket_event), .ticket);
+    try testing.expectEqual(@as(u32, 3600), ticket_event.ticket.lifetime_s);
+    var resumption: ClientHandshake.Resumption = .{
+        .identity = "sealed-by-us!",
+        .obfuscated_age = ticket_event.ticket.age_add,
+        .psk = undefined,
+        .psk_bytes = 32,
+    };
+    var client_psk_buffer: [cipher_suite.hash_bytes_max]u8 = undefined;
+    const client_psk = harness.client.resumptionPsk(ticket_event.ticket.nonce, &client_psk_buffer);
+    @memset(&resumption.psk, 0);
+    @memcpy(resumption.psk[0..client_psk.len], client_psk);
+    try testing.expectEqualSlices(u8, server_psk, client_psk);
+    return resumption;
+}
+
 test "production client ↔ server: handshake, data, ticket capture, resumption" {
     var buffers: Buffers = .{};
 
@@ -236,33 +323,7 @@ test "production client ↔ server: handshake, data, ticket capture, resumption"
     // A ticket travels server → client through the event surface; the
     // client derives the PSK for it from its own resumption_master.
     var store: TicketStore = undefined;
-    var psk_buffer: [cipher_suite.hash_bytes_max]u8 = undefined;
-    const server_psk = first.server.resumptionPsk(&.{0x0a}, &psk_buffer);
-    @memset(&store.psk, 0);
-    @memcpy(store.psk[0..server_psk.len], server_psk);
-    @memcpy(store.identity[0..13], "sealed-by-us!");
-    store.identity_bytes = 13;
-    const sealed = try first.server.sendNewSessionTicket(&.{
-        .lifetime_s = 3600,
-        .age_add = 0x5eed,
-        .ticket_nonce = &.{0x0a},
-        .ticket = "sealed-by-us!",
-    }, &buffers.server_out);
-    const ticket_event = (try first.client.handleRecord(sealed, &buffers.scratch)).?;
-    try testing.expectEqual(std.meta.activeTag(ticket_event), .ticket);
-    try testing.expectEqual(@as(u32, 3600), ticket_event.ticket.lifetime_s);
-    var resumption: ClientHandshake.Resumption = .{
-        .identity = "sealed-by-us!",
-        .obfuscated_age = ticket_event.ticket.age_add,
-        .psk = undefined,
-        .psk_bytes = 32,
-    };
-    var client_psk_buffer: [cipher_suite.hash_bytes_max]u8 = undefined;
-    const client_psk = first.client.resumptionPsk(ticket_event.ticket.nonce, &client_psk_buffer);
-    @memset(&resumption.psk, 0);
-    @memcpy(resumption.psk[0..client_psk.len], client_psk);
-    // Both ends derived the same PSK from their own resumption_master.
-    try testing.expectEqualSlices(u8, server_psk, client_psk);
+    const resumption = try issueTicket(&first, &buffers, &store);
 
     // Clean close, server first this time.
     const close_record = try first.server.sendClose(&buffers.server_out);
@@ -724,6 +785,85 @@ const ChainSpy = struct {
         return .{ .context = spy, .verify = ChainSpy.verify };
     }
 };
+
+test "end to end through a HelloRetryRequest: working keys, data, agreeing exports" {
+    // The claim the client's HelloRetryRequest support makes and that no
+    // in-tree oracle checked: the group we are retried *into* really
+    // derives working keys against a real peer. BoGo checked it, so
+    // `zig build test` would have stayed green if it broke.
+    //
+    // A server preferring curves our client does not share is the whole
+    // trick, and the reason this needed a config knob before it could be
+    // a test: with x25519 in its list the server takes the share it was
+    // given and never retries, and every client this library builds
+    // shares x25519.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{
+        .server_groups = &.{ client_hello_mod.group_secp256r1, client_hello_mod.group_secp384r1 },
+        .retry_private = .{0x71} ** 48,
+    });
+    defer harness.deinit();
+    try harness.connect(&buffers);
+
+    // A retry really happened — `connect` would have taken the straight
+    // path in silence — and both ends landed on the same group.
+    try testing.expect(harness.client.retried);
+    try testing.expectEqual(backend.Group.secp256r1, harness.server.key_share_group);
+    try testing.expectEqual(client_hello_mod.group_secp256r1, harness.client.share_group);
+    try testing.expect(harness.client.certificate_verified);
+    try testing.expectEqualSlices(u8, "http/1.1", harness.client.alpnSelected().?);
+
+    // Working keys in both directions, and one derivation on each side.
+    const ping = try harness.client.sendApplicationData("over the retry", &buffers.client_out);
+    const ping_event = (try harness.server.handleRecord(ping, &buffers.server_out)).?;
+    try testing.expectEqualSlices(u8, "over the retry", ping_event.application_data);
+    const pong = try harness.server.sendApplicationData("and back", &buffers.server_out);
+    const pong_event = (try harness.client.handleRecord(pong, &buffers.scratch)).?;
+    try testing.expectEqualSlices(u8, "and back", pong_event.application_data);
+    try expectExportAgreement(&harness.server, &harness.client);
+}
+
+test "end to end: a resumed session crosses a HelloRetryRequest" {
+    // `retry_private` and `resume_session` in one handshake against a
+    // real server — the case that would have caught the `resumed`
+    // authentication bypass, where a hello that had dropped its PSK
+    // could still be answered with a `selected_identity`.
+    //
+    // It also drives §4.4.1's binder from both ends at once: the client
+    // computes it over message_hash(CH1) + the retry + the truncated
+    // CH2, and the server verifies it against a transcript it built
+    // independently. The unit tests check each half against a hand-rolled
+    // hash; this checks the two against each other.
+    var buffers: Buffers = .{};
+    var first: Harness = undefined;
+    try first.init(.{});
+    defer first.deinit();
+    try first.connect(&buffers);
+    var store: TicketStore = undefined;
+    const resumption = try issueTicket(&first, &buffers, &store);
+
+    var second: Harness = undefined;
+    try second.init(.{
+        .store = &store,
+        .resume_session = resumption,
+        .server_groups = &.{client_hello_mod.group_secp256r1},
+        .retry_private = .{0x71} ** 48,
+    });
+    defer second.deinit();
+    try second.connect(&buffers);
+    try testing.expect(second.client.retried);
+    try testing.expect(second.client.psk_offered);
+    try testing.expect(second.server.resumed);
+    try testing.expect(second.client.resumed);
+    // Resumed means the PSK authenticated the session: no certificate
+    // leg travelled, and none was verified.
+    try testing.expect(!second.client.certificate_verified);
+    const echo = try second.client.sendApplicationData("resumed over a retry", &buffers.client_out);
+    const echo_event = (try second.server.handleRecord(echo, &buffers.server_out)).?;
+    try testing.expectEqualSlices(u8, "resumed over a retry", echo_event.application_data);
+    try expectExportAgreement(&second.server, &second.client);
+}
 
 test "the chain verifier is shown the peer's chain, leaf first" {
     var buffers: Buffers = .{};
