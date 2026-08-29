@@ -117,6 +117,25 @@ pub const Assembler = struct {
 
     /// The next complete message, or null while one is still arriving.
     /// The slice lives until the next `push`.
+    /// Whether `next` would answer a message rather than null — a
+    /// complete one is already buffered and waiting to be taken.
+    ///
+    /// `empty` is not the same question and cannot answer it: a message
+    /// still arriving leaves bytes behind too, and refusing on those
+    /// would refuse ordinary fragmentation. This exists so that a caller
+    /// which stopped draining can be told so, rather than discovering it
+    /// one record later as a decryption failure.
+    pub fn hasComplete(self: *const Assembler) bool {
+        assert(self.start <= self.used);
+        const available = self.used - self.start;
+        if (available < header_bytes) return false;
+        const head = self.buffer[self.start..self.used];
+        const declared = std.mem.readInt(u24, head[1..4], .big);
+        const total = @as(usize, declared) + header_bytes;
+        if (total > self.buffer.len) return false;
+        return available >= total;
+    }
+
     pub fn next(self: *Assembler) Error!?Message {
         assert(self.start <= self.used);
         const available = self.used - self.start;
@@ -232,4 +251,36 @@ test "a length the message type cannot have is decode_error, not capacity" {
         try assembler.push(&.{ 0x63, 0, 0, 64 });
         try std.testing.expectError(error.BufferOverflow, assembler.next());
     }
+}
+
+test "hasComplete tells a waiting message from one still arriving" {
+    var storage: [64]u8 = undefined;
+    var assembler = Assembler.init(&storage);
+    try std.testing.expect(!assembler.hasComplete());
+
+    // A header alone, then a body one byte short: still arriving, and
+    // saying otherwise would refuse ordinary fragmentation.
+    // encrypted_extensions rather than key_update, because only a
+    // variable-length type can be three bytes long — see the fixed
+    // lengths `declaredLengthPossible` holds types to.
+    try assembler.push(&.{ 8, 0, 0, 3 });
+    try std.testing.expect(!assembler.hasComplete());
+    try assembler.push(&.{ 1, 2 });
+    try std.testing.expect(!assembler.hasComplete());
+    try std.testing.expect(!assembler.empty());
+
+    // The last byte completes it.
+    try assembler.push(&.{3});
+    try std.testing.expect(assembler.hasComplete());
+
+    // Two packed together: taking one leaves the other waiting, which
+    // is exactly the state a caller that stopped draining is in.
+    var fresh = Assembler.init(&storage);
+    try fresh.push(&.{ 24, 0, 0, 1, 0, 24, 0, 0, 1, 1 });
+    try std.testing.expect(fresh.hasComplete());
+    _ = try fresh.next();
+    try std.testing.expect(fresh.hasComplete());
+    _ = try fresh.next();
+    try std.testing.expect(!fresh.hasComplete());
+    try std.testing.expect(fresh.empty());
 }

@@ -234,6 +234,11 @@ pub const Error = backend.Error || protect.Error || session_keys.Error ||
     handshake.Assembler.Error || alert.Error || wire.Error || wire.DuplicateError ||
     flood.Error || error{
     UnexpectedMessage,
+    /// `handleRecord` was called while a post-handshake message from the
+    /// previous record was still waiting. Not the peer's fault and not a
+    /// protocol error: the embedder skipped `drain`. §6 has no alert for
+    /// it, and the connection is still intact — drain, then carry on.
+    EventsPending,
     /// The ServerHello broke a rule: bad echo, unknown suite, missing or
     /// wrong supported_versions, a PSK we never offered.
     BadServerHello,
@@ -371,6 +376,13 @@ pub fn handleRecord(self: *ClientHandshake, wire_record: []const u8, out: []u8) 
     assert(self.state != .failed);
     assert(self.state != .idle);
     errdefer self.state = .failed;
+    // A caller that stopped draining is told so here, rather than
+    // finding out one record later. The extra message is still buffered
+    // and would be taken ahead of this record's, so the peer's KeyUpdate
+    // would rotate its keys while ours stayed put and the *next* record
+    // would fail to open — a decryption failure that says nothing about
+    // its cause. `drain` until `.none`.
+    if (self.assembler.hasComplete()) return error.EventsPending;
     const header = try record.parseHeader(wire_record[0..record.header_bytes]);
     if (wire_record.len != @as(usize, record.header_bytes) + header.length) {
         return error.UnexpectedMessage;
@@ -863,10 +875,61 @@ fn completeHandshake(self: *ClientHandshake, arm: anytype, message: handshake.Me
     return .{ .connected = flight };
 }
 
+/// The next event from a record already handed to `handleRecord`.
+///
+/// One record may carry more than one post-handshake message — a
+/// NewSessionTicket packed with a KeyUpdate is what Go and OpenSSL emit
+/// — so `handleRecord` returns the first and this returns the rest. Call
+/// it until it answers null.
+///
+/// Null rather than `.none` so the caller's loop ends on `orelse` or an
+/// `if (…) |event|` capture: `.none` is a real event meaning "this
+/// record advanced nothing", and a drain that ran out is a different
+/// statement from a record that did nothing.
+///
+/// Every event borrows `out`, this one included, so consume an event
+/// before asking for the next: a ticket's bytes live in the reassembly
+/// buffer and a `.send`'s live in `out`, and the next call may reuse
+/// either.
+pub fn drain(self: *ClientHandshake, out: []u8) Error!?Event {
+    assert(out.len >= out_bytes_min);
+    // Only the post-handshake stream is drained. The server's flight is
+    // assembled by `drainFlight`, which already reads every message a
+    // record carried.
+    if (self.state == .awaiting_flight) return null;
+    if (!self.readable()) return null;
+    if (self.ladder == null) return null;
+    errdefer self.state = .failed;
+    switch (self.ladder.?) {
+        inline else => |*arm| {
+            // Null comes from the *assembler* having nothing, never from
+            // what a message resolved to. A KeyUpdate carrying
+            // update_not_requested is consumed and produces `.none`, and
+            // reading that as "the record is done" would strand whatever
+            // the peer packed behind it — an order the peer chooses, so
+            // the strand is reachable from the wire.
+            const message = (try self.assembler.next()) orelse return null;
+            return try self.dispatchPostHandshake(arm, message, out);
+        },
+    }
+}
+
 fn handlePostHandshake(self: *ClientHandshake, arm: anytype, out: []u8) Error!Event {
     assert(self.readable());
     const message = (try self.assembler.next()) orelse return .none;
-    if (!self.assembler.empty()) return error.UnexpectedMessage;
+    return self.dispatchPostHandshake(arm, message, out);
+}
+
+/// One post-handshake message, already pulled from the assembler.
+/// Shared by `handleRecord` and `drain` so that a message means the same
+/// thing whichever asked for it, and so that neither can infer "no more
+/// messages" from what this returned.
+fn dispatchPostHandshake(
+    self: *ClientHandshake,
+    arm: anytype,
+    message: handshake.Message,
+    out: []u8,
+) Error!Event {
     switch (message.messageType() orelse return error.UnexpectedMessage) {
         .new_session_ticket => return .{ .ticket = try parseTicket(message.body()) },
         .key_update => {

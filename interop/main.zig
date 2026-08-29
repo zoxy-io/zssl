@@ -636,29 +636,49 @@ const Pump = struct {
         var records_seen: u16 = 0;
         var tickets_seen: u16 = 0;
         while (records_seen < 64) : (records_seen += 1) {
-            assert(tickets_seen <= records_seen);
+            // Deliberately not `assert(tickets_seen <= records_seen)`.
+            // That held only while one record meant at most one event,
+            // and a real openssl server sends two NewSessionTickets —
+            // packed into one record, which is the shape this gate now
+            // exists to prove works. The count is the peer's to choose
+            // and is bounded by §5's record cap, not by how many records
+            // it took; asserting a relationship the peer controls is how
+            // a harness aborts against a compliant server.
             const one = try pump.nextRecord();
-            const event = try machine.handleRecord(one, &pump.out);
-            switch (event) {
-                .application_data => |bytes| {
-                    @memcpy(pump.plaintext[0..bytes.len], bytes);
-                    pump.plaintext_bytes = bytes.len;
-                    return pump.plaintext[0..bytes.len];
-                },
-                .none, .send => {},
-                else => {
-                    // A real openssl server issues NewSessionTickets
-                    // right after the handshake; parsing them without
-                    // incident is itself a small proof, and they are
-                    // not what we came to read here. Matched by tag
-                    // name because only the client machine has the
-                    // variant, and this helper serves both.
-                    if (!std.mem.eql(u8, @tagName(event), "ticket")) {
-                        return error.UnexpectedEvent;
-                    }
-                    tickets_seen += 1;
-                },
+            // Drained rather than taken one event at a time: a real
+            // openssl server packs its NewSessionTickets, and the record
+            // that carries the application data may carry them too. The
+            // whole record is consumed before the next is read, because
+            // `handleRecord` refuses to run with events still pending.
+            var found: ?[]const u8 = null;
+            var event = try machine.handleRecord(one, &pump.out);
+            // lint:unbounded-ok — each pass takes one complete message from a
+            // fixed reassembly buffer that only `handleRecord` refills, and
+            // `drain` answers null once none remain.
+            while (true) {
+                switch (event) {
+                    .application_data => |bytes| {
+                        @memcpy(pump.plaintext[0..bytes.len], bytes);
+                        pump.plaintext_bytes = bytes.len;
+                        found = pump.plaintext[0..bytes.len];
+                    },
+                    .none, .send => {},
+                    else => {
+                        // A real openssl server issues NewSessionTickets
+                        // right after the handshake; parsing them without
+                        // incident is itself a small proof, and they are
+                        // not what we came to read here. Matched by tag
+                        // name because only the client machine has the
+                        // variant, and this helper serves both.
+                        if (!std.mem.eql(u8, @tagName(event), "ticket")) {
+                            return error.UnexpectedEvent;
+                        }
+                        tickets_seen += 1;
+                    },
+                }
+                event = (try machine.drain(&pump.out)) orelse break;
             }
+            if (found) |bytes| return bytes;
         }
         return error.NoApplicationData;
     }

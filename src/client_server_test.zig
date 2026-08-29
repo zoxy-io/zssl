@@ -1367,3 +1367,75 @@ test "§6.1: a close before there is a connection closes the machine, not half o
         try testing.expect(!harness.client.readable());
     }
 }
+
+test "§5.1: a record packing three post-handshake messages yields all three" {
+    // Finding 1's second half, and the case that broke it. `drain` must
+    // decide "nothing more" from the *assembler*, never from what the
+    // last message resolved to: a KeyUpdate carrying
+    // update_not_requested is consumed and produces no event, and
+    // reading that as "the record is done" strands whatever was packed
+    // behind it. The peer chooses the order, so the strand is reachable
+    // from the wire — and the next `handleRecord` would then answer
+    // `EventsPending`, blaming an embedder that did everything right.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+    try harness.connect(&buffers);
+
+    // ticket, KeyUpdate(update_not_requested), ticket — in one record.
+    var plaintext: [256]u8 = undefined;
+    var b = wire.Builder.init(&plaintext);
+    for (0..2) |round| {
+        const ticket = handshake.beginMessage(&b, .new_session_ticket);
+        b.putU32(7200); // lifetime
+        b.putU32(0); // age_add
+        b.putByte(1); // ticket_nonce<1>
+        b.putByte(@intCast(round));
+        b.putU16(1); // ticket<1>
+        b.putByte(0xa0 + @as(u8, @intCast(round)));
+        b.putU16(0); // no extensions
+        handshake.endMessage(&b, ticket);
+        if (round == 0) {
+            const update = handshake.beginMessage(&b, .key_update);
+            b.putByte(0); // update_not_requested: consumed, no reply
+            handshake.endMessage(&b, update);
+        }
+    }
+
+    var seen: [2]u8 = undefined;
+    var tickets: usize = 0;
+    switch (harness.server.ladder.?) {
+        inline else => |*arm| {
+            const sealed = try arm.session.?.send.seal(.handshake, b.written(), &buffers.server_out);
+            // §4.6.3: the sender emits under the current generation and
+            // rotates after. Forging the message without this would
+            // leave the client's receive side a generation ahead of the
+            // server's send side, and the follow-up record below would
+            // fail to open for a reason that is the test's fault.
+            try arm.session.?.rotateTransmit();
+            var event = try harness.client.handleRecord(sealed, &buffers.scratch);
+            while (true) {
+                if (std.meta.activeTag(event) == .ticket) {
+                    seen[tickets] = event.ticket.ticket[0];
+                    tickets += 1;
+                }
+                event = (try harness.client.drain(&buffers.scratch)) orelse break;
+            }
+        },
+    }
+
+    // Both tickets, not just the one ahead of the KeyUpdate.
+    try testing.expectEqual(@as(usize, 2), tickets);
+    try testing.expectEqualSlices(u8, &.{ 0xa0, 0xa1 }, &seen);
+
+    // And nothing is left behind: a following record is accepted rather
+    // than refused as `EventsPending`.
+    switch (harness.server.ladder.?) {
+        inline else => |*arm| {
+            const data = try arm.session.?.sealApplicationData("after", &buffers.server_out);
+            const event = try harness.client.handleRecord(data, &buffers.scratch);
+            try testing.expectEqualStrings("after", event.application_data);
+        },
+    }
+}

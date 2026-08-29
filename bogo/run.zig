@@ -35,11 +35,11 @@ const boringssl_url = "https://boringssl.googlesource.com/boringssl";
 const boringssl_commit = "193233b86d6cbbc20ce30c06a8775311c11be0c4";
 
 /// What the pin above scored on 2026-08-28, on a tree with every fix
-/// the BoGo and RSA slices landed, plus findings 4, 5, 6, 7, 9, 10 and
-/// half of 1.
+/// the BoGo and RSA slices landed, plus every finding 1 through 12 that
+/// was a defect.
 /// Raise it whenever a fix moves the number up; a drop is either a
 /// regression or a suppression, and both deserve to stop the build.
-const passing_floor: u32 = 275;
+const passing_floor: u32 = 278;
 
 const work_dir = "zig-out/bogo";
 const checkout_dir = work_dir ++ "/boringssl";

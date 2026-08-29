@@ -41,21 +41,22 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**275 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. 144 drive
-`ClientHandshake` and 131 drive `ServerHandshake`. The server number was
+**278 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. 146 drive
+`ClientHandshake` and 132 drive `ServerHandshake`. The server number was
 6 until RSA signing landed, 100 until secp256r1/secp384r1 did, 110 until
 §9.2's `missing_extension` did, 111 until §5.4's inner-plaintext cap did,
 113 until eight suppressions turned out to be describing bugs that were
 already fixed, 121 until finding 8 was taken apart, 124 until §4.2.9's
 psk_key_exchange_modes was enforced, 127 until §4.2's duplicate rule
-did, and 128 until §4.2.11's binder rules were told apart. The client
+did, 128 until §4.2.11's binder rules were told apart, and 131 until one
+record could yield more than one event. The client
 number was 121 until §4.2's unsupported_extension landed, 134 until
 finding 4's flood ceilings did, 136 until finding 5 stopped refusing
 `user_canceled`, 139 until that same duplicate rule, 140 until finding 6
 split the close in two, 141 until finding 7 read the ticket's
-extension block, and 143 until §4.6.3's update requests were coalesced;
-see below.
+extension block, and 143 until §4.6.3's update requests were coalesced, and
+144 until one record could yield more than one event; see below.
 
 **0 failed** is the gate. A case the runner runs and we cannot satisfy
 either gets fixed or gets an entry in `DisabledTests` with a one-line
@@ -136,14 +137,15 @@ Three bugs, fixed in this slice:
    flight was at least 500 bytes, which a legitimately small ECDSA leaf
    falsifies. The floor is now the encoded chain's own size.
 
-Twelve more were open. Nine are fixed outright — 2, 3, 4, 5, 6, 7, 9, 10
-and 12 — and four still carry ledger entries, 11 suppressed cases
-between them: 3 under finding 1, 5 under 10, 2 under 8 and 1 under 11.
-Only one of those four is a gap in the sense the word implies — finding
-1, the packed post-handshake record. 8 is down to two divergences we
-intend to keep, 11 is a documented non-defect, and finding 10's
-remaining 5 are a scope decision filed under its number rather than an
-open defect, which is why a fixed finding still has entries.
+Twelve more were open, and every one that was a defect is now fixed: 1,
+2, 3, 4, 5, 6, 7, 9, 10 and 12. Three findings still carry ledger
+entries, 8 suppressed cases between them — 5 under finding 10, 2 under
+8, 1 under 11 — and **none of them is an OPEN GAP**. Finding 8 is two
+divergences we intend to keep, 11 is a documented non-defect, and
+finding 10's remaining 5 are a scope decision filed under its number,
+which is why findings marked fixed still have entries against them.
+`grep 'OPEN GAP' bogo/config.json` returns nothing, which is the whole
+point of reserving that phrase for defects.
 All twelve keep their numbers rather than being renumbered, because the
 ledger cites them by number.
 
@@ -154,26 +156,49 @@ The got-versus-want the runner printed for the other 44 is what the
 descriptions below now say, rather than what anyone inferred from a case
 name.
 
-1. **Only one post-handshake message per record**, and — a second
-   defect this entry was hiding — one KeyUpdate answered per request
-   rather than per run of them. Four cases, of which three are the first
-   and one was never it.
+1. **FIXED — only one post-handshake message per record**, and — a
+   second defect this entry was hiding — one KeyUpdate answered per
+   request rather than per run of them. Four cases, of which three were
+   the first and one was never it.
 
-   `handlePostHandshake` refuses a non-empty assembler, so two
-   NewSessionTickets in one record — or a ticket packed with a KeyUpdate,
-   which both Go and OpenSSL emit — is `UnexpectedMessage`. Legal,
-   common, and refused. That needs the event surface to grow a way to
-   drain more than one event per record, and is what
-   `Shutdown-Runner-TLS-Sync-PackHandshake`,
-   `TLS13-1RTT-Client-TLS-Sync-PackHandshake` and
-   `Shutdown-Shim-KeyUpdate-TLS-Sync-PackHandshake` still wait on.
+   **FIXED.** `handlePostHandshake` refused a non-empty assembler, so
+   two NewSessionTickets in one record — or a ticket packed with a
+   KeyUpdate, which both Go and OpenSSL emit — was `UnexpectedMessage`.
+   Legal, common, and refused.
 
-   The third of those joined when finding 6 made the shim read after its
-   own close_notify instead of returning: the case was passing because
-   nothing looked at it, and looking found this gap rather than a new
-   one. Its `-TLS-Sync` and `-SplitHandshakeRecords` siblings still
-   pass, which is what isolates the cause to packing rather than to the
-   shutdown path.
+   The event surface grew a way to say "there is more": `drain` returns
+   the next event from a record `handleRecord` already took, and null
+   once none remain. Null rather than `.none`, because `.none` is a real
+   event meaning "this record advanced nothing" and a drain that ran out
+   is a different statement.
+
+   Two things fell out of building it, and both are the same mistake in
+   different clothes — inferring "no more messages" from something other
+   than the assembler.
+
+   The first was mine and the review caught it. `drain` on the client
+   collapsed `.none` into null, and `.none` is what a KeyUpdate carrying
+   update_not_requested produces after being *consumed*. A peer packing
+   `[ticket, KeyUpdate, ticket]` therefore got its second ticket
+   stranded, and the next `handleRecord` blamed the embedder for it with
+   `EventsPending` — a guard meant for embedder error, reachable from
+   the wire. Null now comes only from `assembler.next()` having nothing,
+   and both roles share one dispatch so neither can drift.
+
+   The second is why that guard exists at all. `Assembler.push` appends
+   *after* pending bytes, so an embedder that never drains does not lose
+   the extra message: it takes it one record late, against receive keys
+   the peer has already rotated past, and the symptom is
+   `AuthenticationFailed` on a record that is perfectly good.
+   `hasComplete` tells a waiting message from an arriving one — `empty`
+   cannot — so `handleRecord` can say `EventsPending` instead.
+
+   `Shutdown-Shim-KeyUpdate-TLS-Sync-PackHandshake` joined this finding
+   when finding 6 made the shim read after its own close_notify instead
+   of returning: it had been passing because nothing looked at it. Its
+   `-TLS-Sync` and `-SplitHandshakeRecords` siblings kept passing
+   throughout, which is what isolated the cause to packing rather than
+   to the shutdown path.
 
    **FIXED — `KeyUpdate-Requested` was not this gap at all**, and only
    running it said so: our stderr was empty, because we never errored,

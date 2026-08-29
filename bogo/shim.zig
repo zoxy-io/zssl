@@ -715,6 +715,43 @@ const Pump = struct {
         return err;
     }
 
+    /// One event, acted on. Answers true when the connection is over.
+    ///
+    /// Split out because `handleRecord` and `drain` produce the same
+    /// events and a record may produce several: a reply that lived in
+    /// the loop would have to be written twice, and the second copy is
+    /// where the two would drift apart.
+    fn act(pump: *Pump, machine: anytype, store: *TicketStore, event: anytype) !bool {
+        switch (event) {
+            .application_data => |bytes| {
+                if (bytes.len == 0) return false;
+                assert(bytes.len <= pump.scratch.len);
+                for (bytes, 0..) |byte, index| pump.scratch[index] = byte ^ 0xff;
+                const sealed = machine.sendApplicationData(
+                    pump.scratch[0..bytes.len],
+                    &pump.out,
+                ) catch |err| return pump.abort(machine, err);
+                try pump.write(sealed);
+            },
+            // The peer closed its write side. §6.1 leaves ours open and
+            // an embedder may answer, which zssl now models — but BoGo's
+            // cases here do not ask for a reply, so the socket close is
+            // still the whole of it.
+            .closed => return true,
+            .send => |bytes| try pump.write(bytes),
+            .none => {},
+            // Only the client machine has `ticket`, so the branch is
+            // chosen by the machine's type rather than the tag — the
+            // server arm never analyses a field it lacks.
+            else => if (@TypeOf(machine.*) == ClientHandshake) {
+                captureTicket(machine, event, store);
+            } else {
+                return error.UnexpectedEvent;
+            },
+        }
+        return false;
+    }
+
     /// After our own close_notify. §6.1 closes one direction at a time,
     /// so the read side is still open and the peer's answer still
     /// arrives — its close_notify, or an alert instead of one, or
@@ -745,11 +782,20 @@ const Pump = struct {
             // close_notify, so the error is reported and nothing is
             // written. `Unclean-Shutdown-Alert` is the case that reads
             // it.
-            const event = machine.handleRecord(one, &pump.out) catch |err| {
+            var event = machine.handleRecord(one, &pump.out) catch |err| {
                 pump.linger();
                 return err;
             };
-            if (event == .closed) return;
+            // lint:unbounded-ok — each pass takes one complete message from a
+            // fixed reassembly buffer that only `handleRecord` refills, and
+            // `drain` answers null once none remain.
+            while (true) {
+                if (std.meta.activeTag(event) == .closed) return;
+                event = (machine.drain(&pump.out) catch |err| {
+                    pump.linger();
+                    return err;
+                }) orelse break;
+            }
         }
         return error.TooManyRecords;
     }
@@ -797,35 +843,20 @@ const Pump = struct {
                 },
                 else => return err,
             };
-            const event = machine.handleRecord(one, &pump.out) catch |err| {
+            // One record can carry more than one post-handshake
+            // message, so every event it produced is taken before the
+            // next record is read. `.none` is the end of that run.
+            var event = machine.handleRecord(one, &pump.out) catch |err| {
                 return pump.abort(machine, err);
             };
-            switch (event) {
-                .application_data => |bytes| {
-                    if (bytes.len == 0) continue;
-                    assert(bytes.len <= pump.scratch.len);
-                    for (bytes, 0..) |byte, index| pump.scratch[index] = byte ^ 0xff;
-                    const sealed = machine.sendApplicationData(
-                        pump.scratch[0..bytes.len],
-                        &pump.out,
-                    ) catch |err| return pump.abort(machine, err);
-                    try pump.write(sealed);
-                },
-                // The peer closed its write side. §6.1 leaves ours
-                // open and an embedder may answer, which zssl now
-                // models — but BoGo's cases here do not ask for a
-                // reply, so the socket close is still the whole of it.
-                .closed => return,
-                .send => |bytes| try pump.write(bytes),
-                .none => {},
-                // Only the client machine has `ticket`, so the branch
-                // is chosen by the machine's type rather than the tag —
-                // the server arm never analyses a field it lacks.
-                else => if (@TypeOf(machine.*) == ClientHandshake) {
-                    captureTicket(machine, event, store);
-                } else {
-                    return error.UnexpectedEvent;
-                },
+            // lint:unbounded-ok — each pass takes one complete message from a
+            // fixed reassembly buffer that only `handleRecord` refills, and
+            // `drain` answers null once none remain.
+            while (true) {
+                if (try pump.act(machine, store, event)) return;
+                event = (machine.drain(&pump.out) catch |err| {
+                    return pump.abort(machine, err);
+                }) orelse break;
             }
         }
         return error.TooManyRecords;

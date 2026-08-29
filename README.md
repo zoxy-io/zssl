@@ -14,12 +14,22 @@ sockets, no threads, and no memory: you feed it whole TLS records and
 transmit whatever it hands back.
 
 ```zig
-switch (try server.handleRecord(wire_record, &out)) {
-    .send => |bytes| try socket.writeAll(bytes),
-    .application_data => |plaintext| try onRequest(plaintext),
-    .connected, .closed, .none => {},
+var event = try server.handleRecord(wire_record, &out);
+// lint:unbounded-ok — `drain` answers null once the record's
+// messages are used up.
+while (true) {
+    switch (event) {
+        .send => |bytes| try socket.writeAll(bytes),
+        .application_data => |plaintext| try onRequest(plaintext),
+        .connected, .closed, .none => {},
+    }
+    event = try server.drain(&out) orelse break;
 }
 ```
+
+One record can carry more than one message, so `drain` hands back what
+is left until it answers null. Skipping it is caught rather than left to
+lag: the next `handleRecord` answers `EventsPending`.
 
 That shape is the whole interface, and it is what makes zssl usable from
 an `io_uring` event loop, a thread-per-connection server, or a
@@ -116,18 +126,30 @@ arrive:
 ```zig
 var out: [zssl.ServerHandshake.out_bytes_min]u8 = undefined;
 
-while (try records.next()) |wire_record| {
-    switch (try server.handleRecord(wire_record, &out)) {
-        // Handshake bytes to put on the wire.
-        .send => |bytes| try socket.writeAll(bytes),
-        // The session is up; app data may now flow both ways.
-        .connected => {},
-        // Decrypted application bytes, valid until the next call.
-        .application_data => |plaintext| try onRequest(plaintext),
-        // The peer sent close_notify.
-        .closed => break,
-        // A record that advanced nothing — a fragment, or a CCS.
-        .none => {},
+stream: while (try records.next()) |wire_record| {
+    // One record can hold several messages — a NewSessionTicket packed
+    // with a KeyUpdate is what Go and OpenSSL emit — so take events
+    // until `drain` answers null. Each borrows `out`, so act on one
+    // before asking for the next.
+    var event = try server.handleRecord(wire_record, &out);
+    // lint:unbounded-ok — each pass takes one complete message from a
+    // fixed reassembly buffer that only `handleRecord` refills, and
+    // `drain` answers null once none remain.
+    while (true) {
+        switch (event) {
+            // Handshake bytes to put on the wire.
+            .send => |bytes| try socket.writeAll(bytes),
+            // The session is up; app data may now flow both ways.
+            .connected => {},
+            // Decrypted application bytes, valid until the next call.
+            .application_data => |plaintext| try onRequest(plaintext),
+            // The peer sent close_notify. The label is not decoration —
+            // an unlabelled break would leave only the drain loop.
+            .closed => break :stream,
+            // A record that advanced nothing — a fragment, or a CCS.
+            .none => {},
+        }
+        event = try server.drain(&out) orelse break;
     }
 }
 
@@ -158,13 +180,20 @@ defer client.deinit();
 
 try socket.writeAll(client.start(&out));
 
-while (try records.next()) |wire_record| {
-    switch (try client.handleRecord(wire_record, &out)) {
-        .send, .connected => |bytes| try socket.writeAll(bytes),
-        .application_data => |plaintext| try onResponse(plaintext),
-        .ticket => |ticket| try store(ticket),
-        .closed => break,
-        .none => {},
+stream: while (try records.next()) |wire_record| {
+    var event = try client.handleRecord(wire_record, &out);
+    // lint:unbounded-ok — each pass takes one complete message from a
+    // fixed reassembly buffer that only `handleRecord` refills, and
+    // `drain` answers null once none remain.
+    while (true) {
+        switch (event) {
+            .send, .connected => |bytes| try socket.writeAll(bytes),
+            .application_data => |plaintext| try onResponse(plaintext),
+            .ticket => |ticket| try store(ticket),
+            .closed => break :stream,
+            .none => {},
+        }
+        event = try client.drain(&out) orelse break;
     }
 }
 ```
@@ -252,7 +281,7 @@ its own CI workflow, so they run in parallel and fail separately.
 
 | Oracle | Status | Details |
 | --- | --- | --- |
-| [**BoGo**](docs/BOGO.md) | [![bogo](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml)<br>[![bogo passing](https://img.shields.io/badge/bogo-275%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | Hostile-peer corpus; checks *which* alert we send |
+| [**BoGo**](docs/BOGO.md) | [![bogo](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml)<br>[![bogo passing](https://img.shields.io/badge/bogo-278%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6918%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | Hostile-peer corpus; checks *which* alert we send |
 | [**tlsfuzzer**](docs/TLSFUZZER.md) | [![tlsfuzzer](https://github.com/zoxy-io/zssl/actions/workflows/tlsfuzzer.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/tlsfuzzer.yml)<br>[![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-16%2F57%20scripts-yellow)](docs/TLSFUZZER.md) | A third implementation, driving our *server* |
 | [**TLS-Anvil**](docs/TLSANVIL.md) | [![tlsanvil](https://github.com/zoxy-io/zssl/actions/workflows/tlsanvil.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/tlsanvil.yml)<br>[![tlsanvil passing](https://img.shields.io/badge/tls--anvil-115%20passing-brightgreen)](docs/TLSANVIL.md)<br>[![tlsanvil declined](https://img.shields.io/badge/tls--anvil-321%20declined-lightgrey)](docs/TLSANVIL.md#it-scopes-itself) | A corpus derived from the RFCs, not an implementation |
 | [**RFC 8448**](src/rfc8448_test.zig) | [![rfc8448](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml) | The RFC's traced bytes, reproduced exactly |

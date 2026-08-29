@@ -306,52 +306,65 @@ const Pump = struct {
                 // `test-tls13-record-layer-limits`.
                 else => return pump.abort(server, err),
             };
-            const event = server.handleRecord(one, &pump.out) catch |err| {
+            // One record can carry more than one post-handshake
+            // message, so every event it produced is taken before the
+            // next record is read. Skipping this is not benign: the
+            // extra message would be taken ahead of the following
+            // record's, and `handleRecord` refuses that with
+            // `EventsPending` rather than letting it lag.
+            var event = server.handleRecord(one, &pump.out) catch |err| {
                 return pump.abort(server, err);
             };
-            switch (event) {
-                .application_data => |bytes| {
-                    if (bytes.len == 0) continue;
-                    // Echo, byte for byte. A canned HTTP response answers
-                    // "did anything come back" and nothing else, which is
-                    // all most scripts ask — but `test-tls13-lengths`
-                    // checks the *length* of the reply against what it
-                    // sent, across every size from 1 to 2^14, and no
-                    // fixed response can satisfy 1002 conversations that
-                    // each want a different one.
-                    //
-                    // An error rather than an assertion, because the
-                    // length is one the peer chose. No peer can reach it
-                    // today: `Protector.open` caps the stripped content
-                    // at §5.1's 2^14 before it ever becomes an event, and
-                    // `sendApplicationData` asserts the same bound on the
-                    // way back out. It is here so that the slice below is
-                    // guarded by a refusal rather than by a bound proved
-                    // two modules away — and if that bound ever moves,
-                    // this harness answers record_overflow instead of
-                    // aborting the listener mid-corpus.
-                    if (bytes.len > pump.echo.len) {
-                        return pump.abort(server, error.RecordOverflow);
-                    }
-                    // Copied out first: `bytes` points into `pump.out`,
-                    // which is where the reply gets sealed, and sealing
-                    // copies its content into that same buffer.
-                    @memcpy(pump.echo[0..bytes.len], bytes);
-                    const sealed = server.sendApplicationData(
-                        pump.echo[0..bytes.len],
-                        &pump.out,
-                    ) catch |err| return pump.abort(server, err);
-                    try pump.write(sealed);
-                },
-                .closed => {
-                    // §6.1's half-close, and the one place this harness
-                    // depends on `sendAlert` being callable after the
-                    // peer has already closed its direction.
-                    pump.write(server.sendAlert(.close_notify, &pump.out)) catch {};
-                    return;
-                },
-                .send => |bytes| try pump.write(bytes),
-                .none, .connected => {},
+            // lint:unbounded-ok — each pass takes one complete message from a
+            // fixed reassembly buffer that only `handleRecord` refills, and
+            // `drain` answers null once none remain.
+            while (true) : (event = (server.drain(&pump.out) catch |err| {
+                return pump.abort(server, err);
+            }) orelse break) {
+                switch (event) {
+                    .application_data => |bytes| {
+                        if (bytes.len == 0) continue;
+                        // Echo, byte for byte. A canned HTTP response answers
+                        // "did anything come back" and nothing else, which is
+                        // all most scripts ask — but `test-tls13-lengths`
+                        // checks the *length* of the reply against what it
+                        // sent, across every size from 1 to 2^14, and no
+                        // fixed response can satisfy 1002 conversations that
+                        // each want a different one.
+                        //
+                        // An error rather than an assertion, because the
+                        // length is one the peer chose. No peer can reach it
+                        // today: `Protector.open` caps the stripped content
+                        // at §5.1's 2^14 before it ever becomes an event, and
+                        // `sendApplicationData` asserts the same bound on the
+                        // way back out. It is here so that the slice below is
+                        // guarded by a refusal rather than by a bound proved
+                        // two modules away — and if that bound ever moves,
+                        // this harness answers record_overflow instead of
+                        // aborting the listener mid-corpus.
+                        if (bytes.len > pump.echo.len) {
+                            return pump.abort(server, error.RecordOverflow);
+                        }
+                        // Copied out first: `bytes` points into `pump.out`,
+                        // which is where the reply gets sealed, and sealing
+                        // copies its content into that same buffer.
+                        @memcpy(pump.echo[0..bytes.len], bytes);
+                        const sealed = server.sendApplicationData(
+                            pump.echo[0..bytes.len],
+                            &pump.out,
+                        ) catch |err| return pump.abort(server, err);
+                        try pump.write(sealed);
+                    },
+                    .closed => {
+                        // §6.1's half-close, and the one place this harness
+                        // depends on `sendAlert` being callable after the
+                        // peer has already closed its direction.
+                        pump.write(server.sendAlert(.close_notify, &pump.out)) catch {};
+                        return;
+                    },
+                    .send => |bytes| try pump.write(bytes),
+                    .none, .connected => {},
+                }
             }
         }
         return error.TooManyRecords;
