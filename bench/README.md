@@ -252,6 +252,103 @@ clock reads the phase split adds:
    one pin bump from renaming) or a second backend, which DESIGN.md §2
    rules out. **This row is done.**
 
+   ### Is the vendored libcrypto built right?
+
+   Asked separately, because "upstream is slower" is a convenient answer
+   and the build is the thing we control. It is built at `ReleaseFast`
+   (`zig build --summary all` says `compile lib crypto ReleaseFast
+   native`), and `build.zig` gives the bench its *own* ReleaseFast
+   libcrypto rather than inheriting `-Doptimize`. C is compiled by clang
+   either way — Zig has no self-hosted C backend, so the `use_llvm`
+   question only ever applies to Zig code, and ReleaseFast uses LLVM for
+   that too.
+
+   Linking one C program against different libcryptos, same machine, same
+   core, `EVP` calls identical to the ones the backend makes:
+
+   | libcrypto | fixed-base | variable-base |
+   |---|---|---|
+   | ours, 3.5.7, Zig/clang ReleaseFast | 17,590 ns | 24,065 ns |
+   | stock 3.5.7, gcc -O3 (nixpkgs) | 15,695 ns | 22,488 ns |
+   | stock 3.6.3, gcc -O3 (nixpkgs) | 15,175 ns | 22,376 ns |
+
+   Stock 3.5.7 is the control that matters: same source version as our
+   pin, so the ~12% and ~7% are the *build*, not the release. Chasing
+   that down to flags, by compiling `crypto/ec/curve25519.c` alone and
+   timing `ossl_x25519_public_from_private` — pure C, none of the X25519
+   assembly — with everything else held fixed:
+
+   | compiler and flags | ns |
+   |---|---|
+   | `zig cc -O2`, sanitizers off — the ReleaseFast default | 16,451 |
+   | `zig cc -O3`, sanitizers off | 16,465 |
+   | `zig cc -O2 -fsanitize=undefined -fsanitize-trap=undefined` — the ReleaseSafe default | 18,598 |
+   | `gcc -O2` | 18,630 |
+   | `gcc -O3` | 14,894 |
+
+   Two plausible diagnoses died here, which is most of the value:
+
+   - **`-O2` is not a bug to fix.** Zig's ReleaseFast really does hand
+     clang `-O2` rather than the `-O3` a distro uses, and that looked like
+     the answer until it was measured: clang emits the same speed either
+     way. Adding `-O3` to the openssl package's `base_flags` would buy
+     **nothing**. Only gcc cares, by 1.25x.
+   - **Frame pointers are not it either.** Zig passes
+     `-fno-omit-frame-pointer`; removing it changes nothing measurable on
+     either compiler.
+
+   `-DNDEBUG` is set — checked with a C file that `#error`s under
+   `#ifndef NDEBUG`, not assumed.
+
+   So the residual against a distro build is gcc-versus-clang codegen on
+   ref10's `int32` limb arithmetic, worth ~2% of a handshake, and there is
+   no flag that recovers it. The build is right.
+
+   ### What `sanitize_c = .off` is actually worth
+
+   Both libcryptos in `build.zig` set it — the gate's at line 18 and the
+   bench's — and it is worth being precise about where that matters,
+   because it is easy to credit it with more than it does. Zig turns
+   `-fsanitize=undefined -fsanitize-trap=undefined` on for C at **Debug
+   and ReleaseSafe**, and off at **ReleaseFast**:
+
+   - At ReleaseFast, where the numbers on this page are taken, the setting
+     is a **no-op**. The sanitizers were never on.
+   - At ReleaseSafe — which CLAUDE.md says is what release builds ship —
+     it is worth **1.13x** on this routine, on top of the correctness
+     reason it was added for (zoxy's #283, where `-fsanitize=function`
+     turned `OPENSSL_sk_pop_free` into a `ud1` trap at key load).
+
+   An earlier version of this section claimed 1.77x. That number was real
+   but described something else: `zig cc -O2` defaults to *non-trapping*
+   UBSan, with a runtime handler, which no zssl build uses. Measuring the
+   driver instead of the build is exactly the mistake this section exists
+   to catch.
+
+   ### ReleaseFast is measured; ReleaseSafe is what ships
+
+   CLAUDE.md ships release builds at `-Doptimize=ReleaseSafe`, so a page
+   quoting only ReleaseFast would describe a configuration nobody runs.
+   `zig build bench -Dbench-optimize=ReleaseSafe` builds the harness, zssl
+   and libcrypto that way instead. It costs less than the run-to-run
+   spread on the rows that matter:
+
+   | | ReleaseFast | ReleaseSafe |
+   |---|---|---|
+   | `handshake_full` | 171.86 µs | 174.23 µs (+1.4%) |
+   | `handshake_resume` | 105.12 µs | 107.85 µs (+2.6%) |
+   | `transfer_aes128` | 3.43 µs | 3.54 µs (+3.2%) |
+   | `record_aes128` | 3.44 µs | 3.47 µs (+0.9%) |
+   | `aead_seal_aes128` | 1.63 µs | 1.63 µs (—) |
+   | `x25519_shared` | 25.96 µs | 26.05 µs (—) |
+   | `ecdsa_p256_verify` | 43.80 µs | 44.24 µs (+1.0%) |
+
+   The primitive rows do not move at all, which is the check that the two
+   builds differ only where they should: libcrypto is compiled the same
+   both times, and what ReleaseSafe adds is Zig's bounds and overflow
+   checks over zssl's own ~24 µs. Paying 1.4% of a handshake for them is
+   the trade this tree would make every time.
+
    What *was* ours is fixed, and `x25519_shared_rederive` is what it
    cost. `EVP_PKEY_new_raw_private_key` reaches `ossl_ecx_key_fromdata` →
    `ossl_ecx_public_from_private` (`crypto/ec/ecx_backend.c:99`, and a
@@ -333,6 +430,9 @@ recording because it means the bulk-data rows are measuring the two
 `ZSSL_BENCH_ONLY=handshake_full,x25519_shared` runs a subset of the Zig
 harness and `ZSSL_BENCH_SCALE=100` divides the iteration counts, which is
 what makes it usable under a profiler.
+`zig build bench -Dbench-optimize=ReleaseSafe` measures the mode release
+builds actually ship, rather than the one that compares against rustls's
+`--release`; both are in the results above.
 
 devenv.nix deliberately carries no Rust toolchain: nothing zssl ships
 needs one, and none of the six gates in CLAUDE.md would be improved by
