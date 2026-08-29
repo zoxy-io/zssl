@@ -10,8 +10,8 @@ itself.
 It runs: `zig build tlsfuzzer`.
 
 ```
-tlsfuzzer: 16 scripts to run, 41 disabled (0 of those untriaged)
-tlsfuzzer: 16 scripts passed, 0 failed, 41 disabled, floor 16
+tlsfuzzer: 17 scripts to run, 40 disabled (0 of those untriaged)
+tlsfuzzer: 17 scripts passed, 0 failed, 40 disabled, floor 17
 tlsfuzzer: PASS
 ```
 
@@ -59,7 +59,7 @@ is reporting on the fixture.
 
 ## The numbers, and the debt
 
-**16 of 57** `test-tls13-*` scripts run, 1329 conversations between them.
+**17 of 57** `test-tls13-*` scripts run, 1334 conversations between them.
 `test-tls13-lengths` is 1002 of those on its own: every plaintext length
 from 1 to 2^14, each echoed back and checked for size.
 `test-tls13-connection-abort` is another 150, aborting the connection at
@@ -68,11 +68,11 @@ crashes, and `test-tls13-invalid-ciphers` 52. The rest are the basic
 conversation, alert handling encrypted and not, Minerva timing-signal
 sanity, HelloRetryRequest and the §9.2 hello that must not get one, empty
 and unrecognised cipher lists, record padding, ticket counting, the two
-RSA signature scripts, and — since finding 7 closed — the 68
-conversations of `record-layer-limits`, which walk §5.1's and §5.2's
-caps from both sides.
+RSA signature scripts, the 68 conversations of `record-layer-limits`
+walking §5.1's and §5.2's caps from both sides since finding 7 closed,
+and `ccs` since finding 8 did.
 
-**41 disabled, none of them untriaged.** 24 carry scope reasons that were
+**40 disabled, none of them untriaged.** 24 carry scope reasons that were
 always plain — client certificates, FFDHE, brainpool curves, EdDSA,
 ML-DSA, ML-KEM, 0-RTT, compressed certificates, `psk_ke` without (EC)DHE,
 TLS 1.2 fallback, AES-CCM — each pointing at a written decision. The
@@ -103,7 +103,7 @@ and a debt that is not counted is a debt that is not paid. A new script
 arriving with a pin bump may push it back above zero; triage it before
 the commit lands, never after.
 
-**The floor** is 16. `scripts.json` can disable a script, but not quietly:
+**The floor** is 17. `scripts.json` can disable a script, but not quietly:
 the passing count falls with it and the gate goes red.
 
 ## What it cost to get here
@@ -241,19 +241,35 @@ library's until the OpenSSL oracle said otherwise.
    no hash is; and `test-tls13-keyupdate`'s two length cases to green,
    leaving only finding 10's. `test-tls13-finished` stays at 39 of 42 on
    the three §4.4.4 costs us, which is a `KEEP` and not a gap.
-8. **A ChangeCipherSpec record's payload is never read.** §5 admits "an
+8. **A ChangeCipherSpec record's payload was never read.** §5 admits "an
    unencrypted record of type change_cipher_spec **consisting of the
    single byte value 0x01**" inside a stated window, and an
    implementation "which receives any other change_cipher_spec value ...
    MUST abort the handshake with an `unexpected_message` alert". zssl
-   bounds how *many* such records it tolerates (`ccs_seen_max`) and
-   where (§5's window, both edges, which TLS-Anvil found), but never
-   looks at the byte: a record holding `01 01`, or a hundred `01`s, is
+   bounded how *many* such records it tolerated (`ccs_seen_max`) and
+   where (§5's window, both edges, which TLS-Anvil found), and never
+   looked at the byte: a record holding `01 01`, or a hundred `01`s, was
    accepted as compatibility filler.
 
-   Costs `test-tls13-ccs` its only failure — the other four pass, and
-   OpenSSL passes all five — and one conversation of
-   `test-tls13-multiple-ccs-messages`.
+   Two ways to be "any other value" and the corpus sends both — a byte
+   that is not 0x01, and more than one byte of it. Neither is a
+   ChangeCipherSpec in the 1.2 sense either, because 1.3 keeps the
+   record type and drops the message: there is nothing left to parse,
+   and the whole grammar is one comparison.
+
+   The check is one comparison and it lives in `record.zig`, beside
+   `parseHeader`, because it is the same layer's rule about the same
+   peer's bytes — and because both machines had the hole, so both now
+   ask the same function rather than each carrying its own copy of the
+   sentence. It is asked *before* anything about where the record
+   landed: a record that is not the compatibility record is not one
+   whose position is worth discussing.
+
+   Moved: `test-tls13-ccs` **4 of 5 -> 5**, and into `Run`;
+   `test-tls13-multiple-ccs-messages` 3 -> 4 of 7, where the three that
+   remain are its one-CCS policy. Real OpenSSL 3.6.3 scores 2 of 7 on
+   that script and fails the very conversation this closed, so §5's MUST
+   is one the reference implementation does not keep and we now do.
 9. **(harness) A record refused at its header closed the connection
    without an alert, but only after the handshake.** `Pump.converse`
    routed `handleRecord`'s errors through `Pump.abort`, which sends
@@ -319,10 +335,10 @@ the shape of the debt that was paid.
 
 | Verdict | Scripts |
 | --- | --- |
-| **OPEN GAP** — a defect we mean to fix | `ccs` (8), `legacy-version` (11) |
+| **OPEN GAP** — a defect we mean to fix | `legacy-version` (11) |
 | **SCOPE** — needs a capability or a fixture we chose not to carry | `ecdhe-curves`, `ecdsa-support`, `psk_dhe_ke`, `rsapss-signatures`, `serverhello-random`, `session-resumption`, `signature-algorithms` |
 | **KEEP** — we refuse the input and differ only in the alert, having argued ours | `finished` (7, with BoGo) |
-| **Green, and now in `Run`** | `record-layer-limits` (findings 9 and 7) |
+| **Green, and now in `Run`** | `record-layer-limits` (findings 9 and 7), `ccs` (finding 8) |
 | **Not a defect** — the corpus is stating its own policy, or the harness's shape | `keyupdate`, `keyupdate-from-server`, `large-number-of-extensions`, `multiple-ccs-messages`, `shuffled-extentions`, `zero-content-type`, `zero-length-data` |
 
 Two patterns are worth carrying forward. The **SCOPE** column is mostly

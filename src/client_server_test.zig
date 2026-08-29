@@ -1078,6 +1078,71 @@ test "§5: a ChangeCipherSpec outside its window is unexpected_message" {
     }
 }
 
+test "§5: a ChangeCipherSpec carrying anything but 0x01 is unexpected_message" {
+    // "An implementation which receives any other change_cipher_spec
+    // value ... MUST abort the handshake with an "unexpected_message"
+    // alert." zssl bounded how many of these it would take and where,
+    // and never read the byte — so `01 01` was accepted as compatibility
+    // filler, which is tlsfuzzer's `two byte long CCS` and its
+    // `multiple CCS Messages in one TLS record` (docs/TLSFUZZER.md
+    // finding 8).
+    //
+    // Every case here sits *inside* §5's window, where the record would
+    // otherwise be dropped and the handshake would continue: that is
+    // what makes this about the payload and not about the position.
+    const payloads = [_][]const u8{
+        // The value that is not 0x01. TLS 1.2's message body was this
+        // same byte, so there has never been another legal one.
+        &.{0x00},
+        &.{0x02},
+        &.{0xff},
+        // More than one byte of it, which is "any other value" too —
+        // the record's whole content is the message.
+        &.{ 0x01, 0x01 },
+        &.{ 0x01, 0x00 },
+        &([_]u8{0x01} ** 64),
+    };
+
+    for (payloads) |payload| {
+        var buffers: Buffers = .{};
+        var storage: [record.header_bytes + 64]u8 = undefined;
+        record.writeHeader(
+            .{ .content_type = .change_cipher_spec, .length = @intCast(payload.len) },
+            storage[0..record.header_bytes],
+        );
+        @memcpy(storage[record.header_bytes..][0..payload.len], payload);
+        const ccs_record = storage[0 .. record.header_bytes + payload.len];
+
+        // Server: after the ClientHello, which is squarely inside the
+        // window — the one-byte version of this record is dropped here
+        // and the handshake carries on.
+        {
+            var harness: Harness = undefined;
+            try harness.init(.{});
+            defer harness.deinit();
+            const hello = harness.client.start(&buffers.client_out);
+            _ = try harness.server.handleRecord(hello, &buffers.server_out);
+            try testing.expectError(
+                error.UnexpectedMessage,
+                harness.server.handleRecord(ccs_record, &buffers.server_out),
+            );
+        }
+
+        // Client: after its own ClientHello has gone out, which is the
+        // same window seen from the other side.
+        {
+            var harness: Harness = undefined;
+            try harness.init(.{});
+            defer harness.deinit();
+            _ = harness.client.start(&buffers.client_out);
+            try testing.expectError(
+                error.UnexpectedMessage,
+                harness.client.handleRecord(ccs_record, &buffers.scratch),
+            );
+        }
+    }
+}
+
 test "§6.1: user_canceled is ignored and bounded, other warnings are refused" {
     // The three dispositions a peer can reach, driven through a real
     // connection rather than through `alert.disposition` alone. Every
