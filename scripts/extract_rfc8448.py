@@ -100,10 +100,11 @@ WANT = [
     ("server_app_record", 825, "complete record"),
     ("client_alert_plaintext", 836, "payload"),
     ("client_alert_record", 836, "complete record"),
-    # §4 "Resumed 0-RTT Handshake" — the PSK/binder side of resumption.
-    # zssl does not implement 0-RTT, so the early-data vectors stay out;
-    # what these pin is the binder chain, the PSK-mixed key ladder, and
-    # the pre_shared_key ServerHello.
+    # §4 "Resumed 0-RTT Handshake" — the PSK/binder side of resumption,
+    # and since the server learned to accept early data, the 0-RTT key
+    # schedule with it: the binder chain, the PSK-mixed key ladder, the
+    # pre_shared_key ServerHello, and `client_early_traffic_secret` down
+    # to the key and iv it expands to.
     ("resumed_client_x25519_private", 866, "private key"),
     ("resumed_client_x25519_public", 866, "public key"),
     ("resumed_psk", 874, "IKM"),
@@ -117,6 +118,14 @@ WANT = [
     ("resumed_binder_key", 919, "PRK"),
     ("resumed_binder_finished_key", 919, "expanded"),
     ("resumed_binder_value", 919, "finished"),
+    # The 0-RTT branch: `Derive-Secret(early_secret, "c e traffic", CH)`
+    # and the record keys it expands to. The hash is the transcript over
+    # the ClientHello alone, which is the whole reason these keys can
+    # exist before a ServerHello does.
+    ("resumed_client_hello_hash", 1033, "hash"),
+    ("resumed_client_early_traffic_secret", 1033, "expanded"),
+    ("resumed_client_early_key", 1071, "key expanded"),
+    ("resumed_client_early_iv", 1071, "iv expanded"),
     ("resumed_server_x25519_private", 1096, "private key"),
     ("resumed_server_x25519_public", 1096, "public key"),
     ("resumed_server_hello", 1108, "ServerHello"),

@@ -210,6 +210,41 @@ fn completeHandshake(server: *ServerHandshake, client: *Client) !void {
     try testing.expectEqual(std.meta.activeTag(final.?), .connected);
 }
 
+test "§4 vectors: the 0-RTT branch of the schedule, down to the record keys" {
+    // The early secret has two children and this tree only ever grew
+    // one of them. `client_early_traffic_secret` is the other, and it is
+    // derivable the moment the ClientHello exists — which is the whole
+    // reason 0-RTT can put application data on the wire before a
+    // ServerHello answers.
+    //
+    // No production code was needed for this: `deriveAt` and
+    // `trafficKeys` already spell it. That is worth pinning *before*
+    // anything is built on top, because a schedule that agrees with the
+    // RFC here is one the accept path can be debugged against.
+    var schedule = Schedule.initEarly(&vectors.resumed_psk);
+    defer schedule.wipe();
+    try testing.expectEqualSlices(u8, &vectors.resumed_early_secret, &schedule.secret);
+
+    // The transcript is the ClientHello and nothing else. Checked
+    // against the message rather than taken from the trace's label, so
+    // the vector is tied to bytes we also parse elsewhere.
+    var hello_hash: [32]u8 = undefined;
+    Sha256.hash(&vectors.resumed_client_hello, &hello_hash, .{});
+    try testing.expectEqualSlices(u8, &vectors.resumed_client_hello_hash, &hello_hash);
+
+    const early_traffic = schedule.deriveAt(.early, "c e traffic", &hello_hash);
+    try testing.expectEqualSlices(
+        u8,
+        &vectors.resumed_client_early_traffic_secret,
+        &early_traffic,
+    );
+
+    // And the record keys the client protects early data with.
+    const keys = Schedule.trafficKeys(&early_traffic);
+    try testing.expectEqualSlices(u8, &vectors.resumed_client_early_key, &keys.key);
+    try testing.expectEqualSlices(u8, &vectors.resumed_client_early_iv, &keys.iv);
+}
+
 test "resumption end to end: tickets out, PSK session up, no certificate" {
     var store: TicketStore = .empty;
 
