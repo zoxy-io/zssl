@@ -66,9 +66,11 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
 - **No clock reads.** Time arrives through `Config.now_ms` the same way
   entropy does — supplied per connection, never measured. Seeded replay
   depends on this exactly as it depends on the rule above:
-  `grep -rE 'std\.time\.(timestamp|milliTimestamp|nanoTimestamp)|Instant\.now|clock_gettime' src/`
-  must stay empty. Unit constants (`std.time.ns_per_s`) are arithmetic
-  and not a clock; calling one of those functions is.
+  `grep -rnE '\.now\(|clock_gettime|milliTimestamp|nanoTimestamp' src/`
+  must stay empty. In Zig 0.16 a clock is `Io.Clock.Timestamp.now(io,
+  …)`, so `.now(` is the pattern that matters and the `std.time.*`
+  spellings are there for a future that brings them back. Unit constants
+  (`std.time.ns_per_ms`) are arithmetic, not a clock.
 - **Record caps are enforced at header parse** (`record.zig`), never
   compensated for downstream.
 

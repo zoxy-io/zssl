@@ -96,8 +96,13 @@ stop being promises and become something this library checks, with the
 embedder supplying storage exactly as it supplies `reassembly` and
 `flight`. §8.1 stays the embedder's, and is the one we do not need.
 
-So acceptance is back in scope and being built in slices; this section
-will say what landed when it has. The absence of a clock is still
+So acceptance is in. §8.2's strike register and §8.3's freshness check
+are `src/anti_replay.zig`, in caller-owned storage; §4.2.10's accept
+path and §4.5's EndOfEarlyData are `ServerHandshake`; §2's 0.5-RTT came
+with it, because a server that reads early data wants to answer before
+the client's Finished. BoGo drives all of it — the shim opts in the way
+any embedder must, and docs/BOGO.md finding 18 is what that cost and
+what it caught. The absence of a clock is still
 load-bearing in one direction: `now_ms` is optional, and without it
 everything §8 needs time for is off, so a server that never thought
 about time cannot accept replayable data by accident.

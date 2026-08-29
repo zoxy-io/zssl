@@ -1634,6 +1634,10 @@ pub fn sendNewSessionTicket(
 /// The suite this handshake negotiated. Available from the moment the
 /// ladder exists, which is the ServerHello; an embedder sealing a
 /// resumption ticket needs it to record what the PSK is bound to.
+/// The suite this connection settled on. An embedder minting a ticket
+/// needs it: §4.2.10 only accepts early data on a resumption that
+/// negotiates the same suite the ticket was issued under, and the ticket
+/// is the embedder's to seal.
 pub fn cipherSuite(self: *const ServerHandshake) CipherSuite {
     assert(self.ladder != null);
     return self.ladder.?;
