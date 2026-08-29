@@ -507,4 +507,31 @@ fn main() {
         }
         accumulator
     });
+
+    // The same two halves the Zig harness splits, so the comparison is
+    // per *operation* rather than per handshake-side: a fixed-base
+    // multiplication to build the share, and a variable-base one to agree
+    // against the peer's.
+    let scalar = [0x31u8; 32];
+    measure("x25519_public", "keygen", 0, 2000, |iterations| {
+        let mut accumulator = 0u64;
+        for _ in 0..iterations {
+            let private = PrivateKey::from_private_key(&X25519, &scalar).expect("import");
+            let public = private.compute_public_key().expect("public");
+            accumulator = accumulator.wrapping_add(public.as_ref()[0] as u64);
+        }
+        accumulator
+    });
+
+    let fixed = PrivateKey::from_private_key(&X25519, &scalar).expect("import");
+    let fixed_public = fixed.compute_public_key().expect("public");
+    measure("x25519_shared", "agreement", 0, 2000, |iterations| {
+        let mut accumulator = 0u64;
+        for _ in 0..iterations {
+            let peer = KxPublicKey::new(&X25519, fixed_public.as_ref());
+            let byte = agree(&fixed, &peer, (), |shared| Ok(shared[0])).expect("agree");
+            accumulator = accumulator.wrapping_add(byte as u64);
+        }
+        accumulator
+    });
 }
