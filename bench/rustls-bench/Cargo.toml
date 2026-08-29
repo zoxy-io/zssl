@@ -1,0 +1,22 @@
+[package]
+name = "rustls-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The reference implementation under comparison, with its default
+# provider. `aws-lc-rs` is what a rustls user gets unless they opt out,
+# so it is what the comparison has to face.
+rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs", "tls12"] }
+rustls-pemfile = "2"
+# Pulled in directly so the primitive floor under rustls can be measured
+# with the same key sizes and record sizes as the zssl harness measures
+# libcrypto's. Version-matched to whatever rustls resolves to.
+aws-lc-rs = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

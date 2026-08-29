@@ -19,4 +19,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/zig
       - name: format
-        run: zig fmt --check src interop bogo tlsanvil tlsfuzzer scripts build.zig build.zig.zon
+        run: zig fmt --check src interop bench bogo tlsanvil tlsfuzzer scripts build.zig build.zig.zon

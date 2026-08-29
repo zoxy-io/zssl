@@ -224,6 +224,47 @@ pub fn build(b: *std.Build) void {
     const tlsanvil_step = b.step("tlsanvil", "Adversarial gate: TLS-Anvil's RFC corpus against our server");
     tlsanvil_step.dependOn(&tlsanvil_run.step);
 
+    // The rustls comparison harness. Not a gate: it asserts nothing and
+    // gates nothing, it only reports numbers.
+    //
+    // It pins `ReleaseFast` for itself *and* rebuilds the library and
+    // libcrypto underneath it at `ReleaseFast`, rather than following
+    // `-Doptimize`. A module's optimize mode is its own, so a ReleaseFast
+    // harness importing the default-Debug `zssl_module` would time Debug
+    // zssl through a fast wrapper and report a number about a binary
+    // nobody ships. Cargo has no such trap — `--release` is the whole
+    // dependency graph — so making the two sides agree has to happen
+    // here. See bench/README.md.
+    const bench_openssl = b.dependency("openssl", .{
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_libcrypto = bench_openssl.artifact("crypto");
+    bench_libcrypto.root_module.sanitize_c = .off;
+    const bench_zssl = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_zssl.link_libc = true;
+    bench_zssl.linkLibrary(bench_libcrypto);
+
+    const bench_module = b.createModule(.{
+        .root_source_file = b.path("bench/zssl_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_module.addImport("zssl", bench_zssl);
+    bench_module.addAnonymousImport("cert_pem", .{ .root_source_file = b.path("src/testdata/cert.pem") });
+    bench_module.addAnonymousImport("key_pem", .{ .root_source_file = b.path("src/testdata/key.pem") });
+    const bench_exe = b.addExecutable(.{ .name = "zssl-bench", .root_module = bench_module });
+    b.installArtifact(bench_exe);
+    const bench_run = b.addRunArtifact(bench_exe);
+    bench_run.has_side_effects = true;
+    if (b.args) |forwarded| bench_run.addArgs(forwarded);
+    const bench_step = b.step("bench", "Throughput harness for the rustls comparison (JSON lines)");
+    bench_step.dependOn(&bench_run.step);
+
     const tlsfuzzer_server_step = b.step(
         "tlsfuzzer-server",
         "Run the tlsfuzzer server harness on its own (for manual scripts)",
