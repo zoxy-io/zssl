@@ -9,7 +9,8 @@ A sans-I/O TLS 1.3 library in Zig, over libcrypto primitives.
 zssl implements the protocol — records, the key schedule, both handshake
 state machines, resumption, KeyUpdate — in auditable Zig, and calls
 libcrypto only for the constant-time primitives (AEAD, X25519, ECDSA and
-RSA-PSS signing); checking a *peer's* signature is `std.crypto`'s. It owns no
+RSA-PSS signing, and ECDSA verification); checking a peer's *RSA-PSS*
+signature is still `std.crypto`'s. It owns no
 sockets, no threads, and no memory: you feed it whole TLS records and
 transmit whatever it hands back.
 

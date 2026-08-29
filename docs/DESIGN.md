@@ -110,6 +110,16 @@ most-watched assembly on earth. HKDF, HMAC, and the transcript hash are
 pure Zig over `std.crypto`: hashing public-length data is not where the
 sharp edges are, and this is the same line ztls drew and zoxy audited.
 
+**Verification sits on the line, and is now split.** Checking a peer's
+signature is not a constant-time problem — the message is public — so
+both halves of `.leaf_signature` ran on `std.crypto` for as long as the
+argument was only about timing. `bench/` supplied the other half of the
+argument: Zig's P-256 verifier costs ~333 µs against libcrypto's ~44 µs,
+and that one call was two thirds of a full handshake. ECDSA moved;
+RSA-PSS did not, because nobody has measured it. The cost of moving is
+that a peer-supplied key and signature now reach C, bounded first by
+`captureLeaf` and validated at import by `ecFromPublic`.
+
 **One backend, on purpose.** OpenSSL is the only libcrypto family member
 with `CRYPTO_set_mem_functions`, and that hook is what makes a
 zero-allocation budget over a C library a checkable property instead of
@@ -223,8 +233,9 @@ matter: a peer can spend the whole budget on padding.
    export both directions after any KeyUpdate, then stop feeding the
    machine*. `ClientHandshake` is the origination half: SNI, ALPN with
    RFC 7301 selection checks, the certificate-policy seam
-   (`.leaf_signature` proves key possession via std.crypto against
-   the presented leaf — ECDSA or RSA-PSS; chain/name are the embedder's
+   (`.leaf_signature` proves key possession against the presented leaf —
+   ECDSA through libcrypto, RSA-PSS through std.crypto, for the reason
+   §2 records; chain/name are the embedder's
    through `chain_verifier`, per §1), ticket capture
    through the event surface, resumption, and — since BoGo pressed it —
    HelloRetryRequest answered rather than refused: the client advertises

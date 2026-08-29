@@ -887,11 +887,16 @@ fn acceptClientHello(
         self.ladder = Ladder.initFor(suite);
     }
     const private_key = self.config.key_share_private[0..group.privateBytes()];
+    // One `KeyShare` for both halves of the answer. The pair used to be
+    // an agreement and a separate `keySharePublic`, which multiplied by
+    // the base point twice — once inside the agreement, discarded, and
+    // once for the share on the wire (bench/README.md).
+    var key_share = try backend.KeyShare.init(group, private_key);
+    defer key_share.deinit();
     var shared_buffer: [backend.group_shared_bytes_max]u8 = undefined;
     defer std.crypto.secureZero(u8, &shared_buffer);
-    const shared = try backend.keyShareShared(group, private_key, peer_share, &shared_buffer);
-    var public_buffer: [backend.group_public_bytes_max]u8 = undefined;
-    const public_key = try backend.keySharePublic(group, private_key, &public_buffer);
+    const shared = try key_share.agree(peer_share, &shared_buffer);
+    const public_key = key_share.publicValue();
 
     var message_buffer: [server_messages.server_hello_bytes_max]u8 = undefined;
     const echo = self.session_echo[0..self.session_echo_bytes];

@@ -3,8 +3,14 @@
 //! This file and `c.zig` are the codebase's entire C surface. The division
 //! of trust is DESIGN.md §2: constant-time primitives come from the
 //! most-watched assembly available; every protocol decision stays above
-//! this boundary in Zig. Nothing here parses attacker bytes — callers hand
-//! in already-framed slices with asserted lengths.
+//! this boundary in Zig. Callers hand in already-framed slices with
+//! asserted lengths.
+//!
+//! One exception, and it is deliberate: `verifyEcdsa` hands a peer's DER
+//! ECDSA-Sig-Value to libcrypto's own ASN.1 decoder, and `ecFromPublic` a
+//! peer's point to its own point decoder. Both are peer-chosen bytes, and
+//! both are length-checked by the caller before they get here — see the
+//! note on `ClientHandshake.verifyEcdsa` for why that trade was taken.
 //!
 //! Allocation: `EVP_CIPHER_CTX_new` and the X25519 `EVP_PKEY` objects go
 //! through libcrypto's allocator, which the embedder redirects to a fixed
@@ -292,61 +298,166 @@ fn ecPublicFromScalar(group: Group, private_key: []const u8, out: []u8) Error![]
     return out[0..written];
 }
 
-/// §7.4.2's shared secret: X25519's raw output, or the x-coordinate of
-/// the ECDH point. An all-zero result is `IdentityElement`, the abort
-/// §7.4.2 names, and libcrypto refuses a point off the curve for us.
+/// One party's key-exchange keypair: the embedder's scalar, and the
+/// public value it implies, computed once and kept.
+///
+/// The two halves are bundled because OpenSSL 3 offers no way to build a
+/// private-key object *without* deriving its public one. For X25519,
+/// `ossl_ecx_key_fromdata` calls `ossl_ecx_public_from_private` whenever
+/// the public parameter is absent — which `EVP_PKEY_new_raw_private_key`
+/// always leaves absent — and the EC path's `fromdata` rejects a keypair
+/// selection that carries only the scalar. So an agreement handed only a
+/// scalar pays for a fixed-base scalar multiplication and then throws the
+/// answer away. That was ~18 µs of a ~43 µs X25519 agreement, and a
+/// handshake did it twice: once on each peer, on top of the multiplication
+/// each had already done to put a share on the wire (bench/README.md).
+///
+/// Bundled rather than passed as a second argument to `agree` so the two
+/// halves cannot disagree: only `init` builds one, and it builds both. A
+/// public value that did not match its scalar would derive a shared
+/// secret the peer does not hold, and surface three flights later as a
+/// bad record MAC — the same shape as the key-selection bug
+/// `ClientHandshake` records in its own comment.
+///
+/// The scalar is copied in. The embedder's original outlives this
+/// (`Config` owns it); `deinit` zeroes the copy.
+pub const KeyShare = struct {
+    group: Group,
+    private: [group_private_bytes_max]u8,
+    public: [group_public_bytes_max]u8,
+
+    pub fn init(group: Group, private_key: []const u8) Error!KeyShare {
+        assert(private_key.len == group.privateBytes());
+        var share: KeyShare = undefined;
+        share.group = group;
+        @memset(&share.private, 0);
+        @memcpy(share.private[0..private_key.len], private_key);
+        errdefer std.crypto.secureZero(u8, &share.private);
+        @memset(&share.public, 0);
+        // The one multiplication. Everything else here exists so that it
+        // happens exactly once.
+        const public = try keySharePublic(group, private_key, &share.public);
+        assert(public.len == group.publicBytes());
+        assert(share.group == group);
+        // A point that came back all zero is not a point, and every caller
+        // is about to put this on the wire as its KeyShareEntry.
+        assert(!std.mem.allEqual(u8, public, 0));
+        return share;
+    }
+
+    pub fn deinit(self: *KeyShare) void {
+        std.crypto.secureZero(u8, &self.private);
+        self.* = undefined;
+    }
+
+    /// What goes in the KeyShareEntry.
+    pub fn publicValue(self: *const KeyShare) []const u8 {
+        return self.public[0..self.group.publicBytes()];
+    }
+
+    fn privateValue(self: *const KeyShare) []const u8 {
+        return self.private[0..self.group.privateBytes()];
+    }
+
+    /// §7.4.2's shared secret: X25519's raw output, or the x-coordinate
+    /// of the ECDH point. An all-zero result is `IdentityElement`, the
+    /// abort §7.4.2 names, and libcrypto refuses a point off the curve
+    /// for us.
+    pub fn agree(self: *const KeyShare, peer_public: []const u8, out: []u8) Error![]u8 {
+        assert(out.len >= self.group.sharedBytes());
+        errdefer clearErrorQueue();
+        // A peer value of the wrong length never reaches libcrypto: the
+        // length is the peer's to choose and this is the boundary that
+        // checks it (DESIGN.md §2).
+        if (peer_public.len != self.group.publicBytes()) return error.IdentityElement;
+
+        const pkey = if (self.group == .x25519)
+            try x25519FromKeypair(
+                self.private[0..x25519_key_bytes],
+                self.public[0..x25519_key_bytes],
+            )
+        else blk: {
+            if (peer_public[0] != 0x04) return error.IdentityElement; // §4.2.8.2: uncompressed only.
+            break :blk try ecFromKeypair(self.group, self.privateValue(), self.publicValue());
+        };
+        defer c.EVP_PKEY_free(pkey);
+
+        const peer = if (self.group == .x25519)
+            c.EVP_PKEY_new_raw_public_key(
+                c.EVP_PKEY_X25519,
+                null,
+                peer_public.ptr,
+                x25519_key_bytes,
+            ) orelse return error.LibcryptoFailed
+        else
+            try ecFromPublic(self.group, peer_public);
+        defer c.EVP_PKEY_free(peer);
+
+        const ctx = c.EVP_PKEY_CTX_new(pkey, null) orelse return error.LibcryptoFailed;
+        defer c.EVP_PKEY_CTX_free(ctx);
+        if (c.EVP_PKEY_derive_init(ctx) != 1) return error.LibcryptoFailed;
+        if (c.EVP_PKEY_derive_set_peer(ctx, peer) != 1) return error.IdentityElement;
+        var shared_len: usize = out.len;
+        if (c.EVP_PKEY_derive(ctx, out.ptr, &shared_len) != 1) return error.IdentityElement;
+        if (shared_len != self.group.sharedBytes()) return error.LibcryptoFailed;
+        // libcrypto already rejects the low-order X25519 result; asserting
+        // the negative space here keeps the §7.4.2 guarantee ours.
+        if (std.mem.allEqual(u8, out[0..shared_len], 0)) return error.IdentityElement;
+        return out[0..shared_len];
+    }
+};
+
+/// One-shot agreement, for a caller that holds no `KeyShare`: build one,
+/// use it, drop it.
+///
+/// This pays the fixed-base multiplication `KeyShare.init` does, which is
+/// exactly what holding a share avoids — so the two handshakes hold one
+/// and this is for test scaffolding, which agrees once and does not care.
 pub fn keyShareShared(
     group: Group,
     private_key: []const u8,
     peer_public: []const u8,
     out: []u8,
 ) Error![]u8 {
-    assert(private_key.len == group.privateBytes());
-    assert(out.len >= group.sharedBytes());
-    if (group == .x25519) {
-        if (peer_public.len != x25519_key_bytes) return error.IdentityElement;
-        try x25519Shared(
-            private_key[0..x25519_key_bytes],
-            peer_public[0..x25519_key_bytes],
-            out[0..x25519_key_bytes],
-        );
-        return out[0..x25519_key_bytes];
-    }
-    errdefer clearErrorQueue();
-    // A peer point of the wrong length never reaches libcrypto: the
-    // length is the peer's to choose and this is the boundary that
-    // checks it (DESIGN.md §2).
-    if (peer_public.len != group.publicBytes()) return error.IdentityElement;
-    if (peer_public[0] != 0x04) return error.IdentityElement; // §4.2.8.2: uncompressed only.
-
-    const pkey = try ecFromPrivate(group, private_key);
-    defer c.EVP_PKEY_free(pkey);
-    const peer = try ecFromPublic(group, peer_public);
-    defer c.EVP_PKEY_free(peer);
-
-    const ctx = c.EVP_PKEY_CTX_new(pkey, null) orelse return error.LibcryptoFailed;
-    defer c.EVP_PKEY_CTX_free(ctx);
-    if (c.EVP_PKEY_derive_init(ctx) != 1) return error.LibcryptoFailed;
-    if (c.EVP_PKEY_derive_set_peer(ctx, peer) != 1) return error.IdentityElement;
-    var shared_len: usize = out.len;
-    if (c.EVP_PKEY_derive(ctx, out.ptr, &shared_len) != 1) return error.IdentityElement;
-    if (shared_len != group.sharedBytes()) return error.LibcryptoFailed;
-    if (std.mem.allEqual(u8, out[0..shared_len], 0)) return error.IdentityElement;
-    return out[0..shared_len];
+    var share = try KeyShare.init(group, private_key);
+    defer share.deinit();
+    return share.agree(peer_public, out);
 }
 
-/// Build an EC `EVP_PKEY` from a raw scalar. OpenSSL 3's `fromdata`
-/// takes the private key as a BIGNUM and computes the public half, which
-/// is what lets zssl keep its "the embedder supplies the entropy" rule:
-/// nothing here generates a key, it only completes one.
-fn ecFromPrivate(group: Group, private_key: []const u8) Error!*c.EVP_PKEY {
+/// An X25519 `EVP_PKEY` carrying both halves, so that
+/// `ossl_ecx_key_fromdata` takes the public one as given rather than
+/// multiplying for it. `EVP_PKEY_new_raw_private_key` cannot express
+/// this — it builds a params array with the private key alone.
+fn x25519FromKeypair(
+    private_key: *const [x25519_key_bytes]u8,
+    public_key: *const [x25519_key_bytes]u8,
+) Error!*c.EVP_PKEY {
+    const builder = c.OSSL_PARAM_BLD_new() orelse return error.LibcryptoFailed;
+    defer c.OSSL_PARAM_BLD_free(builder);
+    if (c.OSSL_PARAM_BLD_push_octet_string(
+        builder,
+        c.OSSL_PKEY_PARAM_PRIV_KEY,
+        private_key,
+        x25519_key_bytes,
+    ) != 1) return error.LibcryptoFailed;
+    if (c.OSSL_PARAM_BLD_push_octet_string(
+        builder,
+        c.OSSL_PKEY_PARAM_PUB_KEY,
+        public_key,
+        x25519_key_bytes,
+    ) != 1) return error.LibcryptoFailed;
+    return pkeyFromBuilder("X25519", builder, c.EVP_PKEY_KEYPAIR);
+}
+
+/// Build an EC `EVP_PKEY` from a scalar and the point it implies. The
+/// point is passed in rather than computed: `fromdata` does not derive
+/// the public half from the private, and a keypair selection without it
+/// is rejected, so somebody has to supply it — and `KeyShare` already
+/// has.
+fn ecFromKeypair(group: Group, private_key: []const u8, public_key: []const u8) Error!*c.EVP_PKEY {
     const bn = c.BN_bin2bn(private_key.ptr, @intCast(private_key.len), null) orelse
         return error.LibcryptoFailed;
     defer c.BN_clear_free(bn);
-    // Both halves, because `fromdata` does not derive the public one from
-    // the private and a keypair selection without it is rejected.
-    var public_buffer: [group_public_bytes_max]u8 = undefined;
-    const public_key = try ecPublicFromScalar(group, private_key, &public_buffer);
     const builder = c.OSSL_PARAM_BLD_new() orelse return error.LibcryptoFailed;
     defer c.OSSL_PARAM_BLD_free(builder);
     const name = group.curveName();
@@ -364,7 +475,7 @@ fn ecFromPrivate(group: Group, private_key: []const u8) Error!*c.EVP_PKEY {
         public_key.ptr,
         public_key.len,
     ) != 1) return error.LibcryptoFailed;
-    return pkeyFromBuilder(builder, c.EVP_PKEY_KEYPAIR);
+    return pkeyFromBuilder("EC", builder, c.EVP_PKEY_KEYPAIR);
 }
 
 /// The peer's point, as an uncompressed SEC1 octet string. libcrypto
@@ -386,13 +497,17 @@ fn ecFromPublic(group: Group, peer_public: []const u8) Error!*c.EVP_PKEY {
         peer_public.ptr,
         peer_public.len,
     ) != 1) return error.LibcryptoFailed;
-    return pkeyFromBuilder(builder, c.EVP_PKEY_PUBLIC_KEY);
+    return pkeyFromBuilder("EC", builder, c.EVP_PKEY_PUBLIC_KEY);
 }
 
-fn pkeyFromBuilder(builder: *c.OSSL_PARAM_BLD, selection: c_int) Error!*c.EVP_PKEY {
+fn pkeyFromBuilder(
+    algorithm: [:0]const u8,
+    builder: *c.OSSL_PARAM_BLD,
+    selection: c_int,
+) Error!*c.EVP_PKEY {
     const params = c.OSSL_PARAM_BLD_to_param(builder) orelse return error.LibcryptoFailed;
     defer c.OSSL_PARAM_free(params);
-    const ctx = c.EVP_PKEY_CTX_new_from_name(null, "EC", null) orelse
+    const ctx = c.EVP_PKEY_CTX_new_from_name(null, algorithm.ptr, null) orelse
         return error.LibcryptoFailed;
     defer c.EVP_PKEY_CTX_free(ctx);
     if (c.EVP_PKEY_fromdata_init(ctx) != 1) return error.LibcryptoFailed;
@@ -621,6 +736,65 @@ pub const Signer = struct {
             return error.SignatureInvalid;
     }
 };
+
+pub const VerifyError = Error || error{
+    /// The octet string is not a public key on the scheme's curve —
+    /// wrong length, not a point encoding, or not on the curve.
+    /// libcrypto validates at import, and this is that refusal.
+    BadPublicKey,
+    /// The signature did not verify against the key.
+    SignatureInvalid,
+};
+
+/// Verify a *peer's* ECDSA signature against a public key we were handed,
+/// as a SEC1 octet string — the CertificateVerify path.
+///
+/// `Signer.verify` is the same operation from the other side of a keypair
+/// we loaded ourselves, and is test-side tooling. This one is production:
+/// the key, the signature and the content all came off the wire, and only
+/// the content was assembled by us.
+///
+/// The two failures are kept apart because the caller owes the peer
+/// different alerts for them. `BadPublicKey` is a leaf we cannot use;
+/// `SignatureInvalid` is a signature that did not check out. libcrypto
+/// re-encodes the DER ECDSA-Sig-Value and compares it against the input
+/// before verifying, so a non-canonical encoding lands in the second —
+/// the same strictness `std.crypto`'s `Signature.fromDer` applied, which
+/// matters because BoGo asks for it.
+pub fn verifyEcdsa(
+    scheme: SignatureScheme,
+    public_key_sec1: []const u8,
+    content: []const u8,
+    signature_der: []const u8,
+) VerifyError!void {
+    errdefer clearErrorQueue();
+    assert(content.len >= 1);
+    assert(signature_der.len >= 1);
+    // The caller chose an ECDSA scheme; RSA-PSS has no curve to name.
+    assert(!scheme.isRsaPss());
+    const group: Group = switch (scheme) {
+        .ecdsa_secp256r1_sha256 => .secp256r1,
+        .ecdsa_secp384r1_sha384 => .secp384r1,
+        else => unreachable, // The assert above admitted only these two.
+    };
+
+    // Point validation happens here, at import, exactly as it does for a
+    // KeyShareEntry: a point off the curve never reaches the verifier.
+    const pkey = ecFromPublic(group, public_key_sec1) catch |err| return switch (err) {
+        error.IdentityElement => error.BadPublicKey,
+        else => err,
+    };
+    defer c.EVP_PKEY_free(pkey);
+
+    const ctx = c.EVP_MD_CTX_new() orelse return error.LibcryptoFailed;
+    defer c.EVP_MD_CTX_free(ctx);
+    if (c.EVP_DigestVerifyInit(ctx, null, scheme.digest(), null, pkey) != 1)
+        return error.LibcryptoFailed;
+    if (c.EVP_DigestVerifyUpdate(ctx, content.ptr, content.len) != 1)
+        return error.LibcryptoFailed;
+    if (c.EVP_DigestVerifyFinal(ctx, signature_der.ptr, signature_der.len) != 1)
+        return error.SignatureInvalid;
+}
 
 /// The settable-params probe first: `EVP_PKEY_CTX_set_params` can succeed
 /// while the provider ignores an unknown key, and a silently random nonce
@@ -910,5 +1084,136 @@ test "libcrypto's error queue is empty after a failure" {
         error.AuthenticationFailed,
         aead.open(&nonce, "aad", &sealed, &tag, &opened),
     );
+    try std.testing.expectEqual(@as(c_ulong, 0), c.ERR_peek_error());
+}
+
+test "KeyShare bundles both halves and agrees exactly as the one-shot does" {
+    const groups = [_]Group{ .x25519, .secp256r1, .secp384r1 };
+    for (groups) |group| {
+        const private_bytes = group.privateBytes();
+        var alice: [group_private_bytes_max]u8 = undefined;
+        var bob: [group_private_bytes_max]u8 = undefined;
+        for (0..private_bytes) |i| {
+            alice[i] = @intCast((i * 7 + 3) & 0x7f);
+            bob[i] = @intCast((i * 11 + 5) & 0x7f);
+        }
+
+        var alice_share = try KeyShare.init(group, alice[0..private_bytes]);
+        defer alice_share.deinit();
+        var bob_share = try KeyShare.init(group, bob[0..private_bytes]);
+        defer bob_share.deinit();
+
+        // The bundled public half is the same value the standalone
+        // multiplication produces — the bundle is an accounting change,
+        // not an arithmetic one.
+        var expected_public: [group_public_bytes_max]u8 = undefined;
+        try std.testing.expectEqualSlices(
+            u8,
+            try keySharePublic(group, alice[0..private_bytes], &expected_public),
+            alice_share.publicValue(),
+        );
+
+        // Both directions reach one secret, which is what the key
+        // schedule rests on.
+        var from_alice: [group_shared_bytes_max]u8 = undefined;
+        var from_bob: [group_shared_bytes_max]u8 = undefined;
+        const alice_secret = try alice_share.agree(bob_share.publicValue(), &from_alice);
+        const bob_secret = try bob_share.agree(alice_share.publicValue(), &from_bob);
+        try std.testing.expectEqualSlices(u8, alice_secret, bob_secret);
+
+        // And the same secret the one-shot wrapper reaches, which is the
+        // path that still re-derives the public half. Skipping that
+        // multiplication must not change the answer.
+        var one_shot: [group_shared_bytes_max]u8 = undefined;
+        try std.testing.expectEqualSlices(u8, alice_secret, try keyShareShared(
+            group,
+            alice[0..private_bytes],
+            bob_share.publicValue(),
+            &one_shot,
+        ));
+
+        // Negative space: a peer value of the wrong length is refused at
+        // the boundary, before libcrypto sees it.
+        try std.testing.expectError(
+            error.IdentityElement,
+            alice_share.agree(bob_share.publicValue()[0 .. group.publicBytes() - 1], &from_alice),
+        );
+    }
+    try std.testing.expectEqual(@as(c_ulong, 0), c.ERR_peek_error());
+}
+
+test "verifyEcdsa accepts a std.crypto signature and keeps its two refusals apart" {
+    // The differential that matters: `std.crypto` signs, libcrypto
+    // verifies, and the two share no line of code. This is the oracle
+    // for moving `ClientHandshake.verifyEcdsa` across the boundary.
+    const curves = .{
+        .{ SignatureScheme.ecdsa_secp256r1_sha256, std.crypto.sign.ecdsa.EcdsaP256Sha256 },
+        .{ SignatureScheme.ecdsa_secp384r1_sha384, std.crypto.sign.ecdsa.EcdsaP384Sha384 },
+    };
+    inline for (curves) |pair| {
+        const scheme: SignatureScheme = pair[0];
+        const Ecdsa = pair[1];
+
+        const seed = [_]u8{0x5c} ** Ecdsa.KeyPair.seed_length;
+        const keys = try Ecdsa.KeyPair.generateDeterministic(seed);
+        const sec1 = keys.public_key.toUncompressedSec1();
+        // A CertificateVerify content structure's shape and length; the
+        // bytes themselves do not matter to a signature check.
+        const content = [_]u8{0x20} ** 130;
+        var der_storage: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
+        const der = (try keys.sign(&content, null)).toDer(&der_storage);
+
+        try verifyEcdsa(scheme, &sec1, &content, der);
+
+        // A signature over other content, and a mangled one. Both are
+        // `SignatureInvalid` — libcrypto's ASN.1 decoder rejecting the
+        // encoding and its verifier rejecting the maths are the same
+        // answer to the peer, exactly as `std.crypto`'s were.
+        const other = [_]u8{0x21} ** 130;
+        try std.testing.expectError(
+            error.SignatureInvalid,
+            verifyEcdsa(scheme, &sec1, &other, der),
+        );
+        var mangled = der_storage;
+        mangled[der.len - 1] ^= 0xff;
+        try std.testing.expectError(
+            error.SignatureInvalid,
+            verifyEcdsa(scheme, &sec1, &content, mangled[0..der.len]),
+        );
+        // §4.4.3 framing is exact: a trailing byte is not a signature
+        // that failed, and libcrypto's canonical re-encode catches it.
+        var trailing: [Ecdsa.Signature.der_encoded_length_max + 1]u8 = undefined;
+        @memcpy(trailing[0..der.len], der);
+        trailing[der.len] = 0x00;
+        try std.testing.expectError(
+            error.SignatureInvalid,
+            verifyEcdsa(scheme, &sec1, &content, trailing[0 .. der.len + 1]),
+        );
+
+        // A leaf we cannot use is a *different* answer from a signature
+        // that failed: `ClientHandshake` maps this one to bad_certificate
+        // and the three above to decrypt_error, and that split is the
+        // whole reason `VerifyError` carries two names.
+        var off_curve = sec1;
+        off_curve[off_curve.len - 1] ^= 0xff;
+        try std.testing.expectError(
+            error.BadPublicKey,
+            verifyEcdsa(scheme, &off_curve, &content, der),
+        );
+        try std.testing.expectError(
+            error.BadPublicKey,
+            verifyEcdsa(scheme, sec1[0 .. sec1.len - 1], &content, der),
+        );
+        // A point for the other curve, which is the shape a peer gets by
+        // naming a scheme its leaf does not carry.
+        const other_scheme: SignatureScheme = if (scheme == .ecdsa_secp256r1_sha256)
+            .ecdsa_secp384r1_sha384
+        else
+            .ecdsa_secp256r1_sha256;
+        try std.testing.expectError(
+            error.BadPublicKey,
+            verifyEcdsa(other_scheme, &sec1, &content, der),
+        );
+    }
     try std.testing.expectEqual(@as(c_ulong, 0), c.ERR_peek_error());
 }
