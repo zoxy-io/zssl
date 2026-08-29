@@ -326,6 +326,25 @@ script's *expectation* was read instead of our reply.
 
     `test-tls13-zero-length-data` **8 of 11 -> 11**, and into `Run`.
 
+    `test-tls13-keyupdate` is *not* fixed by this and its entry used to
+    say why in a way that was simply wrong: it blamed the harness's
+    5-second connection budget, on the strength of a 30-second budget
+    scoring better. That measurement was taken against a stale listener
+    — see the caution above — and the real one says the opposite. An
+    instrumented watchdog fires **zero** times across six runs including
+    a 48-of-62 one, and a full 62-conversation sweep takes **0.65 s**
+    against that deadline. The budget was never involved.
+
+    What the script does need is `--coalescing`. Its default expects one
+    KeyUpdate answer per request, and zssl answers once for a run of
+    them — which is not a choice, it is what BoGo's `KeyUpdate-Requested`
+    requires in as many words, "the shim should respond only once".
+    Two corpora disagreeing for the fourth time in this file, and the
+    only one settled by a command-line flag rather than a code change.
+    With that flag the count still moves between 48 and 62 and the
+    residual errors are KeyUpdate ordering; that part is genuinely not
+    root-caused, and the entry says so rather than picking a culprit.
+
     `test-tls13-zero-content-type` keeps 2 of 8, and those two are not
     fixable here. They send an incomplete request — `GET /`, no blank
     line — then a record with content type 0, and expect the alert and
