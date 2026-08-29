@@ -192,6 +192,19 @@ pub const Config = struct {
     /// Caller-owned space for flight plaintext assembly; must hold the
     /// certificate chain plus ~1 KiB.
     flight: []u8,
+    /// The embedder's clock in milliseconds, read once as this
+    /// connection began. Null when the embedder keeps none.
+    ///
+    /// Supplied rather than read, for the reason `server_random` is:
+    /// zssl calls nothing and measures nothing, so a replayed simulation
+    /// feeds the same number and gets the same run. Time is the
+    /// embedder's exactly as entropy is.
+    ///
+    /// The absence is load-bearing. Everything §8 needs a clock for is
+    /// off without one, so a server that never thought about time cannot
+    /// accept replayable data by accident — the safe default is the
+    /// shape of the type rather than a line in a document.
+    now_ms: ?u64 = null,
     /// The PSK seam: given an offered identity, answer the key it stands
     /// for and say which kind it is, or null to fall back to a full
     /// handshake. Both §4.2.11 sources come through here — a ticket this
@@ -221,6 +234,35 @@ pub const PskLookup = struct {
 /// like a key mismatch. The wire carries an identity and says nothing
 /// about provenance, so only the embedder that recognised the identity
 /// can say which it is.
+/// When the ticket behind an identity was issued, and for how long it
+/// was good, in the same milliseconds as `Config.now_ms`. §4.6.1: "The
+/// server MUST NOT use the ticket beyond its lifetime" — this is what
+/// lets zssl hold to that itself instead of trusting the lookup to have
+/// done it.
+pub const Issued = struct {
+    at_ms: u64,
+    /// §4.6.1's `ticket_lifetime`, seconds, and the RFC caps it at a
+    /// week. A lookup answering more is describing a ticket the server
+    /// should never have minted, so the cap is applied rather than
+    /// believed.
+    lifetime_s: u32,
+
+    pub const lifetime_s_max: u32 = 7 * 24 * 60 * 60;
+
+    /// Whether `now_ms` is past the end of this ticket's life.
+    ///
+    /// Saturating both ways on purpose. A clock that went backwards, or
+    /// an `at_ms` in the future, is the embedder's fault and not the
+    /// peer's — answering "expired" to it refuses a resumption that may
+    /// be perfectly good, and answering "fresh" honours a ticket that
+    /// may be ancient. The first is the one to choose.
+    pub fn expired(self: Issued, now_ms: u64) bool {
+        const lifetime_ms = @as(u64, @min(self.lifetime_s, lifetime_s_max)) * 1000;
+        const age_ms = now_ms -| self.at_ms;
+        return age_ms > lifetime_ms;
+    }
+};
+
 pub const Psk = struct {
     /// How many bytes were written into `psk_out`. A resumption PSK is
     /// exactly the negotiated hash's length, because §4.6.1 derives it
@@ -232,6 +274,11 @@ pub const Psk = struct {
     /// length wears — `psk_bytes`, `ticket_bytes`, `nonce_bytes`.
     psk_bytes: u8,
     kind: key_schedule.PskKind,
+    /// Null for an external PSK, which has no issuance to speak of, and
+    /// for an embedder that keeps no clock. With both this and
+    /// `Config.now_ms` present, §4.6.1's lifetime is enforced here
+    /// rather than assumed of the lookup.
+    issued: ?Issued = null,
 };
 
 const SelectedPsk = struct {
@@ -731,6 +778,17 @@ fn selectPsk(
         switch (answer.kind) {
             .resumption => if (answer.psk_bytes != suite.hashBytes()) continue,
             .external => if (answer.psk_bytes == 0 or answer.psk_bytes > selected.psk.len) continue,
+        }
+        // §4.6.1's lifetime, enforced rather than trusted — but only
+        // when the embedder gave us both halves of the question. An
+        // expired ticket is our own policy declining, not a peer
+        // misbehaving, so it falls through to the next identity and then
+        // to a full handshake; `binderMatches` below is where an offer
+        // that *is* an attack gets refused outright.
+        if (self.config.now_ms) |now_ms| {
+            if (answer.issued) |issued| {
+                if (issued.expired(now_ms)) continue;
+            }
         }
         selected.psk_bytes = answer.psk_bytes;
         selected.kind = answer.kind;

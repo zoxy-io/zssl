@@ -67,24 +67,37 @@ a permanent exclusion rather than a queue item.
 
 §8 lets a server accept early data only with single-use tickets (§8.1)
 or a strike register over recorded ClientHellos (§8.2), and either way
-with a freshness check (§8.3). zssl can implement none of the three,
-and not for want of effort: §8.1 needs a ticket store, and tickets are
-the embedder's by design — sealing, lifetime and age policy all live
-behind `psk_lookup`; §8.2 needs storage we could take as a caller-owned
-buffer *and* a clock to bound the window; §8.3 is a clock outright. This
-library has no time source at all, deliberately, and adding one to
-serve 0-RTT would be the tail wagging the dog.
+with a freshness check (§8.3).
 
-That leaves acceptance as a seam — the embedder answers "is early data
-safe for this PSK?" having done §8 itself — and the seam is what settles
-it. `psk_lookup` is the same shape and it is fine, because an embedder
-that gets age policy wrong admits a resumption that should have expired:
-bad, and bounded. An embedder that gets §8 wrong hands *replayed
-application data to the application as if it were fresh*, zssl cannot
-tell that it happened, and `return true` is simultaneously the easiest
-implementation and the insecure one. A seam whose careless answer is the
-unsafe one does not belong in a library whose posture is refusing what
-the RFC says to refuse.
+The first version of this argument said zssl could implement none of the
+three and stopped there, on the grounds that §8.2 and §8.3 both want a
+clock and this library had no time source. That was true and it was the
+wrong conclusion, because it treated an absence as an invariant. "No
+clock" was never one: CLAUDE.md's list has no allocators, no randomness
+and record caps at header parse, and time was simply a thing nobody had
+needed yet.
+
+It is supplied now, through `Config.now_ms`, on the same terms as
+`server_random` — read from the embedder once per connection, never
+measured, so a replayed simulation feeds the same number and gets the
+same run. §4.6.1's ticket lifetime is the first thing it buys, and that
+one stands on its own: a server MUST NOT use a ticket beyond its
+lifetime, and until now zssl could only hope the lookup had checked.
+
+What that changes about §8 is the shape of the answer. The objection
+worth keeping was never "we lack a clock" but *acceptance as a trust
+seam* — the embedder promising it did §8, zssl unable to tell, and
+`return true` being at once the easiest implementation and the insecure
+one. With a clock and a caller-owned strike register, §8.2 and §8.3
+stop being promises and become something this library checks, with the
+embedder supplying storage exactly as it supplies `reassembly` and
+`flight`. §8.1 stays the embedder's, and is the one we do not need.
+
+So acceptance is back in scope and being built in slices; this section
+will say what landed when it has. The absence of a clock is still
+load-bearing in one direction: `now_ms` is optional, and without it
+everything §8 needs time for is off, so a server that never thought
+about time cannot accept replayable data by accident.
 
 Two consequences worth stating so the decision is not quietly reopened.
 The *receive* side of **rejecting** 0-RTT is in, and always was

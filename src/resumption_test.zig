@@ -579,3 +579,101 @@ test "resumption failure paths: bad binder is fatal, unknown ticket falls back" 
         try testing.expect(client.certificate_verified);
     }
 }
+
+test "§4.6.1: a ticket is not used beyond its lifetime" {
+    const Issued = ServerHandshake.Issued;
+    const hour_ms: u64 = 60 * 60 * 1000;
+    const issued: Issued = .{ .at_ms = 1000 * hour_ms, .lifetime_s = 3600 };
+
+    // The boundary, both sides of it. Exactly at the lifetime is still
+    // inside it — §4.6.1 gives a duration, and a ticket is good for it.
+    try testing.expect(!issued.expired(issued.at_ms));
+    try testing.expect(!issued.expired(issued.at_ms + hour_ms));
+    try testing.expect(issued.expired(issued.at_ms + hour_ms + 1));
+
+    // A clock that ran backwards, or an `at_ms` in the future, is the
+    // embedder's fault and not the peer's. Saturating to "no age at all"
+    // answers fresh, which is the wrong half of the choice to make
+    // silently — so the arithmetic is pinned here rather than left to a
+    // reader to re-derive.
+    try testing.expect(!issued.expired(0));
+    try testing.expect(!issued.expired(issued.at_ms - hour_ms));
+
+    // §4.6.1 caps `ticket_lifetime` at a week. A lookup answering more
+    // is describing a ticket that should never have been minted, and the
+    // cap is applied rather than believed.
+    const overlong: Issued = .{ .at_ms = 0, .lifetime_s = std.math.maxInt(u32) };
+    try testing.expect(!overlong.expired(Issued.lifetime_s_max * 1000));
+    try testing.expect(overlong.expired(@as(u64, Issued.lifetime_s_max) * 1000 + 1));
+}
+
+/// A `psk_lookup` answering one identity with an issuance the test
+/// chooses, so §4.6.1's lifetime can be walked from either side.
+const ExpiringStore = struct {
+    psk: [cipher_suite.hash_bytes_max]u8,
+    issued: ServerHandshake.Issued,
+
+    fn lookup(
+        context: *anyopaque,
+        identity: []const u8,
+        obfuscated_age: u32,
+        psk_out: *[cipher_suite.hash_bytes_max]u8,
+    ) ?ServerHandshake.Psk {
+        _ = obfuscated_age;
+        const store: *ExpiringStore = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, identity, "ticket")) return null;
+        psk_out.* = store.psk;
+        return .{ .psk_bytes = 32, .kind = .resumption, .issued = store.issued };
+    }
+};
+
+test "§4.6.1: an expired ticket falls back to a full handshake, not an error" {
+    // The lookup still recognises the identity — this is our own policy
+    // declining, not a peer misbehaving — so the right answer is the
+    // handshake the client would have got with no ticket at all. A
+    // refusal here would turn every expired resumption into a failed
+    // connection.
+    const psk = [_]u8{0x9a} ** 32;
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    const hour_ms: u64 = 60 * 60 * 1000;
+
+    for ([_]bool{ false, true }) |expired| {
+        var store: ExpiringStore = .{
+            .psk = undefined,
+            .issued = .{ .at_ms = 1000 * hour_ms, .lifetime_s = 3600 },
+        };
+        @memset(&store.psk, 0);
+        @memcpy(store.psk[0..psk.len], &psk);
+        var harness: Harness = undefined;
+        try harness.initLookup(.{ .context = &store, .lookup = ExpiringStore.lookup });
+        defer harness.deinit();
+        harness.server.config.now_ms = store.issued.at_ms +
+            if (expired) hour_ms + 1 else hour_ms;
+
+        var ticket: test_client.Ticket = .{
+            .lifetime_s = 3600,
+            .age_add = 0,
+            .nonce = undefined,
+            .nonce_bytes = 1,
+            .ticket = undefined,
+            .ticket_bytes = 6,
+            .psk = undefined,
+            .psk_bytes = 32,
+            .kind = .resumption,
+        };
+        @memset(&ticket.psk, 0);
+        @memcpy(ticket.psk[0..psk.len], &psk);
+        @memcpy(ticket.ticket[0..6], "ticket");
+
+        var client = Client.init(&client_x25519_private, &.{ .resume_with = &ticket });
+        defer client.deinit();
+        const flight = (try harness.server.handleRecord(
+            client.helloRecord(&client_out),
+            &server_out,
+        )).?;
+        try testing.expectEqual(std.meta.activeTag(flight), .send);
+        // Fresh resumes on the PSK; expired signs a certificate instead.
+        try testing.expectEqual(!expired, harness.server.resumed);
+    }
+}
