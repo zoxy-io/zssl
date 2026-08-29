@@ -270,9 +270,10 @@ scripts of 57, and 321 of TLS-Anvil's 437 tests opt out against a
 TLS 1.3-only server. That is why each carries a second, counted badge
 rather than a bare pass mark, and why each holds its passing count
 against a floor, so a regression or a quiet suppression stops the build.
-Nine findings sit on BoGo's ledger, 18 tlsfuzzer scripts are not yet
-triaged, and TLS-Anvil has two open failures it refuses to suppress; the
-three documents name every one, with a reason.
+Nine findings sit on BoGo's ledger, tlsfuzzer's 42 declines are all
+triaged and five of them stand on open findings, and TLS-Anvil has two
+open failures it refuses to suppress; the three documents name every one,
+with a reason.
 
 ## Development
 
