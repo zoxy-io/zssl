@@ -785,15 +785,21 @@ name.
     this is one more of the same, not a new kind of imprecision
     (finding 6 records the limitation).
 
-    One asymmetry is left standing, deliberately and with a note rather
-    than a fix. The shim's `linger` drains and lets the connection's own
-    `defer close` send the FIN; `tlsfuzzer/server.zig`'s
-    `drainBeforeClose` half-closes with `shutdown(.send)` *first*, which
-    that harness needed to fix a real race — a peer waiting to see our
-    FIN before sending its trailing bytes (docs/TLSFUZZER.md). The TCP
-    mechanics are the same for both, so the difference looks like
-    history rather than design, and BoGo has simply not shaped a case
-    that hits it. Worth a slice of its own if one ever does.
+    Reviewing this turned up an asymmetry beside it, since closed. The
+    shim's `linger` drained and left the FIN to the connection's own
+    `defer close`, while `tlsfuzzer/server.zig`'s `drainBeforeClose`
+    half-closes with `shutdown(.send)` *first* — which that harness
+    needed for a real race, a peer waiting to see our FIN before sending
+    its trailing bytes (docs/TLSFUZZER.md). Draining alone is only half
+    an answer: it stops our close from resetting the peer, but a peer
+    waiting on our FIN waits as long as we are willing to read. The TCP
+    is the same for both harnesses and they had no business differing
+    about it, so `linger` half-closes now too.
+
+    No case moved — BoGo has not shaped one that needs it, which is why
+    the difference survived this long. It is fixed on the argument
+    rather than on a red run, and that is the honest description: the
+    other harness had already paid for this lesson.
 
 None of these are exploitable as far as the runner can show; they are
 laxity, and laxity is what BoGo exists to find.

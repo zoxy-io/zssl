@@ -817,11 +817,24 @@ const Pump = struct {
         return error.TooManyRecords;
     }
 
-    /// Read what the peer still had in flight, then let the socket go.
+    /// Say we are done writing, read what the peer still had in flight,
+    /// then let the socket go.
+    ///
     /// Closing on top of an unread window is a reset, and a peer whose
     /// write is cut short reports a broken pipe rather than the alert we
     /// just sent it — a real refusal that reads as a transport fault.
+    ///
+    /// The half-close comes first because draining alone is only half an
+    /// answer: it stops *our* close from resetting the peer, but a peer
+    /// waiting to see our FIN before it sends its last bytes waits for
+    /// as long as we are willing to read. `tlsfuzzer/server.zig` needed
+    /// exactly this (`drainBeforeClose`, docs/TLSFUZZER.md) and the two
+    /// harnesses had no business differing about TCP. Safe at every call
+    /// site because all three are terminal and `write` flushes: whatever
+    /// we meant to send — an alert, or our own close_notify — is already
+    /// on the wire.
     fn linger(pump: *Pump) void {
+        pump.stream.shutdown(pump.io, .send) catch return;
         var reads: u32 = 0;
         while (reads < records_per_phase_max) : (reads += 1) {
             pump.reader.interface.fill(1) catch return;
