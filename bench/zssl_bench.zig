@@ -554,34 +554,56 @@ fn verifyBody(signature_bytes: usize, iterations: usize) anyerror!u64 {
     return signature_bytes;
 }
 
-fn x25519Body(_: void, iterations: usize) anyerror!u64 {
+/// One peer's whole key-exchange cost: build the share it puts on the
+/// wire, then agree against the other side's. This is the pairing
+/// rustls's `x25519_keygen_agree` measures, and it is what a handshake
+/// pays per peer.
+fn x25519Body(peer: *const [32]u8, iterations: usize) anyerror!u64 {
     var accumulator: u64 = 0;
-    var public: [32]u8 = undefined;
     var shared: [32]u8 = undefined;
     for (0..iterations) |_| {
-        try backend.x25519Public(&client_x25519_private, &public);
-        try backend.x25519Shared(&client_x25519_private, &public, &shared);
+        var share = try backend.KeyShare.init(.x25519, &client_x25519_private);
+        _ = try share.agree(peer, &shared);
+        accumulator +%= shared[0];
+        share.deinit();
+    }
+    return accumulator;
+}
+
+/// The two halves of the above, separately, because a handshake pays them
+/// at different moments: `KeyShare.init` when the ClientHello goes out,
+/// `agree` three flights later when the peer's share arrives. They are
+/// not the same scalar multiplication — OpenSSL routes the fixed-base one
+/// through the C `ge_scalarmult_base` and only the variable-base one
+/// through `x25519-x86_64.s`.
+fn x25519PublicBody(_: void, iterations: usize) anyerror!u64 {
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        var share = try backend.KeyShare.init(.x25519, &client_x25519_private);
+        accumulator +%= share.publicValue()[0];
+        share.deinit();
+    }
+    return accumulator;
+}
+
+var agree_share: backend.KeyShare = undefined;
+
+fn x25519SharedBody(peer: *const [32]u8, iterations: usize) anyerror!u64 {
+    var accumulator: u64 = 0;
+    var shared: [32]u8 = undefined;
+    for (0..iterations) |_| {
+        _ = try agree_share.agree(peer, &shared);
         accumulator +%= shared[0];
     }
     return accumulator;
 }
 
-/// The two halves of the above, separately: one handshake pays for one
-/// `x25519Public` at ClientHello time and one `x25519Shared` when the
-/// peer's share arrives, and they are not the same scalar multiplication.
-/// OpenSSL routes the fixed-base one through the C `ge_scalarmult_base`
-/// and only the variable-base one through `x25519-x86_64.s`.
-fn x25519PublicBody(_: void, iterations: usize) anyerror!u64 {
-    var accumulator: u64 = 0;
-    var public: [32]u8 = undefined;
-    for (0..iterations) |_| {
-        try backend.x25519Public(&client_x25519_private, &public);
-        accumulator +%= public[0];
-    }
-    return accumulator;
-}
-
-fn x25519SharedBody(peer: *const [32]u8, iterations: usize) anyerror!u64 {
+/// What `agree` cost before it was handed the public half: the same
+/// agreement through `x25519Shared`, which builds its key object with
+/// `EVP_PKEY_new_raw_private_key` and so pays a fixed-base scalar
+/// multiplication it discards. Kept as a standing row because it is the
+/// measurement the `KeyShare` bundle rests on.
+fn x25519SharedDeriveBody(peer: *const [32]u8, iterations: usize) anyerror!u64 {
     var accumulator: u64 = 0;
     var shared: [32]u8 = undefined;
     for (0..iterations) |_| {
@@ -591,14 +613,14 @@ fn x25519SharedBody(peer: *const [32]u8, iterations: usize) anyerror!u64 {
     return accumulator;
 }
 
-/// The path a *client* actually takes to check CertificateVerify.
+/// The retired baseline: what a client's CertificateVerify check cost
+/// when `ClientHandshake.verifyEcdsa` ran on `std.crypto`.
 ///
-/// `ClientHandshake.verifyEcdsa` runs on `std.crypto`, not on libcrypto:
-/// DESIGN.md §2 puts constant-time primitives behind the C boundary but
-/// exempts verification, on the argument that a public-length message is
-/// not where the timing argument bites. That is a security judgement, and
-/// this line is only here to price it — `ecdsa_p256_verify` above measures
-/// libcrypto's verifier, which no code path in the library calls.
+/// No code path reaches this any more — `ecdsa_p256_verify` above is the
+/// verifier the library now calls. The row stays because it is the
+/// measurement that argued for the move (DESIGN.md §2, bench/README.md),
+/// and undoing the move should mean re-running it rather than re-deciding
+/// on the strength of the original reasoning alone.
 const P256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
 var std_public_sec1: [65]u8 = undefined;
@@ -686,11 +708,21 @@ pub fn main() !void {
         &signature_storage,
     );
     try measure("ecdsa_p256_verify", "verification", 0, 2000, signature.len, verifyBody);
-    try measure("x25519_keygen_agree", "exchange", 0, 2000, {}, x25519Body);
-    try measure("x25519_public", "keygen", 0, 2000, {}, x25519PublicBody);
     var peer_public: [32]u8 = undefined;
     try backend.x25519Public(&server_key_share_private[0..32].*, &peer_public);
+    try measure("x25519_keygen_agree", "exchange", 0, 2000, &peer_public, x25519Body);
+    try measure("x25519_public", "keygen", 0, 2000, {}, x25519PublicBody);
+    agree_share = try backend.KeyShare.init(.x25519, &client_x25519_private);
     try measure("x25519_shared", "agreement", 0, 2000, &peer_public, x25519SharedBody);
+    agree_share.deinit();
+    try measure(
+        "x25519_shared_rederive",
+        "agreement",
+        0,
+        2000,
+        &peer_public,
+        x25519SharedDeriveBody,
+    );
 
     // The client's real CertificateVerify path, priced against the
     // libcrypto verifier it does not use.

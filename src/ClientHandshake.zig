@@ -85,6 +85,11 @@ retried: bool,
 /// The group our *current* key_share is for — x25519 on the first hello,
 /// whatever the retry named on the second.
 share_group: u16,
+/// The keypair behind `share_group`: built once when the share is put on
+/// the wire, kept so the agreement does not rebuild it. `null` until
+/// `start`, and replaced rather than added to by a retry — CH2 carries
+/// exactly one share, so exactly one is ever live.
+key_share: ?backend.KeyShare,
 /// The description byte of the fatal alert the peer sent, or null while
 /// it has sent none.
 ///
@@ -381,6 +386,7 @@ pub fn init(config: *const Config) ClientHandshake {
         .hello_bytes = 0,
         .retried = false,
         .share_group = client_hello.group_x25519,
+        .key_share = null,
         .peer_alert_description = null,
         .psk_offered = false,
         .resumed = false,
@@ -408,6 +414,7 @@ pub fn deinit(self: *ClientHandshake) void {
     if (self.ladder) |*ladder| switch (ladder.*) {
         inline else => |*arm| arm.deinit(),
     };
+    if (self.key_share) |*share| share.deinit();
     self.* = undefined;
 }
 
@@ -419,10 +426,18 @@ const ccs_seen_max: u8 = 2;
 pub fn start(self: *ClientHandshake, out: []u8) []const u8 {
     assert(self.state == .idle);
     assert(out.len >= record.header_bytes + client_messages.hello_bytes_max);
-    var x25519_public: [32]u8 = undefined;
     // The private key was asserted nonzero at init; what remains is a
     // libcrypto fault, which no peer caused and no alert can express.
-    backend.x25519Public(&self.config.x25519_private, &x25519_public) catch unreachable;
+    //
+    // Kept rather than discarded: the agreement three flights from now
+    // needs this keypair, and rebuilding it from the scalar alone would
+    // make libcrypto multiply by the base point a second time to recover
+    // the public half it is about to be handed (bench/README.md).
+    assert(self.key_share == null);
+    self.key_share = backend.KeyShare.init(
+        .x25519,
+        &self.config.x25519_private,
+    ) catch unreachable;
     const psk: ?client_messages.PskParams = if (self.config.resume_session) |resumption| .{
         .identity = resumption.identity,
         .obfuscated_age = resumption.obfuscated_age,
@@ -432,7 +447,7 @@ pub fn start(self: *ClientHandshake, out: []u8) []const u8 {
         .random = &self.config.client_random,
         .session_id = self.config.session_id,
         .share_group = client_hello.group_x25519,
-        .share_public = &x25519_public,
+        .share_public = self.key_share.?.publicValue(),
         .groups = self.config.groups,
         .server_name = self.config.server_name,
         .alpn_protocols = self.config.alpn_protocols,
@@ -587,6 +602,36 @@ fn handleAlertPayload(self: *ClientHandshake, payload: []const u8) Error!?Event 
 /// scalar to build a share from, and inventing one would break §1's
 /// no-randomness rule. That is `HandshakeFailure`, and it is what this
 /// client did for every retry before it could answer any.
+/// Swap the key share CH2 will carry, and hand back its public value.
+///
+/// Replaced rather than added to: CH2 carries one share, and after this
+/// the old keypair can never be the one the ServerHello answers. A
+/// cookie-only retry re-derives the same x25519 pair it already had,
+/// which is a multiplication rather than a correctness question — the
+/// alternative is a branch that has to be right about when the group did
+/// *not* change, and being wrong about that is the bug
+/// `handleServerHello` still carries a comment about.
+///
+/// The new share is built *before* the old one is torn down, so a
+/// libcrypto failure here leaves the handshake holding the share it
+/// already had rather than a `key_share` that is non-null and undefined.
+/// The optional's tag survives `deinit` — it only wipes the payload — so
+/// deinit-then-assign would leave `ClientHandshake.deinit` a second
+/// `deinit` to run over dead bytes on the way out.
+fn replaceKeyShare(
+    self: *ClientHandshake,
+    group: backend.Group,
+    private_key: []const u8,
+) Error![]const u8 {
+    assert(self.key_share != null); // `start` built one before any retry.
+    const replacement = backend.KeyShare.init(group, private_key) catch
+        return error.HandshakeFailure;
+    self.key_share.?.deinit();
+    self.key_share = replacement;
+    assert(self.key_share.?.group == group);
+    return self.key_share.?.publicValue();
+}
+
 fn handleHelloRetryRequest(
     self: *ClientHandshake,
     message: []const u8,
@@ -644,12 +689,7 @@ fn handleHelloRetryRequest(
         ),
     }
 
-    var share_storage: [backend.group_public_bytes_max]u8 = undefined;
-    const share = backend.keySharePublic(
-        group,
-        scalar[0..group.privateBytes()],
-        &share_storage,
-    ) catch return error.HandshakeFailure;
+    const share = try self.replaceKeyShare(group, scalar[0..group.privateBytes()]);
 
     // §4.2.11 on which offers may travel: "the client SHOULD NOT offer
     // any pre-shared keys associated with a hash other than that of the
@@ -808,21 +848,21 @@ fn handleServerHello(self: *ClientHandshake, message: []const u8, out: []u8) Err
     // x25519 on a straight handshake, the retried group after one.
     if (server_share.group != self.share_group) return error.BadServerHello;
     const group = backend.Group.fromWire(server_share.group) orelse return error.BadServerHello;
-    // By the *group*, not by whether we retried: a cookie-only retry
-    // re-sends the x25519 share it already sent, so `retried` says
-    // nothing about which scalar built the share on the wire. Choosing
-    // by `retried` there derived the shared secret from the wrong key
-    // and surfaced as a bad record MAC on the server's first flight —
-    // a transcript-shaped symptom for a key-selection bug.
-    const private: []const u8 = if (server_share.group == client_hello.group_x25519)
-        &self.config.x25519_private
-    else
-        self.config.retry_key_share_private.?[0..group.privateBytes()];
+    // The keypair that built the share on the wire, not one rebuilt from
+    // a scalar picked here. Which scalar that was used to be re-decided
+    // at this line, by the *group* rather than by `retried` — a
+    // cookie-only retry re-sends the x25519 share it already sent, so
+    // `retried` says nothing about it, and choosing by `retried` derived
+    // the shared secret from the wrong key and surfaced as a bad record
+    // MAC on the server's first flight. `start` and `handleRetry` are
+    // now the only two places that answer the question, each right where
+    // it puts a share on the wire, and the check above has already
+    // established that this is the group they answered it for.
+    const key_share = &self.key_share.?;
+    assert(key_share.group == group);
 
     var shared_storage: [backend.group_shared_bytes_max]u8 = undefined;
-    const shared = try backend.keyShareShared(
-        group,
-        private,
+    const shared = try key_share.agree(
         server_share.value[0..server_share.bytes],
         &shared_storage,
     );
@@ -1188,8 +1228,8 @@ fn verifyCertificate(self: *ClientHandshake, arm: anytype, message: handshake.Me
         else => return error.BadSignature,
     }
     switch (scheme) {
-        0x0403 => try verifyEcdsa(std.crypto.sign.ecdsa.EcdsaP256Sha256, public_key, content, signature),
-        0x0503 => try verifyEcdsa(std.crypto.sign.ecdsa.EcdsaP384Sha384, public_key, content, signature),
+        0x0403 => try verifyEcdsa(.ecdsa_secp256r1_sha256, public_key, content, signature),
+        0x0503 => try verifyEcdsa(.ecdsa_secp384r1_sha384, public_key, content, signature),
         0x0804 => try verifyRsaPss(std.crypto.hash.sha2.Sha256, public_key, content, signature),
         0x0805 => try verifyRsaPss(std.crypto.hash.sha2.Sha384, public_key, content, signature),
         0x0806 => try verifyRsaPss(std.crypto.hash.sha2.Sha512, public_key, content, signature),
@@ -1198,19 +1238,53 @@ fn verifyCertificate(self: *ClientHandshake, arm: anytype, message: handshake.Me
     self.certificate_verified = true;
 }
 
-fn verifyEcdsa(comptime Ecdsa: type, public_key: []const u8, content: []const u8, signature_der: []const u8) Error!void {
+/// ECDSA (§4.4.3's `ecdsa_secp*`), through libcrypto.
+///
+/// This ran on `std.crypto.sign.ecdsa` until `bench/` priced it. §2's
+/// exemption for verification is an argument about *constant time* — a
+/// public-length message is not where that bites — and it still holds;
+/// what it was never an argument for was being seven times slower. Zig's
+/// P-256 verifier costs ~333 µs against libcrypto's ~44 µs on the same
+/// machine, and that one call was two thirds of a full handshake.
+///
+/// The memory-safety cost is real and is why this note exists: the key
+/// and the signature are the peer's bytes, and they now reach C. Both are
+/// bounded before they get there — `captureLeaf` caps the key at
+/// `leaf_public_key_bytes_max` and floors it at 65, the signature is a
+/// §4.4.3-framed slice, and `ecFromPublic` validates the point at import
+/// rather than trusting it. `verifyRsaPss` below has *not* moved, and the
+/// same measurement has not been taken for it.
+fn verifyEcdsa(
+    scheme: backend.SignatureScheme,
+    public_key: []const u8,
+    content: []const u8,
+    signature_der: []const u8,
+) Error!void {
     assert(content.len >= 98); // 64 spaces, the context string, a hash.
     assert(public_key.len >= 65);
     if (signature_der.len < 8) return error.BadSignature;
-    const key = Ecdsa.PublicKey.fromSec1(public_key) catch return error.BadCertificate;
-    const signature = Ecdsa.Signature.fromDer(signature_der) catch return error.BadSignature;
-    signature.verify(content, key) catch return error.BadSignature;
+    backend.verifyEcdsa(scheme, public_key, content, signature_der) catch |err| return switch (err) {
+        // The same split `fromSec1` and `verify` gave, and the same two
+        // alerts: a point we cannot import is a certificate we cannot
+        // use, not a signature that failed.
+        error.BadPublicKey => error.BadCertificate,
+        error.SignatureInvalid => error.BadSignature,
+        // Enumerated rather than an `else`: the else arm would carry the
+        // two names above into the return type, which this function
+        // exists to translate away.
+        error.LibcryptoFailed,
+        error.AuthenticationFailed,
+        error.IdentityElement,
+        => |rest| rest,
+    };
 }
 
 /// RSA-PSS (§4.4.3's `rsa_pss_rsae_*`), through `std.crypto`'s
-/// implementation rather than libcrypto's — the same choice the ECDSA
-/// side makes, and for the same reason: verification of a public-length
-/// message is not where the constant-time argument bites.
+/// implementation rather than libcrypto's: verification of a
+/// public-length message is not where the constant-time argument bites.
+/// The ECDSA side above made the same choice until its cost was measured;
+/// this one's has not been, and moving it on the strength of the other's
+/// number would be guessing.
 ///
 /// `public_key` is the leaf's DER `RSAPublicKey`. The modulus lengths are
 /// the four `std.crypto.Certificate.rsa` supports, 1024 through 4096

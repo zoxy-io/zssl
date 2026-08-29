@@ -62,6 +62,7 @@ SECTIONS = [
             "x25519_keygen_agree",
             "x25519_public",
             "x25519_shared",
+            "x25519_shared_rederive",
             "p256_verify_stdcrypto",
         ],
     ),
