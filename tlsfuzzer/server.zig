@@ -70,6 +70,14 @@ var reassembly: [64 * 1024]u8 = undefined;
 var flight_storage: [Credentials.chain_bytes_max + 1024]u8 = undefined;
 var pump_storage: Pump = undefined;
 
+const Reply = enum { echo, http };
+
+/// What `http` mode answers with once a request is complete. Its content
+/// is irrelevant to every script that asks for it — they check that
+/// *something* came back, once — so this is the shortest well-formed
+/// thing that says so.
+const http_response = "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
 const Options = struct {
     port: u16 = 4433,
     cert_path: []const u8 = "src/testdata/cert.pem",
@@ -89,6 +97,13 @@ const Options = struct {
     /// answering resumption identities alone.
     psk: ?[]const u8 = null,
     psk_identity: []const u8 = "test",
+    /// How application data is answered. `echo` replies to the first
+    /// record of each run byte for byte, which is what
+    /// `test-tls13-lengths` measures; `http` stays silent until the
+    /// request is complete and then answers once, which is what the
+    /// scripts written against `s_server -www` expect. Neither can
+    /// serve the other's scripts, so the gate runs an instance of each.
+    reply: Reply = .echo,
     /// Seconds one conversation may take. Five is right for tlsfuzzer,
     /// whose scripts are fast and whose abort cases *need* a short
     /// deadline to keep a sequential listener from starving. TLS-Anvil
@@ -179,6 +194,12 @@ fn parseArguments(init: std.process.Init, arena: std.mem.Allocator) !Options {
             options.psk = value;
         } else if (std.mem.eql(u8, argument, "--psk-iden")) {
             options.psk_identity = value;
+        } else if (std.mem.eql(u8, argument, "--reply")) {
+            if (std.mem.eql(u8, value, "echo")) {
+                options.reply = .echo;
+            } else if (std.mem.eql(u8, value, "http")) {
+                options.reply = .http;
+            } else return error.BadFlagValue;
         } else {
             return error.UnknownFlag;
         }
@@ -272,7 +293,7 @@ fn serve(
         try pump.write(sealed);
     }
 
-    try pump.converse(&server);
+    try pump.converse(&server, options.reply);
 }
 
 const Pump = struct {
@@ -286,8 +307,15 @@ const Pump = struct {
     storage: [4 * record.wire_record_bytes_max]u8,
     out: [4 * record.wire_record_bytes_max]u8,
     /// Where a record's plaintext is held while its echo is sealed back
-    /// into `out`. §5.1's cap, because that is the most
-    /// `sendApplicationData` accepts in one record.
+    /// into `out`, and — in `http` mode — where the request accumulates
+    /// until its terminator arrives. §5.1's cap, because that is the
+    /// most `sendApplicationData` accepts in one record, and because a
+    /// request longer than one record's worth is past what any script
+    /// here sends.
+    ///
+    /// The two uses never interleave: `reply` is fixed from argv for the
+    /// life of the process, so an instance either echoes or accumulates
+    /// and never does both.
     echo: [record.plaintext_bytes_max]u8,
 
     fn init(pump: *Pump, io: Io, stream: Io.net.Stream) void {
@@ -335,7 +363,7 @@ const Pump = struct {
 
     /// Post-handshake: answer application data, and answer a close_notify
     /// with our own — `ExpectAlert` in the scripts is waiting for it.
-    fn converse(pump: *Pump, server: *ServerHandshake) !void {
+    fn converse(pump: *Pump, server: *ServerHandshake, reply: Reply) !void {
         var records_seen: u32 = 0;
         // One reply per *run* of application-data records, where any
         // other record starts a new run.
@@ -359,6 +387,8 @@ const Pump = struct {
         // with the fragments on purpose, and treating one as a boundary
         // would echo the fragment behind it.
         var echoed_this_run = false;
+        // Bytes of the request seen so far, in `http` mode only.
+        var request_bytes: usize = 0;
         while (records_seen < records_per_phase_max) : (records_seen += 1) {
             const one = pump.nextRecord() catch |err| switch (err) {
                 error.PeerClosed => return,
@@ -394,6 +424,35 @@ const Pump = struct {
                 switch (event) {
                     .application_data => |bytes| {
                         if (bytes.len == 0) continue;
+                        if (reply == .http) {
+                            // Silence until the request is complete, then
+                            // one canned response — `s_server -www`'s
+                            // shape, and the only one that satisfies a
+                            // script which sends `GET` and ` / HTTP/1.0`
+                            // in separate records and expects a single
+                            // reply, or one that sends an incomplete
+                            // request and expects nothing but the alert
+                            // its next record earns.
+                            if (request_bytes + bytes.len > pump.echo.len) {
+                                return pump.abort(server, error.RecordOverflow);
+                            }
+                            @memcpy(pump.echo[request_bytes..][0..bytes.len], bytes);
+                            request_bytes += bytes.len;
+                            // What the refusal above just proved, said
+                            // where the next reader needs it: the slice
+                            // taken below is in bounds.
+                            assert(request_bytes <= pump.echo.len);
+                            if (std.mem.indexOf(u8, pump.echo[0..request_bytes], "\r\n\r\n") == null) {
+                                continue;
+                            }
+                            request_bytes = 0;
+                            const sealed = server.sendApplicationData(
+                                http_response,
+                                &pump.out,
+                            ) catch |err| return pump.abort(server, err);
+                            try pump.write(sealed);
+                            continue;
+                        }
                         if (echoed_this_run) continue;
                         echoed_this_run = true;
                         // Echo, byte for byte. A canned HTTP response answers

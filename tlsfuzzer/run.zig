@@ -30,11 +30,11 @@ const tlsfuzzer_commit = "5eebc4464e5197a7f7392fb9acda99cfc32441f7";
 const tlslite_requirement = "tlslite-ng==0.9.0b2";
 const ecdsa_requirement = "ecdsa>=0.15";
 
-/// What the pin above scores on this tree: 19 scripts, 1348
+/// What the pin above scores on this tree: 21 scripts, 1418
 /// conversations between them. Raise it whenever a fix moves the number
 /// up; a drop is either a regression or a suppression, and both deserve
 /// to stop the build.
-const passing_floor: u32 = 19;
+const passing_floor: u32 = 21;
 
 const work_dir = "zig-out/tlsfuzzer";
 const checkout_dir = work_dir ++ "/tlsfuzzer";
@@ -58,6 +58,15 @@ const Leaf = struct {
     port: u16,
     cert_path: []const u8,
     key_path: []const u8,
+    /// How this instance answers application data. The corpus is not of
+    /// one mind about that and cannot be made to be: `test-tls13-lengths`
+    /// checks the reply's *length* against what it sent across 1002
+    /// conversations, which only an echo satisfies, while several scripts
+    /// send one request across several records, expect the single reply
+    /// an HTTP server gives, and expect *silence* until the request is
+    /// complete. Serving both from one instance is not a harness that
+    /// needs cleverness; it is two harnesses.
+    http: bool = false,
 };
 
 const leaves = [_]Leaf{
@@ -72,6 +81,20 @@ const leaves = [_]Leaf{
         .port = 4434,
         .cert_path = "src/testdata/rsa2048-cert.pem",
         .key_path = "src/testdata/rsa2048-key.pem",
+    },
+    .{
+        .name = "rsa-http",
+        // 4436, not 4435: `tlsanvil/run.zig` binds 4435 for its own
+        // instance of this same harness, and both gates document
+        // hand-driving it there. Separate CI jobs never collide, but a
+        // developer running `zig build tlsfuzzer` while TLS-Anvil's
+        // hundred-minute budget is still going would have one of them
+        // fail to bind — and fail for a reason belonging to neither
+        // corpus.
+        .port = 4436,
+        .cert_path = "src/testdata/rsa2048-cert.pem",
+        .key_path = "src/testdata/rsa2048-key.pem",
+        .http = true,
     },
 };
 
@@ -375,10 +398,11 @@ fn startServer(
     const server = try arena.create(Server);
     server.child = try std.process.spawn(io, .{
         .argv = &.{
-            absolute,      "--port",              port,
-            "--cert",      leaf.cert_path,        "--key",
-            leaf.key_path, "--psk",               external_psk_hex,
-            "--psk-iden",  external_psk_identity,
+            absolute,                          "--port",              port,
+            "--cert",                          leaf.cert_path,        "--key",
+            leaf.key_path,                     "--psk",               external_psk_hex,
+            "--psk-iden",                      external_psk_identity, "--reply",
+            if (leaf.http) "http" else "echo",
         },
         .stdin = .ignore,
         .stdout = .ignore,

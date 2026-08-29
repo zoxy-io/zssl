@@ -10,8 +10,8 @@ itself.
 It runs: `zig build tlsfuzzer`.
 
 ```
-tlsfuzzer: 19 scripts to run, 38 disabled (0 of those untriaged)
-tlsfuzzer: 19 scripts passed, 0 failed, 38 disabled, floor 19
+tlsfuzzer: 21 scripts to run, 36 disabled (0 of those untriaged)
+tlsfuzzer: 21 scripts passed, 0 failed, 36 disabled, floor 21
 tlsfuzzer: PASS
 ```
 
@@ -37,11 +37,28 @@ is thin, and the rest of this file is about how thin, and why.
   entry naming the leaf it wants; `Disabled` maps every other script to
   the one-line reason it is not run.
 
-## Two leaves
+## Three instances
 
-The gate serves an ECDSA leaf on port 4433 and an RSA one on 4434, and
-each `Run` entry says which it connects to (`"leaf": "rsa"`; ECDSA is the
-default).
+The gate serves an ECDSA leaf on 4433, an RSA one on 4434, and a second
+RSA one on 4435 that answers application data differently. Each `Run`
+entry says which it connects to (`"leaf": "rsa"`; ECDSA is the default).
+
+The third is not a third *leaf* — same certificate as the second — but a
+third **reply mode**, and it exists because the corpus is not of one mind
+about what a server does with a request. `test-tls13-lengths` checks the
+reply's *length* against what it sent, 1002 times, which only an echo can
+satisfy. Several other scripts send one request across several records
+and expect the single reply an HTTP server gives — and, harder, expect
+*silence* until the request is complete: `test-tls13-zero-content-type`
+sends `GET /` with no blank line and then a malformed record, and wants
+the alert and nothing else. An echo answers the `GET /` and fails the
+script on a point that has nothing to do with the protocol.
+
+Serving both from one instance is not a harness that needs cleverness;
+it is two harnesses. `--reply http` buffers until it sees `\r\n\r\n`
+and then answers once, the way `s_server -www` does — which is why
+OpenSSL passes these scripts and an echo cannot. It moved
+`zero-content-type` to 8 of 8 and `keyupdate` to 62 of 62.
 
 That is not a nicety. A dozen-odd scripts advertise **only** RSA-PSS
 signature algorithms — `test_tls13_ccs.py` asks for `rsa_pss_rsae_sha256`
@@ -59,7 +76,7 @@ is reporting on the fixture.
 
 ## The numbers, and the debt
 
-**19 of 57** `test-tls13-*` scripts run, 1348 conversations between them.
+**21 of 57** `test-tls13-*` scripts run, 1418 conversations between them.
 `test-tls13-lengths` is 1002 of those on its own: every plaintext length
 from 1 to 2^14, each echoed back and checked for size.
 `test-tls13-connection-abort` is another 150, aborting the connection at
@@ -72,7 +89,7 @@ RSA signature scripts, the 68 conversations of `record-layer-limits`
 walking §5.1's and §5.2's caps from both sides since finding 7 closed,
 and `ccs` since finding 8 did.
 
-**38 disabled, none of them untriaged.** 24 carry scope reasons that were
+**36 disabled, none of them untriaged.** 24 carry scope reasons that were
 always plain — client certificates, FFDHE, brainpool curves, EdDSA,
 ML-DSA, ML-KEM, 0-RTT, compressed certificates, `psk_ke` without (EC)DHE,
 TLS 1.2 fallback, AES-CCM — each pointing at a written decision. The
@@ -115,15 +132,15 @@ and a debt that is not counted is a debt that is not paid. A new script
 arriving with a pin bump may push it back above zero; triage it before
 the commit lands, never after.
 
-**The floor** is 19. `scripts.json` can disable a script, but not quietly:
+**The floor** is 21. `scripts.json` can disable a script, but not quietly:
 the passing count falls with it and the gate goes red.
 
 ## What it cost to get here
 
-Fourteen defects, all found by running things rather than reading them,
+Fifteen defects, all found by running things rather than reading them,
 and each worth recording because each looked like something else. 1
 through 3 are the harness's and the gate's; 4 through 8, 11, 12 and 13
-are the library's; 9, 10 and 14 are the harness's again. 9 and 10 were
+are the library's; 9, 10, 14 and 15 are the harness's again. 9 and 10 were
 mistaken for the library's until the OpenSSL oracle said otherwise; 13
 went the other way, filed under 10 as a harness shape until the script's
 *expectation* was read instead of our reply; and 14 was blamed on two
@@ -496,12 +513,51 @@ actually sends the alert.
     they belong to finding 10 and to §4.6.3's answer-once rather than to
     this.
 
-Six of the fourteen were the harness's or the gate's — three at the
-start, and 9, 10 and 14 found here. The other eight are the library's.
-None of the fourteen would have been visible to a gate that was only
-read, and three were not visible to a gate that was only *run* either:
-12, 13 and 14 each needed a print statement in the path under suspicion
-before they gave up what they were.
+15. **(harness) One reply mode cannot serve this corpus.** Finding 10
+    changed the echo from once-per-record to once-per-run and got
+    `zero-length-data` green, but it left three conversations that no
+    echo rule can satisfy, because what they want is not a different
+    *reply* — it is **silence**. `test-tls13-zero-content-type` sends
+    `GET /` with no blank line and then a record with content type 0,
+    and expects the alert and nothing else; `test-tls13-keyupdate`'s
+    "app data split" sends `GET`, then a KeyUpdate, and expects our
+    KeyUpdate answer before the rest of the request arrives. An echo
+    answers the fragment and fails both on a point that has nothing to
+    do with the protocol.
+
+    Meanwhile `test-tls13-lengths` measures the reply's length against
+    what it sent, 1002 times, and only an echo can do that. The two
+    demands are exclusive, and the corpus is written against two
+    different servers: `s_server -www` for the first kind, echo mode for
+    the second. That is why OpenSSL passes them and we did not.
+
+    So the gate now runs a third instance — same RSA leaf, `--reply
+    http`, on 4435 — that buffers until it sees `\r\n\r\n` and then
+    answers once. `zero-content-type` **6 of 8 -> 8**, `keyupdate`
+    **60-62 -> 62 of 62**, both into `Run`. Floor 19 -> 21.
+
+    `keyupdate` carries one exclusion, `two KeyUpdates in one record`,
+    and the reason is a §4.6.3 reading we decided not to take. "After
+    sending this message, the sender SHALL send all its traffic using
+    the next generation of keys" can be read as making a KeyUpdate the
+    last message in its record — anything sharing it was sealed under
+    the generation the KeyUpdate retires — and tlsfuzzer reads it that
+    way, wanting `unexpected_message`. It was implemented, and BoGo did
+    not object; what objected was this tree's own
+    `"§5.1: a record packing three post-handshake messages yields all
+    three"`, written for BoGo finding 1, which packs a ticket *after* a
+    KeyUpdate and requires both to be processed. The record is the unit
+    of sending, so "after sending this message" is genuinely ambiguous
+    when two messages leave together. One conversation is not worth
+    overturning a documented decision, so the reading stands and the
+    exclusion says which conversation it costs.
+
+Seven of the fifteen were the harness's or the gate's — three at the
+start, and 9, 10, 14 and 15 found here. The other eight are the
+library's. None of the fifteen would have been visible to a gate that
+was only read, and three were not visible to a gate that was only *run*
+either: 12, 13 and 14 each needed a print statement in the path under
+suspicion before they gave up what they were.
 
 ## The triage of the eighteen
 
@@ -513,8 +569,8 @@ the shape of the debt that was paid.
 | --- | --- |
 | **SCOPE** — needs a capability or a fixture we chose not to carry | `ecdhe-curves`, `ecdsa-support`, `rsapss-signatures`, `serverhello-random`, `session-resumption`, `signature-algorithms` |
 | **KEEP** — the corpus wants one reading of the RFC and a second corpus demands the other | `finished` (7), `legacy-version` (11) |
-| **Green, and now in `Run`** | `record-layer-limits` (9, 7), `ccs` (8), `zero-length-data` (10), `psk_dhe_ke` (12) |
-| **Not a defect** — the corpus is stating its own policy, or the harness's shape | `keyupdate` (flaky; see its entry), `keyupdate-from-server`, `large-number-of-extensions`, `multiple-ccs-messages`, `shuffled-extentions`, `zero-content-type` |
+| **Green, and now in `Run`** | `record-layer-limits` (9, 7), `ccs` (8), `zero-length-data` (10), `psk_dhe_ke` (12), `zero-content-type` and `keyupdate` (15) |
+| **Not a defect** — the corpus is stating its own policy, or the harness's shape | `keyupdate-from-server`, `large-number-of-extensions`, `multiple-ccs-messages`, `shuffled-extentions` |
 
 Two patterns are worth carrying forward. The **SCOPE** column looked at
 first like mostly fixtures rather than protocol, and an earlier draft of
