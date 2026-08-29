@@ -179,9 +179,14 @@ name.
 
    The event surface grew a way to say "there is more": `drain` returns
    the next event from a record `handleRecord` already took, and null
-   once none remain. Null rather than `.none`, because `.none` is a real
-   event meaning "this record advanced nothing" and a drain that ran out
-   is a different statement.
+   once none remain. At the time both roles could also answer `.none`,
+   an event meaning "this advanced nothing", and the two were kept
+   apart deliberately — see the mistake below. `.none` is gone now:
+   `handleRecord` returns `?Event` too, `nextPostHandshake` skips the
+   messages that resolve to nothing, and null still comes only from the
+   assembler, so the distinction the mistake needed is preserved without
+   a member for it. The loop is `while (event) |ready| : (event = try
+   drain(&out))`.
 
    Two things fell out of building it, and both are the same mistake in
    different clothes — inferring "no more messages" from something other
@@ -194,7 +199,10 @@ name.
    stranded, and the next `handleRecord` blamed the embedder for it with
    `EventsPending` — a guard meant for embedder error, reachable from
    the wire. Null now comes only from `assembler.next()` having nothing,
-   and both roles share one dispatch so neither can drift.
+   and both roles share one dispatch so neither can drift. That is still
+   the rule after `.none` was removed: the silent message is skipped,
+   never returned as the end of the run. `client_server_test` walks that
+   exact packing and counts both tickets.
 
    The second is why that guard exists at all. `Assembler.push` appends
    *after* pending bytes, so an embedder that never drains does not lose

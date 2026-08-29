@@ -191,21 +191,21 @@ fn completeHandshake(server: *ServerHandshake, client: *Client) !void {
     var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
     var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
     const hello = client.helloRecord(&client_out);
-    const flight = try server.handleRecord(hello, &server_out);
+    const flight = (try server.handleRecord(hello, &server_out)).?;
     try testing.expectEqual(std.meta.activeTag(flight), .send);
     const reply = try client.absorb(flight.send, &client_out);
     try testing.expectEqual(std.meta.activeTag(reply), .connected);
     var index: usize = 0;
-    var final: ServerHandshake.Event = .none;
+    var final: ?ServerHandshake.Event = null;
     var count: u8 = 0;
     while (index < reply.connected.len) : (count += 1) {
         try testing.expect(count < 8);
         const length = std.mem.readInt(u16, reply.connected[index + 3 ..][0..2], .big);
         const one = reply.connected[index..][0 .. record.header_bytes + length];
-        final = try server.handleRecord(one, &server_out);
+        if (try server.handleRecord(one, &server_out)) |event| final = event;
         index += one.len;
     }
-    try testing.expectEqual(std.meta.activeTag(final), .connected);
+    try testing.expectEqual(std.meta.activeTag(final.?), .connected);
 }
 
 test "resumption end to end: tickets out, PSK session up, no certificate" {
@@ -262,7 +262,7 @@ test "resumption end to end: tickets out, PSK session up, no certificate" {
     // The resumed session works and can mint tickets of its own.
     var server_out: [record.wire_record_bytes_max]u8 = undefined;
     const ping = try client_two.sendApplicationData("ping", &client_out);
-    const ping_event = try second.server.handleRecord(ping, &server_out);
+    const ping_event = (try second.server.handleRecord(ping, &server_out)).?;
     try testing.expectEqualSlices(u8, "ping", ping_event.application_data);
     var psk_buffer: [cipher_suite.hash_bytes_max]u8 = undefined;
     const chained_psk = second.server.resumptionPsk(&.{0x02}, &psk_buffer);
@@ -337,7 +337,7 @@ test "§4.2.11.2: an external PSK is accepted under the ext binder label" {
     var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
     var server_out: [record.wire_record_bytes_max]u8 = undefined;
     const ping = try client.sendApplicationData("external", &client_out);
-    const event = try harness.server.handleRecord(ping, &server_out);
+    const event = (try harness.server.handleRecord(ping, &server_out)).?;
     try testing.expectEqualSlices(u8, "external", event.application_data);
 }
 

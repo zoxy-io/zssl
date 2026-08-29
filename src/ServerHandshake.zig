@@ -195,8 +195,13 @@ const SelectedPsk = struct {
     index: u16,
 };
 
+/// One thing that happened, as `handleRecord` and `drain` hand it back.
+///
+/// Neither carries a "nothing happened" member: both answer null for
+/// that, so a caller's `while (event) |ready|` ends rather than running
+/// a pass over a member with nothing in it. What null means is spelled
+/// out on `drain`, and it is the same statement from both.
 pub const Event = union(enum) {
-    none,
     /// Bytes to transmit, sliced from the caller's `out`.
     send: []const u8,
     /// The handshake completed on this record.
@@ -277,7 +282,13 @@ const ccs_seen_max: u8 = 2;
 
 /// Feed one whole wire record; act on what comes back. On any error the
 /// machine is `failed` and must not be fed again — the embedder closes.
-pub fn handleRecord(self: *ServerHandshake, wire_record: []const u8, out: []u8) Error!Event {
+///
+/// Null is "this record produced nothing", and it is the same null
+/// `drain` answers, so the two compose into one loop:
+///
+///     var event = try server.handleRecord(wire_record, &out);
+///     while (event) |ready| : (event = try server.drain(&out)) { … }
+pub fn handleRecord(self: *ServerHandshake, wire_record: []const u8, out: []u8) Error!?Event {
     assert(out.len >= out_bytes_min);
     assert(self.state != .failed);
     errdefer self.state = .failed;
@@ -286,7 +297,7 @@ pub fn handleRecord(self: *ServerHandshake, wire_record: []const u8, out: []u8) 
     // and would be taken ahead of this record's, so the peer's KeyUpdate
     // would rotate its keys while ours stayed put and the *next* record
     // would fail to open — a decryption failure that says nothing about
-    // its cause. `drain` until `.none`.
+    // its cause. `drain` until null.
     if (self.assembler.hasComplete()) return error.EventsPending;
     const header = try record.parseHeader(wire_record[0..record.header_bytes]);
     if (wire_record.len != @as(usize, record.header_bytes) + header.length) {
@@ -341,7 +352,7 @@ pub fn handleRecord(self: *ServerHandshake, wire_record: []const u8, out: []u8) 
             // for "other record types" without excepting this one.
             try self.refuseInterleavedRecord();
             self.ccs_seen += 1;
-            return .none;
+            return null;
         },
         .alert => {
             try self.refuseInterleavedRecord();
@@ -370,7 +381,7 @@ fn refuseInterleavedRecord(self: *const ServerHandshake) Error!void {
     if (!self.assembler.empty()) return error.UnexpectedMessage;
 }
 
-fn handlePlaintextAlert(self: *ServerHandshake, payload: []const u8) Error!Event {
+fn handlePlaintextAlert(self: *ServerHandshake, payload: []const u8) Error!?Event {
     assert(self.state != .failed);
     assert(payload.len >= 1);
     const parsed = try alert.parse(payload);
@@ -383,14 +394,14 @@ fn handlePlaintextAlert(self: *ServerHandshake, payload: []const u8) Error!Event
         // has no use for. Counted, because ignoring is work too.
         .ignore => {
             try self.flood_guard.observeWarningAlert();
-            return .none;
+            return null;
         },
         .refuse => return error.BadAlert,
         .peer_fatal => return error.PeerAlert,
     }
 }
 
-fn handlePlaintextHandshake(self: *ServerHandshake, wire_record: []const u8, out: []u8) Error!Event {
+fn handlePlaintextHandshake(self: *ServerHandshake, wire_record: []const u8, out: []u8) Error!?Event {
     // Plaintext handshake records are only ever the ClientHello leg.
     switch (self.state) {
         .awaiting_client_hello, .awaiting_retry_client_hello => {},
@@ -398,12 +409,12 @@ fn handlePlaintextHandshake(self: *ServerHandshake, wire_record: []const u8, out
     }
     assert(self.ladder == null or self.state == .awaiting_retry_client_hello);
     try self.assembler.push(wire_record[record.header_bytes..]);
-    const message = (try self.assembler.next()) orelse return .none;
+    const message = (try self.assembler.next()) orelse return null;
     if (message.messageType() != .client_hello) return error.UnexpectedMessage;
     // One message per flight here: bytes after a complete ClientHello are
     // a peer talking past its own handshake.
     if (!self.assembler.empty()) return error.UnexpectedMessage;
-    return self.handleClientHello(message.bytes, out);
+    return try self.handleClientHello(message.bytes, out);
 }
 
 fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Error!Event {
@@ -779,7 +790,7 @@ fn selectAlpn(self: *const ServerHandshake, hello: *const client_hello.ClientHel
     return error.NoApplicationProtocol;
 }
 
-fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: []u8) Error!Event {
+fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: []u8) Error!?Event {
     // Readable, not connected: §6.1 leaves the read side open after our
     // own close_notify, and closing it there is what made a truncated
     // shutdown indistinguishable from an orderly one.
@@ -840,14 +851,11 @@ fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: [
 
 /// `arm` is one `LadderOf(suite)` instance, always reached through the
 /// caller's `inline else` so the type is concrete at every call site.
-fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []const u8, out: []u8) Error!Event {
+fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []const u8, out: []u8) Error!?Event {
     assert(plaintext.len >= 1);
     try self.assembler.push(plaintext);
-    const message = (try self.assembler.next()) orelse return .none;
-    if (self.state != .awaiting_finished) {
-        return self.dispatchPostHandshake(arm, message, out);
-    }
-    assert(self.state == .awaiting_finished);
+    if (self.state != .awaiting_finished) return self.nextPostHandshake(arm, out);
+    const message = (try self.assembler.next()) orelse return null;
     if (message.messageType() != .finished) return error.UnexpectedMessage;
     // The Finished is the last thing in its flight; anything packed
     // after it is arriving before the keys that would carry it.
@@ -858,19 +866,46 @@ fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []c
     return .connected;
 }
 
-/// One post-handshake message, already pulled from the assembler.
-/// Shared by `handleRecord` and `drain` so that a message means the same
-/// thing whichever asked for it.
+/// One post-handshake message, already pulled from the assembler. Null
+/// is a message consumed in silence, never "no more messages" — see
+/// `nextPostHandshake`, which is the only caller and the only place
+/// allowed to tell those apart.
 fn dispatchPostHandshake(
     self: *ServerHandshake,
     arm: anytype,
     message: handshake.Message,
     out: []u8,
-) Error!Event {
+) Error!?Event {
     // §4.6.3 is the only post-handshake message a server hears; a client
     // has no tickets to send and no certificates to update.
     if (message.messageType() != .key_update) return error.UnexpectedMessage;
     return self.handleKeyUpdate(arm, message, out);
+}
+
+/// The next post-handshake message that has something to say, or null
+/// once the assembler holds no more complete ones.
+///
+/// The skipping is the point. A KeyUpdate can be consumed and produce
+/// nothing — `update_not_requested`, or one arriving after our own
+/// close_notify — and returning that to the caller as an event would
+/// end a `while (event) |ready|` loop on a message that was not the
+/// last, stranding whatever the peer packed behind it. Null still comes
+/// only from `assembler.next()`, which is what docs/BOGO.md finding 1
+/// requires; this loop is how both roles keep that promise while the
+/// caller gets an ordinary iterator.
+///
+/// Bounded by the flood ceiling rather than by a number chosen here:
+/// every silent message is a KeyUpdate, since `dispatchPostHandshake`
+/// refuses each other type, and `observeKeyUpdate` fails the 33rd in a
+/// row.
+fn nextPostHandshake(self: *ServerHandshake, arm: anytype, out: []u8) Error!?Event {
+    assert(self.readable());
+    var silent: u8 = 0;
+    while (try self.assembler.next()) |message| : (silent += 1) {
+        assert(silent <= flood.key_updates_max);
+        if (try self.dispatchPostHandshake(arm, message, out)) |event| return event;
+    }
+    return null;
 }
 
 /// The next event from a record already handed to `handleRecord`.
@@ -880,10 +915,10 @@ fn dispatchPostHandshake(
 /// `handleRecord` returns the first and this returns the rest. Call it
 /// until it answers null.
 ///
-/// Null rather than `.none` so the caller's loop ends on `orelse` or an
-/// `if (…) |event|` capture: `.none` is a real event meaning "this
-/// record advanced nothing", and a drain that ran out is a different
-/// statement from a record that did nothing.
+/// Null means one thing only: the assembler holds no further complete
+/// message. It never means "the last message resolved to nothing" —
+/// that is `nextPostHandshake`'s job to skip past, and inferring the
+/// end from a dispatch result is docs/BOGO.md finding 1.
 ///
 /// Every event borrows `out`, this one included, so consume an event
 /// before asking for the next: the bytes behind the previous one are
@@ -897,17 +932,14 @@ pub fn drain(self: *ServerHandshake, out: []u8) Error!?Event {
     if (self.ladder == null) return null;
     errdefer self.state = .failed;
     switch (self.ladder.?) {
-        inline else => |*arm| {
-            const message = (try self.assembler.next()) orelse return null;
-            return try self.dispatchPostHandshake(arm, message, out);
-        },
+        inline else => |*arm| return self.nextPostHandshake(arm, out),
     }
 }
 
 /// §4.6.3, receive side, delegated to the shared session-keys logic. The
 /// decrypted plaintext was already copied into the assembler, so `out`
 /// is free to carry any response.
-fn handleKeyUpdate(self: *ServerHandshake, arm: anytype, message: handshake.Message, out: []u8) Error!Event {
+fn handleKeyUpdate(self: *ServerHandshake, arm: anytype, message: handshake.Message, out: []u8) Error!?Event {
     assert(self.readable());
     assert(arm.session != null);
     // Counted before the rotation, because deriving the next generation
@@ -919,9 +951,9 @@ fn handleKeyUpdate(self: *ServerHandshake, arm: anytype, message: handshake.Mess
     // sent close_notify, so nothing further goes out, including a
     // KeyUpdate the peer asked us to send back. Our receive side still
     // rotated, which is what lets us keep reading to its close_notify.
-    if (self.state == .close_sent) return .none;
+    if (self.state == .close_sent) return null;
     if (response) |sealed| return .{ .send = sealed };
-    return .none;
+    return null;
 }
 
 /// §4.6.3, send side. `request_update` asks the peer to rotate too — the

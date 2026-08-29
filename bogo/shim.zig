@@ -685,12 +685,12 @@ const Pump = struct {
         while (server.state != .connected) : (records_seen += 1) {
             if (records_seen == records_per_phase_max) return error.TooManyRecords;
             const one = try pump.nextRecord();
-            switch (try server.handleRecord(one, &pump.out)) {
+            if (try server.handleRecord(one, &pump.out)) |ready| switch (ready) {
                 .send => |bytes| try pump.write(bytes),
-                .none, .connected => {},
+                .connected => {},
                 .closed => return error.PeerClosedDuringHandshake,
                 .application_data => return error.UnexpectedEvent,
-            }
+            };
         }
     }
 
@@ -701,13 +701,12 @@ const Pump = struct {
         while (client.state != .connected) : (records_seen += 1) {
             if (records_seen == records_per_phase_max) return error.TooManyRecords;
             const one = try pump.nextRecord();
-            switch (try client.handleRecord(one, &pump.out)) {
+            if (try client.handleRecord(one, &pump.out)) |ready| switch (ready) {
                 // The client's `connected` carries its final flight.
                 .send, .connected => |bytes| try pump.write(bytes),
-                .none => {},
                 .closed => return error.PeerClosedDuringHandshake,
                 .application_data, .ticket => return error.UnexpectedEvent,
-            }
+            };
         }
     }
 
@@ -748,7 +747,6 @@ const Pump = struct {
             // still the whole of it.
             .closed => return true,
             .send => |bytes| try pump.write(bytes),
-            .none => {},
             // Only the client machine has `ticket`, so the branch is
             // chosen by the machine's type rather than the tag — the
             // server arm never analyses a field it lacks.
@@ -769,8 +767,10 @@ const Pump = struct {
     /// that merely stopped is a truncation, not an orderly shutdown.
     ///
     /// Nothing this loop reads produces a reply. §6.1 forbids sending
-    /// after close_notify, and the machine already returns `.none`
-    /// rather than a KeyUpdate response once its write side is shut.
+    /// after close_notify, and once its write side is shut the machine
+    /// consumes a KeyUpdate in silence instead of answering it — which
+    /// `nextPostHandshake` skips past, so it reaches this loop as null
+    /// rather than as an event.
     fn awaitPeerClose(pump: *Pump, machine: anytype, connection: *const Connection) !void {
         var records_seen: u32 = 0;
         while (records_seen < records_per_phase_max) : (records_seen += 1) {
@@ -795,15 +795,12 @@ const Pump = struct {
                 pump.linger();
                 return err;
             };
-            // lint:unbounded-ok — each pass takes one complete message from a
-            // fixed reassembly buffer that only `handleRecord` refills, and
-            // `drain` answers null once none remain.
-            while (true) {
-                if (std.meta.activeTag(event) == .closed) return;
-                event = (machine.drain(&pump.out) catch |err| {
+            while (event) |ready| {
+                if (std.meta.activeTag(ready) == .closed) return;
+                event = machine.drain(&pump.out) catch |err| {
                     pump.linger();
                     return err;
-                }) orelse break;
+                };
             }
         }
         return error.TooManyRecords;
@@ -854,18 +851,15 @@ const Pump = struct {
             };
             // One record can carry more than one post-handshake
             // message, so every event it produced is taken before the
-            // next record is read. `.none` is the end of that run.
+            // next record is read. Null is the end of that run.
             var event = machine.handleRecord(one, &pump.out) catch |err| {
                 return pump.abort(machine, err);
             };
-            // lint:unbounded-ok — each pass takes one complete message from a
-            // fixed reassembly buffer that only `handleRecord` refills, and
-            // `drain` answers null once none remain.
-            while (true) {
-                if (try pump.act(machine, store, event)) return;
-                event = (machine.drain(&pump.out) catch |err| {
+            while (event) |ready| {
+                if (try pump.act(machine, store, ready)) return;
+                event = machine.drain(&pump.out) catch |err| {
                     return pump.abort(machine, err);
-                }) orelse break;
+                };
             }
         }
         return error.TooManyRecords;

@@ -73,9 +73,7 @@ const Duplex = struct {
         var records_seen: u8 = 0;
         while (try duplex.from_client.next()) |one| : (records_seen += 1) {
             std.debug.assert(records_seen < 16);
-            const event = try duplex.server.handleRecord(one, &duplex.server_out);
-            switch (event) {
-                .none => {},
+            if (try duplex.server.handleRecord(one, &duplex.server_out)) |event| switch (event) {
                 .send => |reply| duplex.enqueue(reply),
                 .connected => duplex.server_connected = true,
                 .application_data => |plaintext| {
@@ -85,7 +83,7 @@ const Duplex = struct {
                     duplex.application_received_bytes += plaintext.len;
                 },
                 .closed => {},
-            }
+            };
         }
     }
 

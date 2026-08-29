@@ -143,7 +143,7 @@ const Harness = struct {
     /// Drive the handshake to `connected` on both machines.
     fn connect(harness: *Harness, buffers: *Buffers) !void {
         const hello = harness.client.start(&buffers.client_out);
-        const flight = try harness.server.handleRecord(hello, &buffers.server_out);
+        const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
         try testing.expectEqual(std.meta.activeTag(flight), .send);
 
         var reply_storage: [2 * record.wire_record_bytes_max]u8 = undefined;
@@ -153,15 +153,13 @@ const Harness = struct {
         while (index < flight.send.len) : (count += 1) {
             try testing.expect(count < 8);
             const one = recordAt(flight.send, index);
-            const event = try harness.client.handleRecord(one, &buffers.scratch);
-            switch (event) {
-                .none => {},
+            if (try harness.client.handleRecord(one, &buffers.scratch)) |event| switch (event) {
                 .connected => |bytes| {
                     @memcpy(reply_storage[0..bytes.len], bytes);
                     reply_bytes = bytes.len;
                 },
                 else => return error.TestUnexpectedResult,
-            }
+            };
             index += one.len;
         }
         try testing.expect(reply_bytes >= 1);
@@ -169,14 +167,14 @@ const Harness = struct {
 
         index = 0;
         count = 0;
-        var final: ServerHandshake.Event = .none;
+        var final: ?ServerHandshake.Event = null;
         while (index < reply_bytes) : (count += 1) {
             try testing.expect(count < 8);
             const one = recordAt(reply_storage[0..reply_bytes], index);
-            final = try harness.server.handleRecord(one, &buffers.server_out);
+            if (try harness.server.handleRecord(one, &buffers.server_out)) |event| final = event;
             index += one.len;
         }
-        try testing.expectEqual(std.meta.activeTag(final), .connected);
+        try testing.expectEqual(std.meta.activeTag(final.?), .connected);
         try testing.expectEqual(ServerHandshake.State.connected, harness.server.state);
     }
 };
@@ -213,10 +211,10 @@ test "production client ↔ server: handshake, data, ticket capture, resumption"
 
     // Application data in both directions.
     const ping = try first.client.sendApplicationData("ping from origin client", &buffers.client_out);
-    const ping_event = try first.server.handleRecord(ping, &buffers.server_out);
+    const ping_event = (try first.server.handleRecord(ping, &buffers.server_out)).?;
     try testing.expectEqualSlices(u8, "ping from origin client", ping_event.application_data);
     const pong = try first.server.sendApplicationData("pong", &buffers.server_out);
-    const pong_event = try first.client.handleRecord(pong, &buffers.scratch);
+    const pong_event = (try first.client.handleRecord(pong, &buffers.scratch)).?;
     try testing.expectEqualSlices(u8, "pong", pong_event.application_data);
 
     // A ticket travels server → client through the event surface; the
@@ -234,7 +232,7 @@ test "production client ↔ server: handshake, data, ticket capture, resumption"
         .ticket_nonce = &.{0x0a},
         .ticket = "sealed-by-us!",
     }, &buffers.server_out);
-    const ticket_event = try first.client.handleRecord(sealed, &buffers.scratch);
+    const ticket_event = (try first.client.handleRecord(sealed, &buffers.scratch)).?;
     try testing.expectEqual(std.meta.activeTag(ticket_event), .ticket);
     try testing.expectEqual(@as(u32, 3600), ticket_event.ticket.lifetime_s);
     var resumption: ClientHandshake.Resumption = .{
@@ -252,7 +250,7 @@ test "production client ↔ server: handshake, data, ticket capture, resumption"
 
     // Clean close, server first this time.
     const close_record = try first.server.sendClose(&buffers.server_out);
-    const close_event = try first.client.handleRecord(close_record, &buffers.scratch);
+    const close_event = (try first.client.handleRecord(close_record, &buffers.scratch)).?;
     try testing.expectEqual(std.meta.activeTag(close_event), .closed);
 
     // Session two: resumed on the captured ticket, no certificate leg.
@@ -264,7 +262,7 @@ test "production client ↔ server: handshake, data, ticket capture, resumption"
     try testing.expect(second.client.resumed);
     try testing.expect(!second.client.certificate_verified);
     const echo = try second.client.sendApplicationData("resumed", &buffers.client_out);
-    const echo_event = try second.server.handleRecord(echo, &buffers.server_out);
+    const echo_event = (try second.server.handleRecord(echo, &buffers.server_out)).?;
     try testing.expectEqualSlices(u8, "resumed", echo_event.application_data);
 }
 
@@ -279,10 +277,11 @@ test "KeyUpdate both ways: generations rotate and the kTLS export tracks them" {
 
     // Client-initiated, with a rotation demanded of the server too.
     const update = try harness.client.sendKeyUpdate(true, &buffers.client_out);
-    const update_event = try harness.server.handleRecord(update, &buffers.server_out);
+    const update_event = (try harness.server.handleRecord(update, &buffers.server_out)).?;
     try testing.expectEqual(std.meta.activeTag(update_event), .send);
-    const ack_event = try harness.client.handleRecord(update_event.send, &buffers.scratch);
-    try testing.expectEqual(std.meta.activeTag(ack_event), .none);
+    // Null, not an event: the client rotated and had nothing to say
+    // back, which `update_requested` on our side does not ask for.
+    try testing.expect(try harness.client.handleRecord(update_event.send, &buffers.scratch) == null);
 
     // Every direction moved to generation 1 and both sides agree.
     const after = harness.client.exportKeyMaterial(.transmit);
@@ -291,20 +290,19 @@ test "KeyUpdate both ways: generations rotate and the kTLS export tracks them" {
 
     // Traffic still flows under the new generation, both ways.
     const ping = try harness.client.sendApplicationData("post-update ping", &buffers.client_out);
-    const ping_event = try harness.server.handleRecord(ping, &buffers.server_out);
+    const ping_event = (try harness.server.handleRecord(ping, &buffers.server_out)).?;
     try testing.expectEqualSlices(u8, "post-update ping", ping_event.application_data);
     const pong = try harness.server.sendApplicationData("post-update pong", &buffers.server_out);
-    const pong_event = try harness.client.handleRecord(pong, &buffers.scratch);
+    const pong_event = (try harness.client.handleRecord(pong, &buffers.scratch)).?;
     try testing.expectEqualSlices(u8, "post-update pong", pong_event.application_data);
 
     // Server-initiated, no rotation requested back: only its transmit
     // side and the client's receive side move.
     const quiet_update = try harness.server.sendKeyUpdate(false, &buffers.server_out);
-    const quiet_event = try harness.client.handleRecord(quiet_update, &buffers.scratch);
-    try testing.expectEqual(std.meta.activeTag(quiet_event), .none);
+    try testing.expect(try harness.client.handleRecord(quiet_update, &buffers.scratch) == null);
     try expectExportAgreement(&harness.server, &harness.client);
     const again = try harness.server.sendApplicationData("gen2", &buffers.server_out);
-    const again_event = try harness.client.handleRecord(again, &buffers.scratch);
+    const again_event = (try harness.client.handleRecord(again, &buffers.scratch)).?;
     try testing.expectEqualSlices(u8, "gen2", again_event.application_data);
 }
 
@@ -365,7 +363,7 @@ test "a hostile server flight errors rather than panicking" {
         // Drive the real handshake far enough that the client holds the
         // server's handshake keys, stopping before the protected flight.
         const hello = harness.client.start(&buffers.client_out);
-        const flight = try harness.server.handleRecord(hello, &buffers.server_out);
+        const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
         const server_hello_record = recordAt(flight.send, 0);
         _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
         try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
@@ -469,7 +467,7 @@ test "§4.1.4: a retry into a group we advertised produces a second hello" {
 
     var wire_buffer: [record.header_bytes + server_messages.server_hello_bytes_max]u8 = undefined;
     const retry = retryRecord(&wire_buffer, client_hello_mod.group_secp256r1);
-    const event = try harness.client.handleRecord(retry, &buffers.scratch);
+    const event = (try harness.client.handleRecord(retry, &buffers.scratch)).?;
     try testing.expectEqual(std.meta.activeTag(event), .send);
     try testing.expectEqual(ClientHandshake.State.awaiting_server_hello, harness.client.state);
 
@@ -526,7 +524,7 @@ test "a retried hello offers no PSK, so a selected one is refused" {
     // Retry into a group we advertised: CH2 goes out without the PSK.
     var wire_buffer: [record.header_bytes + server_messages.server_hello_bytes_max]u8 = undefined;
     const retry = retryRecord(&wire_buffer, client_hello_mod.group_secp256r1);
-    const event = try harness.client.handleRecord(retry, &buffers.scratch);
+    const event = (try harness.client.handleRecord(retry, &buffers.scratch)).?;
     try testing.expectEqual(std.meta.activeTag(event), .send);
     try testing.expect(!harness.client.resumed);
 
@@ -697,7 +695,7 @@ test "ALPN: a protocol the client never offered is refused" {
     defer harness.deinit();
 
     const hello = harness.client.start(&buffers.client_out);
-    const flight = try harness.server.handleRecord(hello, &buffers.server_out);
+    const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
     const server_hello_record = recordAt(flight.send, 0);
     _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
     try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
@@ -795,7 +793,7 @@ test "sendAlert: encrypted once keys exist, plaintext before, and the peer reads
         const sealed = harness.server.sendAlert(.close_notify, &buffers.server_out);
         // Our write side only (§6.1): the client has not closed back.
         try testing.expectEqual(ServerHandshake.State.close_sent, harness.server.state);
-        const event = try harness.client.handleRecord(sealed, &buffers.scratch);
+        const event = (try harness.client.handleRecord(sealed, &buffers.scratch)).?;
         try testing.expectEqual(std.meta.activeTag(event), .closed);
     }
 }
@@ -811,7 +809,7 @@ test "sendAlert mid-handshake leads with D.4's dummy ChangeCipherSpec" {
     // gone out. A peer in compatibility mode is still waiting for it, and
     // will not read a protected record that arrives first.
     const hello = harness.client.start(&buffers.client_out);
-    const flight = try harness.server.handleRecord(hello, &buffers.server_out);
+    const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
     const server_hello = recordAt(flight.send, 0);
     _ = try harness.client.handleRecord(server_hello, &buffers.scratch);
     try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
@@ -854,7 +852,7 @@ test "an RSA leaf signs the server's CertificateVerify and our client accepts it
     try testing.expect(harness.client.certificate_verified);
 
     const ping = try harness.client.sendApplicationData("rsa", &buffers.client_out);
-    const event = try harness.server.handleRecord(ping, &buffers.server_out);
+    const event = (try harness.server.handleRecord(ping, &buffers.server_out)).?;
     try testing.expectEqualSlices(u8, "rsa", event.application_data);
 }
 
@@ -891,7 +889,7 @@ test "a P-384 leaf signs with ecdsa_secp384r1_sha384 and our client accepts it" 
     );
 
     const ping = try harness.client.sendApplicationData("p384", &buffers.client_out);
-    const event = try harness.server.handleRecord(ping, &buffers.server_out);
+    const event = (try harness.server.handleRecord(ping, &buffers.server_out)).?;
     try testing.expectEqualSlices(u8, "p384", event.application_data);
 }
 
@@ -966,7 +964,7 @@ test "a protected record that is nothing but its content type is refused, not as
         try harness.init(.{});
         defer harness.deinit();
         const hello = harness.client.start(&buffers.client_out);
-        const flight = try harness.server.handleRecord(hello, &buffers.server_out);
+        const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
         const server_hello_record = recordAt(flight.send, 0);
         _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
         try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
@@ -996,7 +994,7 @@ test "a protected record that is nothing but its content type is refused, not as
     switch (harness.client.ladder.?) {
         inline else => |*arm| {
             const one = try arm.session.?.send.seal(.application_data, "x", &buffers.client_out);
-            const event = try harness.server.handleRecord(one, &buffers.server_out);
+            const event = (try harness.server.handleRecord(one, &buffers.server_out)).?;
             try testing.expectEqualSlices(u8, "x", event.application_data);
         },
     }
@@ -1021,7 +1019,7 @@ test "an alert the server sends before the client's Finished is readable by the 
     // Drive the handshake until the client is connected, but never hand
     // the client's Finished to the server: that is the window.
     const hello = harness.client.start(&buffers.client_out);
-    const flight = try harness.server.handleRecord(hello, &buffers.server_out);
+    const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
     var index: usize = 0;
     var count: u8 = 0;
     while (index < flight.send.len) : (count += 1) {
@@ -1153,7 +1151,7 @@ test "§4.2: EncryptedExtensions may carry only what we offered, where it is leg
         harness.client.config.server_name = shape.server_name;
 
         const hello = harness.client.start(&buffers.client_out);
-        const flight = try harness.server.handleRecord(hello, &buffers.server_out);
+        const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
         const server_hello_record = recordAt(flight.send, 0);
         _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
 
@@ -1257,7 +1255,7 @@ test "§5: a ChangeCipherSpec outside its window is unexpected_message" {
         defer harness.deinit();
         try harness.connect(&buffers);
         const bye = harness.client.sendAlert(.close_notify, &buffers.client_out);
-        const event = try harness.server.handleRecord(bye, &buffers.server_out);
+        const event = (try harness.server.handleRecord(bye, &buffers.server_out)).?;
         try testing.expectEqual(std.meta.activeTag(event), .closed);
         // The read side, and the §5 window is shut either way — a
         // half-closed connection is well past the peer's Finished.
@@ -1288,8 +1286,7 @@ test "§5: a ChangeCipherSpec outside its window is unexpected_message" {
         defer harness.deinit();
         const hello = harness.client.start(&buffers.client_out);
         _ = try harness.server.handleRecord(hello, &buffers.server_out);
-        const event = try harness.server.handleRecord(&ccs, &buffers.server_out);
-        try testing.expectEqual(std.meta.activeTag(event), .none);
+        try testing.expect(try harness.server.handleRecord(&ccs, &buffers.server_out) == null);
     }
 }
 
@@ -1378,8 +1375,7 @@ test "§6.1: user_canceled is ignored and bounded, other warnings are refused" {
             inline else => |*arm| {
                 for (0..flood.warning_alerts_max) |_| {
                     const sealed = try arm.session.?.send.seal(.alert, &user_canceled, &buffers.client_out);
-                    const event = try harness.server.handleRecord(sealed, &buffers.server_out);
-                    try testing.expectEqual(std.meta.activeTag(event), .none);
+                    try testing.expect(try harness.server.handleRecord(sealed, &buffers.server_out) == null);
                     try testing.expectEqual(ServerHandshake.State.connected, harness.server.state);
                 }
                 const one_too_many = try arm.session.?.send.seal(.alert, &user_canceled, &buffers.client_out);
@@ -1407,7 +1403,7 @@ test "§6.1: user_canceled is ignored and bounded, other warnings are refused" {
                     _ = try harness.server.handleRecord(sealed, &buffers.server_out);
                 }
                 const data = try arm.session.?.send.seal(.application_data, "hello", &buffers.client_out);
-                const event = try harness.server.handleRecord(data, &buffers.server_out);
+                const event = (try harness.server.handleRecord(data, &buffers.server_out)).?;
                 try testing.expectEqualStrings("hello", event.application_data);
                 // The whole budget again, on the far side of one byte.
                 for (0..flood.warning_alerts_max) |_| {
@@ -1482,7 +1478,7 @@ test "§6.1: a close closes one direction, and the peer may answer" {
         try testing.expect(harness.server.readable());
 
         // The client reads it, and its own halves move the other way.
-        const seen = try harness.client.handleRecord(bye, &buffers.scratch);
+        const seen = (try harness.client.handleRecord(bye, &buffers.scratch)).?;
         try testing.expectEqual(std.meta.activeTag(seen), .closed);
         try testing.expectEqual(ClientHandshake.State.close_received, harness.client.state);
         try testing.expect(harness.client.writable());
@@ -1492,7 +1488,7 @@ test "§6.1: a close closes one direction, and the peer may answer" {
         // used to abort. Both machines end fully closed.
         const answer = try harness.client.sendClose(&buffers.client_out);
         try testing.expectEqual(ClientHandshake.State.closed, harness.client.state);
-        const done = try harness.server.handleRecord(answer, &buffers.server_out);
+        const done = (try harness.server.handleRecord(answer, &buffers.server_out)).?;
         try testing.expectEqual(std.meta.activeTag(done), .closed);
         try testing.expectEqual(ServerHandshake.State.closed, harness.server.state);
         try testing.expect(!harness.server.readable());
@@ -1533,7 +1529,7 @@ test "§6.1: a close closes one direction, and the peer may answer" {
         _ = try harness.server.handleRecord(bye, &buffers.server_out);
         try testing.expectEqual(ServerHandshake.State.close_received, harness.server.state);
         const late = try harness.server.sendApplicationData("still here", &buffers.server_out);
-        const event = try harness.client.handleRecord(late, &buffers.scratch);
+        const event = (try harness.client.handleRecord(late, &buffers.scratch)).?;
         try testing.expectEqualStrings("still here", event.application_data);
     }
 
@@ -1575,7 +1571,7 @@ test "§6.1: a close before there is a connection closes the machine, not half o
         try harness.init(.{});
         defer harness.deinit();
         const bye = [_]u8{ 21, 3, 3, 0, 2, 1, 0 };
-        const event = try harness.server.handleRecord(&bye, &buffers.server_out);
+        const event = (try harness.server.handleRecord(&bye, &buffers.server_out)).?;
         try testing.expectEqual(std.meta.activeTag(event), .closed);
         try testing.expectEqual(ServerHandshake.State.closed, harness.server.state);
         try testing.expect(harness.server.ladder == null);
@@ -1640,7 +1636,7 @@ test "§6.1: a close before there is a connection closes the machine, not half o
         defer harness.deinit();
         _ = harness.client.start(&buffers.client_out);
         const bye = [_]u8{ 21, 3, 3, 0, 2, 1, 0 };
-        const event = try harness.client.handleRecord(&bye, &buffers.scratch);
+        const event = (try harness.client.handleRecord(&bye, &buffers.scratch)).?;
         try testing.expectEqual(std.meta.activeTag(event), .closed);
         try testing.expectEqual(ClientHandshake.State.closed, harness.client.state);
         try testing.expect(!harness.client.writable());
@@ -1695,12 +1691,11 @@ test "§5.1: a record packing three post-handshake messages yields all three" {
             // fail to open for a reason that is the test's fault.
             try arm.session.?.rotateTransmit();
             var event = try harness.client.handleRecord(sealed, &buffers.scratch);
-            while (true) {
-                if (std.meta.activeTag(event) == .ticket) {
-                    seen[tickets] = event.ticket.ticket[0];
+            while (event) |ready| : (event = try harness.client.drain(&buffers.scratch)) {
+                if (std.meta.activeTag(ready) == .ticket) {
+                    seen[tickets] = ready.ticket.ticket[0];
                     tickets += 1;
                 }
-                event = (try harness.client.drain(&buffers.scratch)) orelse break;
             }
         },
     }
@@ -1714,7 +1709,7 @@ test "§5.1: a record packing three post-handshake messages yields all three" {
     switch (harness.server.ladder.?) {
         inline else => |*arm| {
             const data = try arm.session.?.sealApplicationData("after", &buffers.server_out);
-            const event = try harness.client.handleRecord(data, &buffers.scratch);
+            const event = (try harness.client.handleRecord(data, &buffers.scratch)).?;
             try testing.expectEqualStrings("after", event.application_data);
         },
     }

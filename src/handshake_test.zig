@@ -52,21 +52,21 @@ const Harness = struct {
 /// event per run is the tests' invariant.
 fn feedRecords(server: *ServerHandshake, bytes: []const u8, out: []u8) !ServerHandshake.Event {
     var index: usize = 0;
-    var final: ServerHandshake.Event = .none;
+    var final: ?ServerHandshake.Event = null;
     var count: u8 = 0;
     while (index < bytes.len) : (count += 1) {
         try testing.expect(count < 8);
         const length = std.mem.readInt(u16, bytes[index + 3 ..][0..2], .big);
         const one = bytes[index..][0 .. record.header_bytes + length];
-        const event = try server.handleRecord(one, out);
-        if (std.meta.activeTag(event) != .none) {
-            try testing.expectEqual(std.meta.activeTag(final), .none);
+        if (try server.handleRecord(one, out)) |event| {
+            try testing.expect(final == null);
             final = event;
         }
         index += one.len;
     }
     try testing.expectEqual(bytes.len, index);
-    return final;
+    try testing.expect(final != null);
+    return final.?;
 }
 
 test "full 1-RTT: ALPN, app data both ways, kTLS export, clean close" {
@@ -83,7 +83,7 @@ test "full 1-RTT: ALPN, app data both ways, kTLS export, clean close" {
     var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
 
     const hello = client.helloRecord(&client_out);
-    const flight = try harness.server.handleRecord(hello, &server_out);
+    const flight = (try harness.server.handleRecord(hello, &server_out)).?;
     try testing.expectEqual(std.meta.activeTag(flight), .send);
     try testing.expectEqual(ServerHandshake.State.awaiting_finished, harness.server.state);
 
@@ -98,7 +98,7 @@ test "full 1-RTT: ALPN, app data both ways, kTLS export, clean close" {
 
     // Application data, both directions.
     const ping = try client.sendApplicationData("ping", &client_out);
-    const ping_event = try harness.server.handleRecord(ping, &server_out);
+    const ping_event = (try harness.server.handleRecord(ping, &server_out)).?;
     try testing.expectEqualSlices(u8, "ping", ping_event.application_data);
     const pong = try harness.server.sendApplicationData("pong", &server_out);
     const pong_event = try client.absorb(pong, &client_out);
@@ -117,7 +117,7 @@ test "full 1-RTT: ALPN, app data both ways, kTLS export, clean close" {
     // §6.1 closes one at a time, so the server's read side goes first
     // and its write side is still open, which is what lets it answer.
     const close_record = try client.sendClose(&client_out);
-    const close_event = try harness.server.handleRecord(close_record, &server_out);
+    const close_event = (try harness.server.handleRecord(close_record, &server_out)).?;
     try testing.expectEqual(std.meta.activeTag(close_event), .closed);
     try testing.expectEqual(ServerHandshake.State.close_received, harness.server.state);
     try testing.expect(harness.server.writable());
@@ -148,7 +148,7 @@ test "a ClientHello fragmented across three records reassembles" {
         .{ third, 2 * third },
         .{ 2 * third, payload.len },
     };
-    var flight: ServerHandshake.Event = .none;
+    var flight: ?ServerHandshake.Event = null;
     for (cuts, 0..) |cut, index| {
         var fragment: [record.wire_record_bytes_max]u8 = undefined;
         const body = payload[cut[0]..cut[1]];
@@ -162,14 +162,14 @@ test "a ClientHello fragmented across three records reassembles" {
             &server_out,
         );
         if (index < cuts.len - 1) {
-            try testing.expectEqual(std.meta.activeTag(event), .none);
+            try testing.expect(event == null);
         } else {
             flight = event;
         }
     }
     // The reassembled hello produces a flight the client accepts whole —
     // transcript agreement is the proof the fragments reunited exactly.
-    const reply = try client.absorb(flight.send, &client_out);
+    const reply = try client.absorb(flight.?.send, &client_out);
     try testing.expectEqual(std.meta.activeTag(reply), .connected);
     const done = try feedRecords(&harness.server, reply.connected, &server_out);
     try testing.expectEqual(std.meta.activeTag(done), .connected);
@@ -188,7 +188,7 @@ test "HelloRetryRequest: no usable share, retry, complete" {
     var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
 
     const first_hello = client.helloRecord(&client_out);
-    const retry = try harness.server.handleRecord(first_hello, &server_out);
+    const retry = (try harness.server.handleRecord(first_hello, &server_out)).?;
     try testing.expectEqual(std.meta.activeTag(retry), .send);
     try testing.expectEqual(ServerHandshake.State.awaiting_retry_client_hello, harness.server.state);
 
@@ -240,7 +240,7 @@ test "failure paths fail closed" {
         var client = Client.init(&client_x25519_private, &.{ .send_change_cipher_spec = false });
         defer client.deinit();
         const hello = client.helloRecord(&client_out);
-        const flight = try harness.server.handleRecord(hello, &server_out);
+        const flight = (try harness.server.handleRecord(hello, &server_out)).?;
         const reply = try client.absorb(flight.send, &client_out);
         var tampered: [2 * record.wire_record_bytes_max]u8 = undefined;
         @memcpy(tampered[0..reply.connected.len], reply.connected);
@@ -261,7 +261,7 @@ test "failure paths fail closed" {
         var client = Client.init(&client_x25519_private, &.{});
         defer client.deinit();
         const hello = client.helloRecord(&client_out);
-        const flight = try harness.server.handleRecord(hello, &server_out);
+        const flight = (try harness.server.handleRecord(hello, &server_out)).?;
         const reply = try client.absorb(flight.send, &client_out);
         const done = try feedRecords(&harness.server, reply.connected, &server_out);
         try testing.expectEqual(std.meta.activeTag(done), .connected);
@@ -288,7 +288,7 @@ test "the server negotiates whichever group the client offers a share for" {
         var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
 
         const hello = client.helloRecord(&client_out);
-        const flight = try harness.server.handleRecord(hello, &server_out);
+        const flight = (try harness.server.handleRecord(hello, &server_out)).?;
         try testing.expectEqual(std.meta.activeTag(flight), .send);
         // No HelloRetryRequest: the share was usable as offered.
         try testing.expectEqual(ServerHandshake.State.awaiting_finished, harness.server.state);
@@ -359,7 +359,7 @@ test "§9.2: an omitted key_share is missing_extension, an empty one is a retry"
             .offer_unsupported_decoy = true,
         });
         defer client.deinit();
-        const retry = try harness.server.handleRecord(client.helloRecord(&client_out), &server_out);
+        const retry = (try harness.server.handleRecord(client.helloRecord(&client_out), &server_out)).?;
         try testing.expectEqual(std.meta.activeTag(retry), .send);
         try testing.expectEqual(
             ServerHandshake.State.awaiting_retry_client_hello,
@@ -424,7 +424,7 @@ test "§4.2.9 and §4.6.1: psk_key_exchange_modes gates both the offer and the t
         var client = Client.init(&client_x25519_private, &.{ .psk_mode_byte = 0x1a });
         defer client.deinit();
 
-        const flight = try harness.server.handleRecord(client.helloRecord(&client_out), &server_out);
+        const flight = (try harness.server.handleRecord(client.helloRecord(&client_out), &server_out)).?;
         const reply = try client.absorb(flight.send, &client_out);
         const done = try feedRecords(&harness.server, reply.connected, &server_out);
         try testing.expectEqual(std.meta.activeTag(done), .connected);
@@ -440,7 +440,7 @@ test "§4.2.9 and §4.6.1: psk_key_exchange_modes gates both the offer and the t
             defer bare.deinit();
             var out: [2 * record.wire_record_bytes_max]u8 = undefined;
             var scratch: [2 * record.wire_record_bytes_max]u8 = undefined;
-            const bare_flight = try permissive.server.handleRecord(bare.helloRecord(&out), &scratch);
+            const bare_flight = (try permissive.server.handleRecord(bare.helloRecord(&out), &scratch)).?;
             const bare_reply = try bare.absorb(bare_flight.send, &out);
             _ = try feedRecords(&permissive.server, bare_reply.connected, &scratch);
             try testing.expect(permissive.server.ticketPermitted());

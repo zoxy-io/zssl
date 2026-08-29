@@ -352,12 +352,12 @@ const Pump = struct {
         while (server.state != .connected) : (records_seen += 1) {
             if (records_seen == records_per_phase_max) return error.TooManyRecords;
             const one = try pump.nextRecord();
-            switch (try server.handleRecord(one, &pump.out)) {
+            if (try server.handleRecord(one, &pump.out)) |ready| switch (ready) {
                 .send => |bytes| try pump.write(bytes),
-                .none, .connected => {},
+                .connected => {},
                 .closed => return error.PeerClosedDuringHandshake,
                 .application_data => return error.UnexpectedEvent,
-            }
+            };
         }
     }
 
@@ -415,14 +415,13 @@ const Pump = struct {
             var event = server.handleRecord(one, &pump.out) catch |err| {
                 return pump.abort(server, err);
             };
-            // lint:unbounded-ok — each pass takes one complete message from a
-            // fixed reassembly buffer that only `handleRecord` refills, and
-            // `drain` answers null once none remain.
-            while (true) : (event = (server.drain(&pump.out) catch |err| {
+            var data_this_record = false;
+            while (event) |ready| : (event = server.drain(&pump.out) catch |err| {
                 return pump.abort(server, err);
-            }) orelse break) {
-                switch (event) {
+            }) {
+                switch (ready) {
                     .application_data => |bytes| {
+                        data_this_record = true;
                         if (bytes.len == 0) continue;
                         if (reply == .http) {
                             // Silence until the request is complete, then
@@ -493,13 +492,19 @@ const Pump = struct {
                         pump.write(server.sendAlert(.close_notify, &pump.out)) catch {};
                         return;
                     },
-                    .send => |bytes| {
-                        echoed_this_run = false;
-                        try pump.write(bytes);
-                    },
-                    .none, .connected => echoed_this_run = false,
+                    .send => |bytes| try pump.write(bytes),
+                    .connected => {},
                 }
             }
+            // A record that delivered no application data ends the run,
+            // and the reply budget below is per run. This used to be a
+            // `.none` arm in the switch above; null does not reach a
+            // switch, so it moved out here — where it covers the record
+            // that produced nothing *and* the message consumed in
+            // silence, which the arm never saw separately anyway. One
+            // application_data record yields at most one such event and
+            // a handshake record yields none, so the test is exact.
+            if (!data_this_record) echoed_this_run = false;
         }
         return error.TooManyRecords;
     }

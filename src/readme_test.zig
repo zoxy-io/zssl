@@ -76,18 +76,13 @@ test "README: terminating TLS" {
     // zero times; the point here is that it typechecks.
     stream: while (try records.next()) |wire_record| {
         var event = try server.handleRecord(wire_record, &out);
-        // lint:unbounded-ok — each pass takes one complete message from a
-        // fixed reassembly buffer that only `handleRecord` refills, and
-        // `drain` answers null once none remain.
-        while (true) {
-            switch (event) {
+        while (event) |ready| : (event = try server.drain(&out)) {
+            switch (ready) {
                 .send => |bytes| try socket.writeAll(bytes),
                 .connected => {},
                 .application_data => |plaintext| try onRequest(plaintext),
                 .closed => break :stream,
-                .none => {},
             }
-            event = try server.drain(&out) orelse break;
         }
     }
 }
@@ -116,18 +111,13 @@ test "README: originating TLS" {
     var records = zssl.record_buffer.RecordBuffer.init(&storage);
     stream: while (try records.next()) |wire_record| {
         var event = try client.handleRecord(wire_record, &out);
-        // lint:unbounded-ok — each pass takes one complete message from a
-        // fixed reassembly buffer that only `handleRecord` refills, and
-        // `drain` answers null once none remain.
-        while (true) {
-            switch (event) {
+        while (event) |ready| : (event = try client.drain(&out)) {
+            switch (ready) {
                 .send, .connected => |bytes| try socket.writeAll(bytes),
                 .application_data => |plaintext| try onResponse(plaintext),
                 .ticket => |ticket| try store(ticket),
                 .closed => break :stream,
-                .none => {},
             }
-            event = try client.drain(&out) orelse break;
         }
     }
 }

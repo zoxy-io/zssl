@@ -690,12 +690,11 @@ const Pump = struct {
         while (server.state != .connected) : (records_seen += 1) {
             assert(records_seen < 64);
             const one = try pump.nextRecord();
-            const event = try server.handleRecord(one, &pump.out);
-            switch (event) {
+            if (try server.handleRecord(one, &pump.out)) |event| switch (event) {
                 .send => |bytes| try pump.write(bytes),
-                .none, .connected => {},
+                .connected => {},
                 else => return error.UnexpectedEvent,
-            }
+            };
         }
     }
 
@@ -705,12 +704,10 @@ const Pump = struct {
         while (client.state != .connected) : (records_seen += 1) {
             assert(records_seen < 64);
             const one = try pump.nextRecord();
-            const event = try client.handleRecord(one, &pump.out);
-            switch (event) {
+            if (try client.handleRecord(one, &pump.out)) |event| switch (event) {
                 .send, .connected => |bytes| try pump.write(bytes),
-                .none => {},
                 else => return error.UnexpectedEvent,
-            }
+            };
         }
     }
 
@@ -736,17 +733,14 @@ const Pump = struct {
             // `handleRecord` refuses to run with events still pending.
             var found: ?[]const u8 = null;
             var event = try machine.handleRecord(one, &pump.out);
-            // lint:unbounded-ok — each pass takes one complete message from a
-            // fixed reassembly buffer that only `handleRecord` refills, and
-            // `drain` answers null once none remain.
-            while (true) {
-                switch (event) {
+            while (event) |ready| : (event = try machine.drain(&pump.out)) {
+                switch (ready) {
                     .application_data => |bytes| {
                         @memcpy(pump.plaintext[0..bytes.len], bytes);
                         pump.plaintext_bytes = bytes.len;
                         found = pump.plaintext[0..bytes.len];
                     },
-                    .none, .send => {},
+                    .send => {},
                     else => {
                         // A real openssl server issues NewSessionTickets
                         // right after the handshake; parsing them without
@@ -754,13 +748,12 @@ const Pump = struct {
                         // not what we came to read here. Matched by tag
                         // name because only the client machine has the
                         // variant, and this helper serves both.
-                        if (!std.mem.eql(u8, @tagName(event), "ticket")) {
+                        if (!std.mem.eql(u8, @tagName(ready), "ticket")) {
                             return error.UnexpectedEvent;
                         }
                         tickets_seen += 1;
                     },
                 }
-                event = (try machine.drain(&pump.out)) orelse break;
             }
             if (found) |bytes| return bytes;
         }
