@@ -942,9 +942,13 @@ fn alertFor(err: anyerror) ?alert.Description {
         error.TooManyEmptyRecords,
         error.TooManyKeyUpdates,
         error.TooManyWarningAlerts,
-        // §4.2.10's ceiling on rejected early data, which is the same
-        // shape of refusal and gets the same alert from BoringSSL.
+        // §4.2.10's two early-data ceilings answer the same way, and
+        // BoringSSL sends this for both (`SSL_R_TOO_MUCH_SKIPPED_EARLY_DATA`
+        // in `ssl/tls_record.cc`, `SSL_R_TOO_MUCH_READ_EARLY_DATA` in
+        // `ssl/s3_pkt.cc`): one bounds data we declined and never keyed,
+        // the other data we did.
         error.TooMuchSkippedEarlyData,
+        error.TooMuchEarlyData,
         => .unexpected_message,
         // Not a TLS record at all — the same answer BoringSSL gives an
         // HTTP request that arrived on the TLS port.

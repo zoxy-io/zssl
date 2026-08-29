@@ -455,7 +455,7 @@ test "a hostile server flight errors rather than panicking" {
         defer forger.deinit();
         var plaintext: [4096]u8 = undefined;
         var used: usize = 0;
-        const extensions = server_messages.encryptedExtensions(plaintext[used..], "http/1.1");
+        const extensions = server_messages.encryptedExtensions(plaintext[used..], "http/1.1", false);
         used += extensions.len;
         switch (shape.kind) {
             .verify_without_certificate => {
@@ -944,7 +944,7 @@ test "ALPN: a protocol the client never offered is refused" {
     defer forger.deinit();
     var plaintext: [4096]u8 = undefined;
     // "http/1.1" was never in the offer — only "h2" was.
-    const extensions = server_messages.encryptedExtensions(&plaintext, "http/1.1");
+    const extensions = server_messages.encryptedExtensions(&plaintext, "http/1.1", false);
     var forged_record: [record.wire_record_bytes_max]u8 = undefined;
     const sealed = try forger.seal(.handshake, extensions, &forged_record);
 

@@ -12,6 +12,7 @@ const ServerHandshake = @import("ServerHandshake.zig");
 const backend = @import("crypto/backend_openssl.zig");
 const cipher_suite = @import("cipher_suite.zig");
 const client_hello = @import("client_hello.zig");
+const anti_replay = @import("anti_replay.zig");
 const client_messages = @import("client_messages.zig");
 const key_schedule = @import("key_schedule.zig");
 const record = @import("record.zig");
@@ -711,4 +712,293 @@ test "§4.6.1: an expired ticket falls back to a full handshake, not an error" {
         // Fresh resumes on the PSK; expired signs a certificate instead.
         try testing.expectEqual(!expired, harness.server.resumed);
     }
+}
+
+/// A `psk_lookup` that answers one ticket on 0-RTT terms the test picks.
+const EarlyDataStore = struct {
+    psk: [cipher_suite.hash_bytes_max]u8,
+    issued: ServerHandshake.Issued,
+    early_data: ?ServerHandshake.EarlyData,
+
+    fn lookup(
+        context: *anyopaque,
+        identity: []const u8,
+        obfuscated_age: u32,
+        psk_out: *[cipher_suite.hash_bytes_max]u8,
+    ) ?ServerHandshake.Psk {
+        _ = obfuscated_age;
+        const store: *EarlyDataStore = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, identity, "ticket")) return null;
+        psk_out.* = store.psk;
+        return .{
+            .psk_bytes = 32,
+            .kind = .resumption,
+            .issued = store.issued,
+            .early_data = store.early_data,
+        };
+    }
+};
+
+const EarlyDataFixture = struct {
+    const psk = [_]u8{0x7e} ** 32;
+    const issued_at_ms: u64 = 4_000_000;
+    const age_add: u32 = 0x0bad_c0de;
+    /// The client learned the ticket 250 ms ago and we are 250 ms past
+    /// issuing it: no skew, which §8.3 wants.
+    const now_ms: u64 = issued_at_ms + 250;
+
+    fn ticket() test_client.Ticket {
+        var entry: test_client.Ticket = .{
+            .lifetime_s = 3600,
+            .age_add = age_add,
+            .nonce = undefined,
+            .nonce_bytes = 1,
+            .ticket = undefined,
+            .ticket_bytes = 6,
+            .psk = undefined,
+            .psk_bytes = 32,
+            .kind = .resumption,
+        };
+        @memset(&entry.psk, 0);
+        @memcpy(entry.psk[0..psk.len], &psk);
+        @memcpy(entry.ticket[0..6], "ticket");
+        return entry;
+    }
+
+    fn store(bytes_max: u32, suite: cipher_suite.CipherSuite) EarlyDataStore {
+        var s: EarlyDataStore = .{
+            .psk = undefined,
+            .issued = .{ .at_ms = issued_at_ms, .age_add = age_add, .lifetime_s = 3600 },
+            .early_data = .{ .bytes_max = bytes_max, .suite = suite },
+        };
+        @memset(&s.psk, 0);
+        @memcpy(s.psk[0..psk.len], &psk);
+        return s;
+    }
+};
+
+test "§4.2.10 end to end: early data is accepted, read, and the session completes" {
+    // The property slice 2's unit tests could not reach: a real client
+    // puts application data on the wire before the server has said
+    // anything, and the server reads it under keys derived from the
+    // hello alone — then the same handshake finishes normally with the
+    // client's Finished MACing a transcript that includes §4.5's
+    // EndOfEarlyData and application secrets that do not (§4.4 vs §7.1).
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var early_out: [record.wire_record_bytes_max]u8 = undefined;
+
+    var registry: [anti_replay.StrikeRegister.probe_max]anti_replay.StrikeRegister.Entry =
+        @splat(.free);
+    var register: anti_replay.StrikeRegister = .{ .entries = &registry };
+    var store = EarlyDataFixture.store(1024, .aes_128_gcm_sha256);
+    var harness: Harness = undefined;
+    try harness.initLookup(.{ .context = &store, .lookup = EarlyDataStore.lookup });
+    defer harness.deinit();
+    harness.server.config.now_ms = EarlyDataFixture.now_ms;
+    harness.server.config.strike_register = &register;
+
+    var ticket = EarlyDataFixture.ticket();
+    var client = Client.init(&client_x25519_private, &.{
+        .resume_with = &ticket,
+        .offer_early_data = true,
+    });
+    defer client.deinit();
+
+    // The hello, then 0-RTT data behind it — before the server has been
+    // fed anything at all, which is the whole point of the mode.
+    const hello = client.helloRecord(&client_out);
+    const early = try client.earlyDataRecord("GET /0rtt", &early_out);
+
+    const flight = (try harness.server.handleRecord(hello, &server_out)).?;
+    try testing.expectEqual(std.meta.activeTag(flight), .send);
+    try testing.expect(harness.server.early_data_accepted);
+    try testing.expect(harness.server.resumed);
+    try testing.expectEqual(
+        ServerHandshake.State.awaiting_end_of_early_data,
+        harness.server.state,
+    );
+
+    // Read, not discarded.
+    var flight_storage: [2 * record.wire_record_bytes_max]u8 = undefined;
+    @memcpy(flight_storage[0..flight.send.len], flight.send);
+    const flight_bytes = flight_storage[0..flight.send.len];
+    const early_event = (try harness.server.handleRecord(early, &server_out)).?;
+    try testing.expectEqualSlices(u8, "GET /0rtt", early_event.application_data);
+    try testing.expectEqual(@as(u32, 9), harness.server.early_data_bytes);
+
+    // The client's flight carries EndOfEarlyData and then its Finished,
+    // and the server completes on it — which only works if both ends
+    // agree about which transcript the Finished covers.
+    const reply = try client.absorb(flight_bytes, &client_out);
+    try testing.expectEqual(std.meta.activeTag(reply), .connected);
+    var final: ?ServerHandshake.Event = null;
+    var index: usize = 0;
+    var count: u8 = 0;
+    while (index < reply.connected.len) : (count += 1) {
+        try testing.expect(count < 8);
+        const length = std.mem.readInt(u16, reply.connected[index + 3 ..][0..2], .big);
+        const one = reply.connected[index..][0 .. record.header_bytes + length];
+        if (try harness.server.handleRecord(one, &server_out)) |event| final = event;
+        index += one.len;
+    }
+    try testing.expectEqual(std.meta.activeTag(final.?), .connected);
+    try testing.expectEqual(ServerHandshake.State.connected, harness.server.state);
+}
+
+/// Drive one hello at a fresh server on the given terms, and answer
+/// whether the early data behind it was accepted. Everything the test
+/// wants to vary is a parameter; everything else is the fixture, so a
+/// refusal can only come from the thing under test.
+fn earlyDataAccepted(options: struct {
+    now_ms: u64 = EarlyDataFixture.now_ms,
+    bytes_max: u32 = 1024,
+    /// §4.2.10 requires the ticket's suite to be the negotiated one.
+    /// The fixture negotiates AES-128-GCM, so anything else here is a
+    /// mismatch and nothing else about the hello changes.
+    suite: cipher_suite.CipherSuite = .aes_128_gcm_sha256,
+    register: ?*anti_replay.StrikeRegister,
+    clock: bool = true,
+    terms: bool = true,
+    /// Offer an identity the server does not know ahead of the real
+    /// one, so the PSK it selects is not the first offered.
+    decoy_first: bool = false,
+}) !bool {
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var store = EarlyDataFixture.store(options.bytes_max, options.suite);
+    if (!options.terms) store.early_data = null;
+    var harness: Harness = undefined;
+    try harness.initLookup(.{ .context = &store, .lookup = EarlyDataStore.lookup });
+    defer harness.deinit();
+    if (options.clock) harness.server.config.now_ms = options.now_ms;
+    harness.server.config.strike_register = options.register;
+
+    var ticket = EarlyDataFixture.ticket();
+    var client = Client.init(&client_x25519_private, &.{
+        .resume_with = &ticket,
+        .offer_early_data = true,
+        .psk_decoy_first = options.decoy_first,
+    });
+    defer client.deinit();
+    const flight = (try harness.server.handleRecord(
+        client.helloRecord(&client_out),
+        &server_out,
+    )).?;
+    try testing.expectEqual(std.meta.activeTag(flight), .send);
+    // Whatever the answer, the handshake itself survives: refusing 0-RTT
+    // costs a round trip and never the connection.
+    try testing.expect(harness.server.resumed);
+    return harness.server.early_data_accepted;
+}
+
+test "§8: every gate on early data refuses on its own, and none of them fails the handshake" {
+    // The client's hello is byte-identical across all of these — the
+    // randoms and the scalar are fixtures — so the same hello is
+    // accepted or refused purely on the server's terms. That is what
+    // makes each row a test of one gate.
+    var registry: [anti_replay.StrikeRegister.probe_max]anti_replay.StrikeRegister.Entry =
+        @splat(.free);
+    var register: anti_replay.StrikeRegister = .{ .entries = &registry };
+
+    // The control: everything present, and it is accepted.
+    try testing.expect(try earlyDataAccepted(.{ .register = &register }));
+
+    // §8.2, and the reason the register exists: the *same* hello again,
+    // at the same instant, against a server that shares the register.
+    // Byte-for-byte replay is what an attacker who captured the first
+    // one has, and it must not be read twice.
+    try testing.expect(!try earlyDataAccepted(.{ .register = &register }));
+
+    // §8.3: the same hello arriving an hour after the ticket was issued
+    // claims an age that no longer matches the one we measure. A fresh
+    // register, so this is the freshness check refusing and not §8.2.
+    var stale_registry: [anti_replay.StrikeRegister.probe_max]anti_replay.StrikeRegister.Entry =
+        @splat(.free);
+    var stale_register: anti_replay.StrikeRegister = .{ .entries = &stale_registry };
+    try testing.expect(!try earlyDataAccepted(.{
+        .register = &stale_register,
+        .now_ms = EarlyDataFixture.issued_at_ms + 60 * 60 * 1000,
+    }));
+
+    // The three opt-ins, each absent in turn. A server that never
+    // thought about any one of them does not accept early data, which is
+    // the whole reason they default to off rather than on.
+    var spare_registry: [anti_replay.StrikeRegister.probe_max]anti_replay.StrikeRegister.Entry =
+        @splat(.free);
+    var spare: anti_replay.StrikeRegister = .{ .entries = &spare_registry };
+    try testing.expect(!try earlyDataAccepted(.{ .register = null }));
+    try testing.expect(!try earlyDataAccepted(.{ .register = &spare, .clock = false }));
+    try testing.expect(!try earlyDataAccepted(.{ .register = &spare, .terms = false }));
+    // And a ticket whose advertised limit is zero permits nothing,
+    // which is a server saying "resume, but not before I answer".
+    try testing.expect(!try earlyDataAccepted(.{ .register = &spare, .bytes_max = 0 }));
+
+    // §4.2.10: "the server MUST ... only accept early data if the PSK
+    // selected is the first one offered". An unknown identity ahead of
+    // the real one still resumes — a server walks past what it does not
+    // recognise — but the selection is no longer the first, and the
+    // early data behind it is not ours to read.
+    var decoy_registry: [anti_replay.StrikeRegister.probe_max]anti_replay.StrikeRegister.Entry =
+        @splat(.free);
+    var decoy_register: anti_replay.StrikeRegister = .{ .entries = &decoy_registry };
+    try testing.expect(!try earlyDataAccepted(.{
+        .register = &decoy_register,
+        .decoy_first = true,
+    }));
+
+    // §4.2.10 again: the suite must be the one the ticket was issued
+    // under. AES-256-GCM hashes to SHA-384 and this PSK is 32 bytes, so
+    // the mismatch is visible only because the ticket carries its suite
+    // — inferring it from the PSK's length would miss the case that
+    // matters, two suites sharing one hash.
+    var suite_registry: [anti_replay.StrikeRegister.probe_max]anti_replay.StrikeRegister.Entry =
+        @splat(.free);
+    var suite_register: anti_replay.StrikeRegister = .{ .entries = &suite_registry };
+    try testing.expect(!try earlyDataAccepted(.{
+        .register = &suite_register,
+        .suite = .chacha20_poly1305_sha256,
+    }));
+}
+
+test "§4.6.1: early data past the ticket's own limit ends the connection" {
+    // `max_early_data_size` is a number the client was given and sized
+    // its send against, so a client past it is not one we issued that
+    // ticket to. Distinct from the skip ceiling, which bounds data we
+    // declined and never keyed.
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var early_out: [record.wire_record_bytes_max]u8 = undefined;
+    var registry: [anti_replay.StrikeRegister.probe_max]anti_replay.StrikeRegister.Entry =
+        @splat(.free);
+    var register: anti_replay.StrikeRegister = .{ .entries = &registry };
+    var store = EarlyDataFixture.store(8, .aes_128_gcm_sha256);
+    var harness: Harness = undefined;
+    try harness.initLookup(.{ .context = &store, .lookup = EarlyDataStore.lookup });
+    defer harness.deinit();
+    harness.server.config.now_ms = EarlyDataFixture.now_ms;
+    harness.server.config.strike_register = &register;
+
+    var ticket = EarlyDataFixture.ticket();
+    var client = Client.init(&client_x25519_private, &.{
+        .resume_with = &ticket,
+        .offer_early_data = true,
+    });
+    defer client.deinit();
+    const hello = client.helloRecord(&client_out);
+    const first = try client.earlyDataRecord("12345678", &early_out);
+    var second_out: [record.wire_record_bytes_max]u8 = undefined;
+    const second = try client.earlyDataRecord("9", &second_out);
+
+    _ = (try harness.server.handleRecord(hello, &server_out)).?;
+    try testing.expect(harness.server.early_data_accepted);
+    // Exactly the limit is inside it.
+    const event = (try harness.server.handleRecord(first, &server_out)).?;
+    try testing.expectEqualSlices(u8, "12345678", event.application_data);
+    try testing.expectEqual(@as(u32, 8), harness.server.early_data_bytes);
+    // One byte past is not.
+    try testing.expectError(
+        error.TooMuchEarlyData,
+        harness.server.handleRecord(second, &server_out),
+    );
 }

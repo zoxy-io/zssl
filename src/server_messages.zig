@@ -14,6 +14,7 @@ const CipherSuite = cipher_suite.CipherSuite;
 const extension_key_share: u16 = 51;
 const extension_supported_versions: u16 = 43;
 const extension_alpn: u16 = 16;
+const extension_early_data: u16 = 42;
 const extension_pre_shared_key: u16 = 41;
 const tls13_wire_version: u16 = 0x0304;
 
@@ -119,12 +120,19 @@ pub fn helloRetryRequest(
 
 /// §4.3.1. Empty unless ALPN was negotiated; zssl advertises nothing else
 /// in EncryptedExtensions today.
-pub fn encryptedExtensions(out: []u8, alpn_selected: ?[]const u8) []const u8 {
+/// §4.2.10: `early_data` here, and empty, is the whole of how a server
+/// says it accepted 0-RTT. There is no other signal and no room for one
+/// — the client has already sent the data.
+pub fn encryptedExtensions(out: []u8, alpn_selected: ?[]const u8, early_data: bool) []const u8 {
     assert(out.len >= 64);
     if (alpn_selected) |protocol| assert(protocol.len >= 1);
     var builder = wire.Builder.init(out);
     const message = handshake.beginMessage(&builder, .encrypted_extensions);
     const extensions = builder.markU16();
+    if (early_data) {
+        builder.putU16(extension_early_data);
+        builder.patchU16(builder.markU16());
+    }
     if (alpn_selected) |protocol| {
         assert(protocol.len <= 32);
         builder.putU16(extension_alpn);

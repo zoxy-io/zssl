@@ -16,6 +16,7 @@ const assert = std.debug.assert;
 
 const Credentials = @import("Credentials.zig");
 const alert = @import("alert.zig");
+const anti_replay = @import("anti_replay.zig");
 const backend = @import("crypto/backend_openssl.zig");
 const cipher_suite = @import("cipher_suite.zig");
 const flood = @import("flood.zig");
@@ -82,6 +83,16 @@ early_data_offered: bool,
 /// What the records skipped under that window have cost, in bytes of
 /// the budget below — their payloads, and never less than one each.
 early_data_skipped: u32,
+/// §4.2.10 accepted for this connection: the flight said so, and the
+/// early keys exist to open what follows.
+early_data_accepted: bool,
+/// Application bytes accepted as early data, against the ticket's own
+/// `max_early_data_size`. Counted after decryption, because that is what
+/// §4.6.1 measures — the client sized its data against this number.
+early_data_bytes: u32,
+/// The limit the ticket advertised, copied out because the `Psk` that
+/// carried it is gone by the time the records arrive.
+early_data_bytes_max: u32,
 /// Whether the ClientHello that earned a HelloRetryRequest carried a
 /// `pre_shared_key`. §4.1.2 lets the second hello update that extension
 /// and not drop it, and CH1's bytes are gone by the time CH2 arrives —
@@ -104,6 +115,13 @@ const ServerHandshake = @This();
 pub const State = enum(u8) {
     awaiting_client_hello,
     awaiting_retry_client_hello,
+    /// §4.2.10 accepted: our flight is out and the client's 0-RTT data
+    /// is arriving under keys derived from its hello alone. Distinct
+    /// from `awaiting_finished` because the records here open with a
+    /// different protector, and because the message that ends it —
+    /// §4.5's EndOfEarlyData — is the one that moves the transcript the
+    /// client's Finished will MAC.
+    awaiting_end_of_early_data,
     awaiting_finished,
     connected,
     /// §6.1 closes one direction at a time, so a close is two states
@@ -205,6 +223,12 @@ pub const Config = struct {
     /// accept replayable data by accident — the safe default is the
     /// shape of the type rather than a line in a document.
     now_ms: ?u64 = null,
+    /// §8.2's record of ClientHellos already seen, in caller-owned
+    /// storage. Null — the default — is one of the three things that
+    /// must all be present before any early data is accepted, along with
+    /// `now_ms` and the ticket's own `early_data` terms. Three positive
+    /// opt-ins, because the failure of any of them is a replay.
+    strike_register: ?*anti_replay.StrikeRegister = null,
     /// The PSK seam: given an offered identity, answer the key it stands
     /// for and say which kind it is, or null to fall back to a full
     /// handshake. Both §4.2.11 sources come through here — a ticket this
@@ -241,6 +265,10 @@ pub const PskLookup = struct {
 /// done it.
 pub const Issued = struct {
     at_ms: u64,
+    /// §4.2.11.1's `ticket_age_add`, which the client adds to the age it
+    /// claims. §8.3 cannot be computed without it: what arrives on the
+    /// wire is the sum, and only the issuer knows the addend.
+    age_add: u32 = 0,
     /// §4.6.1's `ticket_lifetime`, seconds, and the RFC caps it at a
     /// week. A lookup answering more is describing a ticket the server
     /// should never have minted, so the cap is applied rather than
@@ -279,6 +307,25 @@ pub const Psk = struct {
     /// `Config.now_ms` present, §4.6.1's lifetime is enforced here
     /// rather than assumed of the lookup.
     issued: ?Issued = null,
+    /// What this ticket permits by way of 0-RTT, or null — the default —
+    /// for none. §4.2.10 is explicit that early data rides on the
+    /// *ticket's* terms, not the connection's: the client was told a
+    /// limit and a suite when the ticket was minted and has already
+    /// spent bytes against them by the time we read this.
+    early_data: ?EarlyData = null,
+};
+
+/// The 0-RTT terms a ticket was issued under.
+pub const EarlyData = struct {
+    /// §4.6.1's `max_early_data_size`, as the ticket advertised it. The
+    /// client sized its early data against this number, so it is the
+    /// server's to hold to rather than to reconsider.
+    bytes_max: u32,
+    /// §4.2.10: "the server MUST verify that the ... cipher suite ...
+    /// are the same as the ones associated with the ticket". A PSK is
+    /// bound to a hash and two of our three suites share one, so the
+    /// suite has to be carried rather than inferred from the length.
+    suite: CipherSuite,
 };
 
 const SelectedPsk = struct {
@@ -286,6 +333,19 @@ const SelectedPsk = struct {
     psk_bytes: u8,
     kind: key_schedule.PskKind,
     index: u16,
+    /// The binder as the client sent it, kept because §8.2 needs a value
+    /// unique to this hello and this already is one: an HMAC over the
+    /// truncated ClientHello, so two hellos share it only if they are
+    /// the same hello. Copied rather than borrowed — the offer points
+    /// into the record buffer and the decision outlives it.
+    binder: [cipher_suite.hash_bytes_max]u8,
+    binder_bytes: u8,
+    /// What the lookup answered about the ticket, carried forward so the
+    /// early-data decision can be made after the binder verified rather
+    /// than beside it.
+    issued: ?Issued,
+    early_data: ?EarlyData,
+    obfuscated_age: u32,
 };
 
 /// One thing that happened, as `handleRecord` and `drain` hand it back.
@@ -336,6 +396,12 @@ pub const Error = backend.SignError || protect.Error || handshake.Assembler.Erro
     PeerAlert,
     /// A KeyUpdate whose body breaks §4.6.3's one-byte grammar.
     IllegalKeyUpdate,
+    /// More *accepted* early data than the ticket advertised room for.
+    /// §4.6.1's `max_early_data_size` is a promise the client sized its
+    /// send against, so a client past it is not one we issued that
+    /// ticket to — distinct from `TooMuchSkippedEarlyData`, which is
+    /// about data we declined and never keyed.
+    TooMuchEarlyData,
     /// More rejected early data than `early_data_skipped_max`. Not the
     /// peer breaking a rule — the records are legal and we asked for
     /// none of them — but discarding is work, and unbounded work a peer
@@ -376,6 +442,9 @@ pub fn init(config: *const Config) ServerHandshake {
         .peer_alert_description = null,
         .early_data_offered = false,
         .early_data_skipped = 0,
+        .early_data_accepted = false,
+        .early_data_bytes = 0,
+        .early_data_bytes_max = 0,
     };
 }
 
@@ -761,6 +830,11 @@ fn selectPsk(
             .psk_bytes = 0,
             .kind = .resumption,
             .index = index,
+            .binder = undefined,
+            .binder_bytes = 0,
+            .issued = null,
+            .early_data = null,
+            .obfuscated_age = offer.obfuscated_ages[index],
         };
         const answer = lookup.lookup(
             lookup.context,
@@ -792,6 +866,8 @@ fn selectPsk(
         }
         selected.psk_bytes = answer.psk_bytes;
         selected.kind = answer.kind;
+        selected.issued = answer.issued;
+        selected.early_data = answer.early_data;
         if (!binderMatches(
             suite,
             answer.kind,
@@ -801,6 +877,12 @@ fn selectPsk(
         )) {
             return error.DecryptError;
         }
+        // Only now, with the binder verified: an unverified one is a
+        // value an attacker chose, and §8.2's register must not be
+        // filled with those.
+        assert(offer.binders[index].len <= selected.binder.len);
+        selected.binder_bytes = @intCast(offer.binders[index].len);
+        @memcpy(selected.binder[0..selected.binder_bytes], offer.binders[index]);
         return selected;
     }
     return null;
@@ -929,6 +1011,51 @@ fn sendHelloRetry(self: *ServerHandshake, ch1: []const u8, suite: CipherSuite, o
     return .{ .send = builder.written() };
 }
 
+/// §4.2.10 and §8, as one question: may this hello's early data be
+/// read rather than discarded?
+///
+/// Every clause is a refusal that costs the client one round trip and
+/// nothing else, which is why they are all written as "no unless".
+/// Three of them are opt-ins the embedder has to positively supply — a
+/// clock, a register, and a ticket that carried 0-RTT terms — because
+/// the failure of any one of them is a replay, and defaults that mean
+/// "yes" are how that happens.
+fn admitEarlyData(
+    self: *ServerHandshake,
+    hello: *const client_hello.ClientHello,
+    selected: *const SelectedPsk,
+    suite: CipherSuite,
+) bool {
+    if (!hello.early_data) return false;
+    // §4.1.2/§4.2.10: early data is not permitted after a
+    // HelloRetryRequest, and this is the state that says there was one.
+    if (self.state != .awaiting_client_hello) return false;
+    // §4.2.10: "the server MUST ... only accept early data if the PSK
+    // selected is the first one offered". A server that accepted on a
+    // later identity would let a client attach 0-RTT to a ticket it
+    // listed as a fallback.
+    if (selected.index != 0) return false;
+    const terms = selected.early_data orelse return false;
+    if (terms.bytes_max == 0) return false;
+    // §4.2.10 again: the suite must be the ticket's own. Two of our
+    // three share a hash, so the PSK's length does not settle this.
+    if (terms.suite != suite) return false;
+    const now_ms = self.config.now_ms orelse return false;
+    const issued = selected.issued orelse return false;
+    const register = self.config.strike_register orelse return false;
+    // §8.3 before §8.2, and the order is the point: a hello whose age is
+    // not plausible must not spend a slot in the register on its way to
+    // being refused, or an attacker with a stream of stale hellos
+    // evicts nothing and denies everything.
+    if (!anti_replay.ageIsPlausible(&.{
+        .obfuscated_age = selected.obfuscated_age,
+        .age_add = issued.age_add,
+        .issued_at_ms = issued.at_ms,
+        .now_ms = now_ms,
+    })) return false;
+    return register.admit(selected.binder[0..selected.binder_bytes], now_ms);
+}
+
 fn acceptClientHello(
     self: *ServerHandshake,
     hello: *const client_hello.ClientHello,
@@ -965,20 +1092,31 @@ fn acceptClientHello(
     self.resumed = selected_psk != null;
 
     const selected_alpn = try self.selectAlpn(hello);
+    const accept_early = if (selected_psk) |*psk| self.admitEarlyData(hello, psk, suite) else false;
+    if (accept_early) {
+        self.early_data_accepted = true;
+        self.early_data_bytes_max = selected_psk.?.early_data.?.bytes_max;
+        // Nothing left to skip: the records that follow are ours to
+        // open, and `skippingEarlyData` must not also claim them.
+        self.early_data_offered = false;
+    }
     switch (self.ladder.?) {
         inline else => |*arm| {
             arm.absorbMessage(message);
-            arm.absorbMessage(hello_bytes);
             const psk_slice: ?[]const u8 = if (selected_psk) |*psk| psk.psk[0..psk.psk_bytes] else null;
+            // Between the two absorbs, and only here: the early secret
+            // is derived over the ClientHello alone.
+            if (accept_early) try arm.startEarlyKeys(psk_slice.?);
+            arm.absorbMessage(hello_bytes);
             try arm.startHandshakeKeys(shared, psk_slice);
-            const flight = try self.buildFlightPlaintext(arm, selected_alpn);
+            const flight = try self.buildFlightPlaintext(arm, selected_alpn, accept_early);
             var builder = @import("wire.zig").Builder.init(out);
             appendPlaintextRecord(&builder, .handshake, hello_bytes);
             if (first_flight) builder.putSlice(&server_messages.change_cipher_spec_record);
             const sealed = try arm.send.?.seal(.handshake, flight, builder.bytes[builder.index..]);
             builder.index += sealed.len;
             try arm.finishFlight();
-            self.state = .awaiting_finished;
+            self.state = if (accept_early) .awaiting_end_of_early_data else .awaiting_finished;
             return .{ .send = builder.written() };
         },
     }
@@ -992,11 +1130,16 @@ fn buildFlightPlaintext(
     self: *ServerHandshake,
     arm: anytype,
     selected_alpn: ?[]const u8,
+    early_data: bool,
 ) Error![]const u8 {
     const flight = self.config.flight;
     var builder = @import("wire.zig").Builder.init(flight);
 
-    const extensions = server_messages.encryptedExtensions(flight[builder.index..], selected_alpn);
+    const extensions = server_messages.encryptedExtensions(
+        flight[builder.index..],
+        selected_alpn,
+        early_data,
+    );
     builder.index += extensions.len;
     arm.absorbMessage(extensions);
 
@@ -1077,7 +1220,7 @@ fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: [
     // own close_notify, and closing it there is what made a truncated
     // shutdown indistinguishable from an orderly one.
     switch (self.state) {
-        .awaiting_finished, .connected, .close_sent => {},
+        .awaiting_end_of_early_data, .awaiting_finished, .connected, .close_sent => {},
         else => return error.UnexpectedMessage,
     }
     assert(self.ladder != null);
@@ -1092,6 +1235,10 @@ fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: [
     switch (self.ladder.?) {
         inline else => |*arm| {
             const opened = (switch (self.state) {
+                // §4.2.10's own keys, and their own sequence space: the
+                // early data and the Finished that follows it are two
+                // different protectors over the same record type.
+                .awaiting_end_of_early_data => arm.early_recv.?.open(wire_record, out),
                 .awaiting_finished => arm.recv.?.open(wire_record, out),
                 .connected, .close_sent => arm.session.?.recv.open(wire_record, out),
                 else => unreachable, // The guard above admits only these three.
@@ -1139,6 +1286,9 @@ fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: [
                 .handshake => return self.handleProtectedHandshake(arm, plaintext, out),
                 .application_data => {
                     try self.refuseInterleavedRecord();
+                    if (self.state == .awaiting_end_of_early_data) {
+                        return self.acceptEarlyData(plaintext);
+                    }
                     // Readable, not connected: our own close_notify
                     // shuts the write side, and the peer is entitled to
                     // keep sending until it closes its own (§6.1).
@@ -1153,9 +1303,38 @@ fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: [
 
 /// `arm` is one `LadderOf(suite)` instance, always reached through the
 /// caller's `inline else` so the type is concrete at every call site.
+/// One accepted early-data record, counted against the ticket's own
+/// promise. §4.6.1's `max_early_data_size` is what the client sized its
+/// send against, so going past it is not a client we issued that ticket
+/// to — and the count is of decrypted content, which is what the RFC
+/// measures.
+fn acceptEarlyData(self: *ServerHandshake, plaintext: []const u8) Error!?Event {
+    assert(self.early_data_accepted);
+    assert(self.state == .awaiting_end_of_early_data);
+    self.early_data_bytes +|= @intCast(plaintext.len);
+    if (self.early_data_bytes > self.early_data_bytes_max) return error.TooMuchEarlyData;
+    return .{ .application_data = plaintext };
+}
+
 fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []const u8, out: []u8) Error!?Event {
     assert(plaintext.len >= 1);
     try self.assembler.push(plaintext);
+    if (self.state == .awaiting_end_of_early_data) {
+        // §4.5: `struct {} EndOfEarlyData`, under the early keys, and
+        // the only handshake message that may arrive here. It joins the
+        // transcript — §4.4 puts it in the client's Finished context and
+        // not in §7.1's application secrets, which is why the ladder
+        // keeps two hashes.
+        const message = (try self.assembler.next()) orelse return null;
+        if (message.messageType() != .end_of_early_data) return error.UnexpectedMessage;
+        if (message.body().len != 0) return error.MalformedMessage;
+        // Nothing may ride behind it: what follows is under other keys.
+        if (!self.assembler.empty()) return error.UnexpectedMessage;
+        arm.absorbMessage(message.bytes);
+        arm.finishEarlyData();
+        self.state = .awaiting_finished;
+        return null;
+    }
     if (self.state != .awaiting_finished) return self.nextPostHandshake(arm, out);
     const message = (try self.assembler.next()) orelse return null;
     if (message.messageType() != .finished) return error.UnexpectedMessage;
@@ -1487,9 +1666,19 @@ fn LadderOf(comptime suite: CipherSuite) type {
         /// Server handshake traffic secret — our own Finished derives
         /// from it mid-flight.
         server_handshake_traffic: [hash_bytes]u8,
-        /// Transcript hash through the server Finished: what the client's
-        /// Finished MACs, and what the application secrets derive from.
+        /// Transcript hash through the server Finished: what §7.1's
+        /// application secrets derive from.
         finished_hash: [hash_bytes]u8,
+        /// What the *client's* Finished MACs, which is not the same
+        /// thing once 0-RTT is accepted. §4.4's table gives the client's
+        /// handshake context as "ClientHello ... later of server
+        /// Finished/EndOfEarlyData", and §7.1 gives the application
+        /// secrets "ClientHello...server Finished" — so an EndOfEarlyData
+        /// arriving after our flight moves one and not the other. They
+        /// are equal until that message exists, and conflating them is a
+        /// resumption that verifies fine until the first client that
+        /// actually sends early data.
+        client_finished_hash: [hash_bytes]u8,
         /// Application traffic secrets, staged at flight end; the live
         /// session keys are built from them at `connected`.
         client_application_traffic: [hash_bytes]u8,
@@ -1497,6 +1686,11 @@ fn LadderOf(comptime suite: CipherSuite) type {
         /// §7.1's last derivation, available from `connected`: what every
         /// ticket's PSK descends from.
         resumption_master: [hash_bytes]u8,
+        /// §4.2.10's receive-only protector for accepted early data,
+        /// keyed off the ClientHello alone and retired at
+        /// EndOfEarlyData. Never a `send` counterpart: 0-RTT is one
+        /// direction by construction.
+        early_recv: ?protect.Protector,
         /// Handshake-phase protectors; retired at `connected`.
         recv: ?protect.Protector,
         send: ?protect.Protector,
@@ -1512,19 +1706,23 @@ fn LadderOf(comptime suite: CipherSuite) type {
             .client_handshake_traffic = undefined,
             .server_handshake_traffic = undefined,
             .finished_hash = undefined,
+            .client_finished_hash = undefined,
             .client_application_traffic = undefined,
             .server_application_traffic = undefined,
             .resumption_master = undefined,
+            .early_recv = null,
             .recv = null,
             .send = null,
             .session = null,
         };
 
         fn deinit(self: *Self) void {
+            if (self.early_recv) |*protector| protector.deinit();
             if (self.recv) |*protector| protector.deinit();
             if (self.send) |*protector| protector.deinit();
             if (self.session) |*session| session.deinit();
             if (self.schedule) |*schedule| schedule.wipe();
+            std.crypto.secureZero(u8, &self.client_finished_hash);
             std.crypto.secureZero(u8, &self.client_handshake_traffic);
             std.crypto.secureZero(u8, &self.server_handshake_traffic);
             std.crypto.secureZero(u8, &self.client_application_traffic);
@@ -1566,6 +1764,41 @@ fn LadderOf(comptime suite: CipherSuite) type {
         /// out of band, the schedule cannot tell and does not need to —
         /// or null for a full handshake. Either way the (EC)DHE share is
         /// mixed: psk_dhe_ke is the only mode this library speaks.
+        /// §7.1's other child of the early secret: the receive keys for
+        /// 0-RTT data, derived from `Derive-Secret(early, "c e traffic",
+        /// ClientHello)`.
+        ///
+        /// Called between absorbing the ClientHello and absorbing the
+        /// ServerHello, and it cannot be called anywhere else: the
+        /// transcript this reads is the hello *alone*, which is the
+        /// property that lets these keys exist before a ServerHello does.
+        /// A schedule of its own, thrown away here — `startHandshakeKeys`
+        /// builds the connection's from the same PSK a moment later, and
+        /// sharing one across that boundary would mean advancing a
+        /// schedule the early keys still needed.
+        fn startEarlyKeys(self: *Self, psk: []const u8) protect.Error!void {
+            assert(self.schedule == null);
+            assert(self.early_recv == null);
+            assert(psk.len >= 1 and psk.len <= cipher_suite.hash_bytes_max);
+            assert(self.transcript.messages_seen == 1);
+            var schedule = Schedule.initEarly(psk);
+            defer schedule.wipe();
+            const hello_hash = self.transcriptHash();
+            const early_traffic = schedule.deriveAt(.early, "c e traffic", &hello_hash);
+            const keys = Schedule.trafficKeys(&early_traffic);
+            self.early_recv = try protect.Protector.init(suite, &keys.key, &keys.iv);
+        }
+
+        /// EndOfEarlyData (§4.5) has been absorbed: the early keys have
+        /// nothing left to open, and the client's Finished now MACs a
+        /// transcript one message longer than the server's did.
+        fn finishEarlyData(self: *Self) void {
+            assert(self.early_recv != null);
+            self.early_recv.?.deinit();
+            self.early_recv = null;
+            self.client_finished_hash = self.transcriptHash();
+        }
+
         fn startHandshakeKeys(self: *Self, shared: []const u8, psk: ?[]const u8) protect.Error!void {
             assert(self.schedule == null);
             assert(self.recv == null);
@@ -1625,6 +1858,9 @@ fn LadderOf(comptime suite: CipherSuite) type {
             assert(self.schedule.?.stage == .handshake);
             assert(self.send != null);
             self.finished_hash = self.transcriptHash();
+            // Equal here, and they stay equal unless an EndOfEarlyData
+            // arrives to move the client's on.
+            self.client_finished_hash = self.finished_hash;
             self.schedule.?.advanceToMaster();
             self.client_application_traffic = self.schedule.?.deriveAt(.master, "c ap traffic", &self.finished_hash);
             self.server_application_traffic = self.schedule.?.deriveAt(.master, "s ap traffic", &self.finished_hash);
@@ -1659,7 +1895,7 @@ fn LadderOf(comptime suite: CipherSuite) type {
             assert(self.schedule.?.stage == .master);
             if (message.body().len != hash_bytes) return false;
             const key = Schedule.finishedKey(&self.client_handshake_traffic);
-            const expected = Schedule.verifyData(&key, &self.finished_hash);
+            const expected = Schedule.verifyData(&key, &self.client_finished_hash);
             return std.crypto.timing_safe.eql(
                 [hash_bytes]u8,
                 message.body()[0..hash_bytes].*,

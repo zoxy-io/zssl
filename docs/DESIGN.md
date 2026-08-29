@@ -58,12 +58,15 @@ proxy needs instead of what a general TLS library carries.
 
 **Out, permanently** (a caller that needs these wants a different
 library): TLS 1.2, renegotiation, compression, RSA key exchange, DSA,
-SSLv3-era anything, post-handshake client auth, and *accepting* 0-RTT.
+SSLv3-era anything, post-handshake client auth.
 
-That last one was carried as "deferred pending a replay analysis" for
-most of this library's life. The analysis has now been done, and the
-answer is that zssl is the wrong layer to make the decision — so it is
-a permanent exclusion rather than a queue item.
+**0-RTT is in, and was out twice.** It was "deferred pending a replay
+analysis" for most of this library's life, then briefly a permanent
+exclusion on the grounds that §8 wanted a clock this library did not
+have. Both readings are recorded because the second was wrong in an
+instructive way: "no clock" was never one of CLAUDE.md's invariants — it
+was an absence nobody had needed to fill, and an absence is not a
+design.
 
 §8 lets a server accept early data only with single-use tickets (§8.1)
 or a strike register over recorded ClientHellos (§8.2), and either way

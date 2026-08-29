@@ -64,6 +64,12 @@ pub const Options = struct {
     psk_mode_byte: u8 = 0x01,
     /// Flip a binder bit — the offer must then be fatally refused.
     corrupt_binder: bool = false,
+    /// Offer an identity the server will not recognise *ahead* of the
+    /// real one, so the accepted PSK sits at index 1. §4.2.10 lets a
+    /// server accept early data only on the first identity offered, and
+    /// this is the shape that tests it: the resumption still succeeds,
+    /// because a server walks past an identity it does not know.
+    psk_decoy_first: bool = false,
     /// §4.2.10: offer 0-RTT. zssl never accepts it, so this is here to
     /// open the server's skip window and nothing else — no early data
     /// is actually sent, because the records a real client would send
@@ -108,6 +114,9 @@ pub fn TestClient(comptime suite: CipherSuite) type {
         transcript: Transcript,
         schedule: ?Schedule,
         client_handshake_traffic: [hash_bytes]u8,
+        /// §7.1's `c e traffic` protector, built lazily by
+        /// `earlyDataRecord` and retired when EndOfEarlyData goes out.
+        early_send: ?protect.Protector,
         server_handshake_traffic: [hash_bytes]u8,
         finished_hash: [hash_bytes]u8,
         leaf_der: []const u8,
@@ -168,6 +177,7 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                 .transcript = .empty,
                 .schedule = null,
                 .client_handshake_traffic = undefined,
+                .early_send = null,
                 .server_handshake_traffic = undefined,
                 .finished_hash = undefined,
                 .leaf_der = &.{},
@@ -197,6 +207,7 @@ pub fn TestClient(comptime suite: CipherSuite) type {
 
         pub fn deinit(self: *Self) void {
             assert(self.state != .awaiting_server_hello or self.schedule == null);
+            if (self.early_send) |*protector| protector.deinit();
             if (self.recv) |*protector| protector.deinit();
             if (self.send) |*protector| protector.deinit();
             if (self.schedule) |*schedule| schedule.wipe();
@@ -213,6 +224,28 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             var builder = wire.Builder.init(out);
             appendPlaintextRecord(&builder, .handshake, message);
             return builder.written();
+        }
+
+        /// Seal one 0-RTT record under §7.1's `c e traffic` keys.
+        ///
+        /// Callable only between `helloRecord` and the first `absorb`,
+        /// which is not a limitation of this client but of the
+        /// derivation: the early secret is taken over the ClientHello
+        /// alone, and the transcript stops being that the moment a
+        /// ServerHello lands in it. The assertion says so.
+        pub fn earlyDataRecord(self: *Self, payload: []const u8, out: []u8) Error![]const u8 {
+            assert(self.options.offer_early_data);
+            const ticket = self.options.resume_with.?;
+            if (self.early_send == null) {
+                assert(self.transcript.messages_seen == 1);
+                var schedule = Schedule.initEarly(ticket.psk[0..ticket.psk_bytes]);
+                defer schedule.wipe();
+                const hello_hash = self.transcript.currentHash();
+                const early_traffic = schedule.deriveAt(.early, "c e traffic", &hello_hash);
+                const keys = Schedule.trafficKeys(&early_traffic);
+                self.early_send = try protect.Protector.init(suite, &keys.key, &keys.iv);
+            }
+            return self.early_send.?.seal(.application_data, payload, out);
         }
 
         fn buildHello(self: *Self, with_x25519: bool, with_decoy: bool) []const u8 {
@@ -258,7 +291,11 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             // the section size below does not move.
             assert(ticket.psk_bytes >= 1 and ticket.psk_bytes <= hash_bytes);
             const message = self.hello_storage[0..self.hello_bytes];
-            const binders_section_bytes = 2 + 1 + hash_bytes;
+            // Every identity carries a binder, so the truncation moves
+            // when a decoy is offered — §4.2.11.2's hash covers the
+            // hello up to the *whole* binders list, not to the last one.
+            const identity_count: usize = if (self.options.psk_decoy_first) 2 else 1;
+            const binders_section_bytes = 2 + identity_count * (1 + hash_bytes);
             assert(message.len > binders_section_bytes);
             const truncated = message[0 .. message.len - binders_section_bytes];
             var truncated_hash: [hash_bytes]u8 = undefined;
@@ -402,11 +439,24 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             builder.putU16(41); // pre_shared_key
             const extension = builder.markU16();
             const identities = builder.markU16();
+            if (self.options.psk_decoy_first) {
+                builder.putU16(8);
+                builder.putSlice("nobodys!");
+                builder.putU32(0);
+            }
             builder.putU16(ticket.ticket_bytes);
             builder.putSlice(ticket.ticket[0..ticket.ticket_bytes]);
             builder.putU32(ticket.age_add); // Obfuscated age; policy is the server's.
             builder.patchU16(identities);
             const binders = builder.markU16();
+            // §4.2.11.2 pairs binders to identities positionally, so the
+            // decoy needs one even though nothing will ever check it —
+            // a list of the wrong length is refused before the identity
+            // it belongs to is ever looked up.
+            if (self.options.psk_decoy_first) {
+                builder.putByte(hash_bytes);
+                builder.putSlice(&(.{0} ** hash_bytes));
+            }
             builder.putByte(hash_bytes);
             builder.putSlice(&(.{0} ** hash_bytes));
             builder.patchU16(binders);
@@ -706,16 +756,41 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             self.transmit_keys = Schedule.trafficKeys(&client_ap);
             self.receive_keys = Schedule.trafficKeys(&server_ap);
 
-            const client_key = Schedule.finishedKey(&self.client_handshake_traffic);
-            const verify_data = Schedule.verifyData(&client_key, &self.finished_hash);
-            var message_buffer: [handshake.header_bytes + hash_bytes]u8 = undefined;
-            const finished_message = server_messages.finished(&message_buffer, &verify_data);
-            self.transcript.update(finished_message);
-            self.resumption_master = self.schedule.?.deriveAt(.master, "res master", &self.transcript.currentHash());
             var builder = wire.Builder.init(out);
             if (self.options.send_change_cipher_spec) {
                 builder.putSlice(&server_messages.change_cipher_spec_record);
             }
+            // §4.5, out under the *early* keys — the last thing they
+            // protect — before the Finished switches to the handshake
+            // ones. It joins the transcript here, which is why the
+            // verify_data below reads `currentHash` rather than the
+            // `finished_hash` the application secrets came from: §4.4
+            // puts EndOfEarlyData in the client's handshake context and
+            // §7.1 leaves it out of the secrets. With no early data the
+            // two hashes are equal and this is a no-op.
+            if (self.early_send) |*early| {
+                const end_of_early_data = [_]u8{
+                    @intFromEnum(handshake.MessageType.end_of_early_data),
+                    0,
+                    0,
+                    0,
+                };
+                self.transcript.update(&end_of_early_data);
+                const sealed_end = try early.seal(
+                    .handshake,
+                    &end_of_early_data,
+                    builder.bytes[builder.index..],
+                );
+                builder.index += sealed_end.len;
+                early.deinit();
+                self.early_send = null;
+            }
+            const client_key = Schedule.finishedKey(&self.client_handshake_traffic);
+            const verify_data = Schedule.verifyData(&client_key, &self.transcript.currentHash());
+            var message_buffer: [handshake.header_bytes + hash_bytes]u8 = undefined;
+            const finished_message = server_messages.finished(&message_buffer, &verify_data);
+            self.transcript.update(finished_message);
+            self.resumption_master = self.schedule.?.deriveAt(.master, "res master", &self.transcript.currentHash());
             const sealed = try self.send.?.seal(.handshake, finished_message, builder.bytes[builder.index..]);
             builder.index += sealed.len;
 
