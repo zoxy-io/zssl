@@ -33,7 +33,13 @@ the four decisions everything else follows from.
   rsa_pkcs1_* stays out on both sides, because §4.4.3 forbids it in
   CertificateVerify. ECDSA signs through libcrypto, with an opt-in
   RFC 6979 deterministic-nonce mode; a peer's RSA-PSS is checked through
-  `std.crypto`, for the reason §2 records.
+  `std.crypto`, for the reason §2 records. What the client will accept is
+  `Config.verify_schemes`, and §4.4.3 makes that list a promise rather
+  than a hint: a CertificateVerify under a scheme absent from it is an
+  `illegal_parameter` abort with nothing verified, told apart from a
+  signature that simply failed. `ClientHandshake.peer_signature_scheme`
+  reports what the server actually used, mirroring the server's own
+  `signature_scheme`.
 - **PSK resumption.** `psk_lookup` is the embedder seam: an opaque
   identity goes in, the PSK *and its kind* come out, and ticket sealing,
   lifetime and age policy stay the embedder's. Both kinds are accepted

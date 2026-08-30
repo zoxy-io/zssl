@@ -544,6 +544,22 @@ pub const SignatureScheme = enum(u16) {
     rsa_pss_rsae_sha384 = 0x0805,
     rsa_pss_rsae_sha512 = 0x0806,
 
+    /// Null for every code point outside the five, which is how §4.4.3's
+    /// "not offered" case is told from a signature that simply failed.
+    pub fn fromWire(wire: u16) ?SignatureScheme {
+        return std.enums.fromInt(SignatureScheme, wire);
+    }
+
+    /// Which key an embedder must hold to answer this scheme. The
+    /// pairing is fixed by §4.4.3, so a scheme against the wrong kind of
+    /// leaf is the peer's error rather than a signature to attempt.
+    pub fn keyKind(scheme: SignatureScheme) enum { ecdsa, rsa } {
+        return switch (scheme) {
+            .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384 => .ecdsa,
+            .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => .rsa,
+        };
+    }
+
     fn digest(scheme: SignatureScheme) *const c.EVP_MD {
         return switch (scheme) {
             .ecdsa_secp256r1_sha256, .rsa_pss_rsae_sha256 => c.EVP_sha256(),
