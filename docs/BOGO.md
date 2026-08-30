@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 324 passed, 0 failed, 6893 declined by the shim (89), floor 324
+bogo: 348 passed, 0 failed, 6835 declined by the shim (89), floor 348
 bogo: PASS
 ```
 
@@ -41,8 +41,10 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**324 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. It was 278 until
+**348 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. It was 324 until
+the client could report and restrict its signature algorithms
+(finding 19), and 278 until
 the client could answer a HelloRetryRequest: a single-group client that
 refused every retry structurally kept 26 patterns declined, and
 un-declining them is where the 21 came from. The last seven are the
@@ -76,7 +78,7 @@ extension block, and 143 until §4.6.3's update requests were coalesced, and
 either gets fixed or gets an entry in `DisabledTests` with a one-line
 reason. There are no silent skips.
 
-**6893 declined** — 88% of the corpus. The shim exited 89, PORTING.md's
+**6835 declined** — 86% of the corpus. The shim exited 89, PORTING.md's
 "unimplemented", and the runner counted the case without running it.
 That number is large enough to be the first thing anyone asks about, so
 here is what it is made of. Counting each case by the *first* thing the
@@ -925,6 +927,56 @@ name.
 
 None of these are exploitable as far as the runner can show; they are
 laxity, and laxity is what BoGo exists to find.
+
+19. **The peer's signature algorithm, and §4.4.3's other abort.**
+    Twenty-four more cases, from the row this document had been
+    calling one of the largest wins available without anyone checking
+    what was behind it.
+
+    Two flags, both client-side. `-verify-prefs` narrows what the client
+    will accept in a CertificateVerify, which is now
+    `ClientHandshake.Config.verify_schemes` — one list, read both by the
+    hello that advertises it and by the verifier that enforces it,
+    because §4.4.3 makes those the same promise.
+    `-expect-peer-signature-algorithm` asks what the server actually
+    signed with, which the client had been checking and throwing away; it
+    is `peer_signature_scheme` now, the mirror of the server's
+    `signature_scheme` that `interop` has always asserted on.
+
+    The library defect underneath: every unrecognised code point in a
+    CertificateVerify returned `BadSignature`, whose alert is
+    decrypt_error. §4.4.3 asks for illegal_parameter, and the two are not
+    interchangeable — one says the peer's key is bad, the other says it
+    broke a negotiation, and only the second is true when no signature
+    was ever checked. `UnofferedSignatureScheme` is that case, and the
+    in-tree test forges both shapes of it: a code point outside the five
+    we implement, and a scheme we verify perfectly well that the embedder
+    withheld. The second is the one that proves `verify_schemes` is
+    enforced rather than merely advertised.
+
+    A resumption wrinkle worth recording, because it is a seam rather
+    than a bug. BoGo asserts the algorithm on *both* exchanges, and a
+    resumed TLS 1.3 handshake carries no CertificateVerify — so the
+    library reports null and the shim remembers. That is the right split:
+    the scheme is a property of the session, and sessions are the
+    embedder's, exactly as tickets are.
+
+    Five cases stay declined and are marked KEEP, not fixed.
+    `Client-VerifyDefault-` over Ed25519, P-521 and the three ML-DSA
+    sizes pair an unsupported *key type* with an unsupported *signature
+    scheme*, and we notice the key first: those leaves are certificates
+    we cannot use under any scheme we offer, so they earn bad_certificate
+    — or, for ML-DSA, decode_error, because std's certificate parser will
+    not read them at all. BoGo wants illegal_parameter for all five. The
+    divergence is about *where* we notice, not whether we refuse, and the
+    §4.4.3 abort this finding added is what fires when the scheme really
+    is the only thing wrong.
+
+    Twenty-nine more were declined for their version. They are the same
+    accident finding 18's `-curves` note describes: the runner sets
+    MaxVersion on its own Config rather than passing the shim a flag, so
+    nothing on the wire says a case is pre-1.3, and these had been held
+    back only by the two flags this finding added.
 
 ## Running it
 
