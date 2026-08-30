@@ -253,7 +253,7 @@ standard suites, x25519/secp256r1/secp384r1, ECDSA P-256/P-384 and
 RSA-PSS, SNI, ALPN, HelloRetryRequest in both directions, PSK
 resumption, 0-RTT, KeyUpdate, and kTLS key export.
 
-Not built: client certificates and RFC 5705 exporters. Never:
+Not built: client certificates. Never:
 TLS 1.2 and earlier, renegotiation, compression, RSA and DSA key
 exchange, post-handshake client auth, QUIC and DTLS. X.509 chain
 building and RFC 9525 name matching are yours, through

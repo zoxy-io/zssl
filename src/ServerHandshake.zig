@@ -420,6 +420,12 @@ pub const Error = backend.SignError || protect.Error || handshake.Assembler.Erro
     EventsPending,
     /// No common cipher suite, group, or signature scheme (§4.1.1).
     HandshakeFailure,
+    /// `exporter` was called before §7.5's secret exists — before the
+    /// server Finished that its transcript names. Not the peer's fault
+    /// and not a protocol error: the connection is intact and the answer
+    /// is "ask again once you are connected". Zeroes would be worse:
+    /// they look like keying material.
+    HandshakeNotComplete,
     /// A ClientHello negotiating TLS 1.3 that omits an extension §9.2
     /// makes mandatory — `supported_groups`, `key_share`, or
     /// `psk_key_exchange_modes` beside a PSK offer. Distinct from
@@ -1723,6 +1729,43 @@ pub fn exportKeyMaterial(self: *const ServerHandshake, direction: Direction) ktl
     }
 }
 
+/// RFC 5705 keying material, through RFC 8446 §7.5's construction: a
+/// secret derived from this connection and nothing else, for a protocol
+/// above us that needs one (channel binding is the usual reason).
+///
+/// Not to be confused with `exportKeyMaterial` above, which hands the
+/// *record layer's* traffic keys to the kernel. This one produces bytes
+/// no other connection can reproduce and that carry no traffic; the
+/// names are close because the RFCs' are, and the two are unrelated.
+///
+/// `label` is the application's, from RFC 5705's registry or its own
+/// namespace; `context` may be empty, which is *not* the same request as
+/// no context at all in TLS 1.2 and is the only shape §7.5 has. `out` is
+/// caller-owned and sized by the caller.
+///
+/// Available once the server has sent its Finished — §2's 0.5-RTT window
+/// included, which is where a server answering early data would ask.
+/// Before that there is no exporter_master and the answer is an error
+/// rather than zeroes.
+pub fn exporter(
+    self: *const ServerHandshake,
+    label: []const u8,
+    context: []const u8,
+    out: []u8,
+) Error!void {
+    assert(label.len <= key_schedule.exporter_label_bytes_max);
+    assert(out.len >= 1);
+    if (!self.halfRttWritable() and self.state != .connected and self.state != .close_sent) {
+        return error.HandshakeNotComplete;
+    }
+    switch (self.ladder.?) {
+        inline else => |*arm, tag| {
+            const Schedule = key_schedule.KeySchedule(tag);
+            Schedule.exporter(&arm.exporter_master, label, context, out);
+        },
+    }
+}
+
 fn appendPlaintextRecord(
     builder: *@import("wire.zig").Builder,
     content_type: record.ContentType,
@@ -1787,6 +1830,12 @@ fn LadderOf(comptime suite: CipherSuite) type {
         /// session keys are built from them at `connected`.
         client_application_traffic: [hash_bytes]u8,
         server_application_traffic: [hash_bytes]u8,
+        /// §7.5's exporter base, `Derive-Secret(Master, "exp master",
+        /// ClientHello..server Finished)`. Derived with the application
+        /// secrets rather than at `connected`, because that is where the
+        /// transcript it names is complete — which is also what makes an
+        /// exporter available to a server in §2's 0.5-RTT window.
+        exporter_master: [hash_bytes]u8,
         /// §7.1's last derivation, available from `connected`: what every
         /// ticket's PSK descends from.
         resumption_master: [hash_bytes]u8,
@@ -1813,6 +1862,7 @@ fn LadderOf(comptime suite: CipherSuite) type {
             .client_finished_hash = undefined,
             .client_application_traffic = undefined,
             .server_application_traffic = undefined,
+            .exporter_master = undefined,
             .resumption_master = undefined,
             .early_recv = null,
             .recv = null,
@@ -1966,6 +2016,7 @@ fn LadderOf(comptime suite: CipherSuite) type {
             // arrives to move the client's on.
             self.client_finished_hash = self.finished_hash;
             self.schedule.?.advanceToMaster();
+            self.exporter_master = self.schedule.?.deriveAt(.master, "exp master", &self.finished_hash);
             self.client_application_traffic = self.schedule.?.deriveAt(.master, "c ap traffic", &self.finished_hash);
             self.server_application_traffic = self.schedule.?.deriveAt(.master, "s ap traffic", &self.finished_hash);
             const transmit_keys = Schedule.trafficKeys(&self.server_application_traffic);

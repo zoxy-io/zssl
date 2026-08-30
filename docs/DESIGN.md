@@ -62,6 +62,11 @@ the four decisions everything else follows from.
   `application_data`: Appendix E.5 is a warning the embedder has to act
   on, and an exhaustive switch is how it gets asked. See below.
 - **SNI and ALPN** reads, with RFC 7301 selection checks client-side.
+- **RFC 5705 exporters** (§7.5), on both machines: `exporter(label,
+  context, out)`, available to a server from its own Finished — §2's
+  0.5-RTT window included — and to a client from `connected`. Not to be
+  confused with `exportKeyMaterial`, which is §4's kTLS hand-off and
+  unrelated; the RFCs' names are as close as ours.
 - **KeyUpdate** (§4.6.3), living once in `session_keys.zig` and shared
   by both machines: rotation resets the sequence space, and a rotation
   ceiling turns a request loop into an error rather than a spin.
@@ -70,14 +75,6 @@ the four decisions everything else follows from.
 ### Not built
 
 - **Client certificates** — no CertificateRequest on either side.
-- **RFC 5705 exporters.** §7.5's `exporter_master` is derived and
-  RFC 8448 checks it (`src/rfc8448_test.zig`), but no API expands it, so
-  an embedder that needs channel binding cannot get it. BoGo declines
-  167 cases on the flag and would run **six** of them — the rest are
-  DTLS, QUIC, or pre-1.3. Six is still the right reason to build it:
-  they cover initial and resumed exchanges, no-context against
-  empty-context, and §7.5's rule that the exporter stays shut while the
-  client is sending 0-RTT.
 - **Coverage-guided fuzzing.** The targets exist and run once per build;
   the search does not (§6).
 
