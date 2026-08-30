@@ -67,7 +67,27 @@ pub fn build(b: *std.Build) void {
         });
         suite_module.link_libc = true;
         suite_module.linkLibrary(libcrypto);
-        const suite_tests = b.addTest(.{ .root_module = suite_module });
+        // The fuzz suite alone runs on a vendored test runner. Zig
+        // 0.16.0's own crosses two `StackTrace` types on the fuzzing
+        // error path, so `--fuzz` does not compile against it;
+        // `fuzz/test_runner.zig` is that file with the one word fixed,
+        // and its header says how to drop it. Confined to this suite so
+        // that a stale copy costs the search and never the CI gates.
+        const is_fuzz_suite = std.mem.eql(u8, suite.step, "test-fuzz");
+        const suite_tests = b.addTest(.{
+            .root_module = suite_module,
+            // The coverage instrumentation `--fuzz` steers by is emitted
+            // by the LLVM backend and not by the self-hosted x86_64 one,
+            // which is the default for Debug on Linux. Without this the
+            // daemon reads an empty PC table and panics on `pcs[1..]`.
+            // The same reason the `coverage` step below sets it: two
+            // tools, one backend that does not tell them anything.
+            .use_llvm = if (is_fuzz_suite) true else null,
+            .test_runner = if (is_fuzz_suite) .{
+                .path = b.path("fuzz/test_runner.zig"),
+                .mode = .server,
+            } else null,
+        });
         const suite_run = b.addRunArtifact(suite_tests);
         b.step(suite.step, suite.blurb).dependOn(&suite_run.step);
     }

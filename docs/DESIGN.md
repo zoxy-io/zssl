@@ -83,8 +83,8 @@ the four decisions everything else follows from.
 
 ### Not built
 
-- **Coverage-guided fuzzing.** The targets exist and run once per build;
-  the search does not (§6).
+Nothing. The list is empty for the first time; what is out is out on
+purpose and lives under **Never** below.
 
 ### Never
 
@@ -305,12 +305,29 @@ suppression stops the build. docs/TLSFUZZER.md, docs/TLSANVIL.md.
 **Fuzzing.** Nine targets over every parser and both state machines,
 asserting the one property that matters for a library whose assertions
 are claims about *our* state: arbitrary peer bytes produce a value or an
-error, never a panic. `zig build test` runs each once over its corpus,
-and that is what CI gates on. The coverage-guided search (`--fuzz`) is
-blocked on a toolchain bug — 0.16.0's own fuzzing test runner fails to
-compile (`compiler/test_runner.zig:566`, two `StackTrace` types crossed)
-— reproduced identically in the zoxy tree, so it is the pinned compiler
-and not this library.
+error, never a panic. `zig build test-fuzz` runs each once over its
+seeds, and that is what CI gates on.
+
+The coverage-guided search runs too, nightly, and getting there took
+routing around two bugs in the pinned toolchain rather than one. The
+first was recorded here for a long time: 0.16.0's own test runner passes
+the `*builtin.StackTrace` from `@errorReturnTrace()` to
+`std.debug.writeStackTrace`, which takes a `*const debug.StackTrace` —
+different types, and the wrong one of two similarly-named functions.
+`std.debug.writeErrorReturnTrace` is the right one.
+`fuzz/test_runner.zig` is Zig's file with that one word changed, used by
+the `test-fuzz` step alone so a stale copy costs the search and never
+the gates. The path only exists under `--fuzz` because
+`std.testing.fuzz` fixes its callback at `anyerror!void`, which is why
+`zig build test` never noticed and why nothing outside the runner could
+route around it.
+
+The second was never recorded because nothing had got far enough to hit
+it: the coverage instrumentation `--fuzz` steers by comes from the LLVM
+backend, and Debug on x86_64 Linux defaults to the self-hosted one. The
+daemon then reads an empty PC table and panics on `pcs[1..]`. Hence
+`use_llvm` on that suite — the same reason the `coverage` step sets it,
+which is the note that made the second bug findable at all.
 
 **In-tree scenarios**, where both production machines run end to end:
 handshake, resumption, KeyUpdate in both directions with kTLS exports

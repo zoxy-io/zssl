@@ -1,0 +1,131 @@
+name: fuzz-search
+
+# The coverage-guided search, nightly — zoxy's `nightly-sim.yml` shape,
+# for the same reason: a search has no natural end, so it belongs on a
+# clock rather than in a pull request. `fuzz.yml` is the per-PR gate and
+# runs each target once over its seeds; this one lets the fuzzer *steer*.
+#
+# The corpus is cached between runs and that is the whole point. A
+# coverage-guided fuzzer is worth what its corpus is worth, and a run
+# that starts from the three inline seeds each morning is a random
+# search wearing a fuzzer's name.
+on:
+  schedule:
+    # 04:00 UTC daily, an hour after zoxy's sim so two long jobs do not
+    # contend for the same runners.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long to search"
+        required: false
+        default: "20"
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/zig
+
+      # Restored by prefix so yesterday's corpus seeds today's run; saved
+      # under a unique key because the cache is immutable once written.
+      - name: restore the corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: .zig-cache/f
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+
+      - name: search
+        id: search
+        env:
+          MINUTES: ${{ inputs.minutes || '20' }}
+        run: |
+          set -uo pipefail
+          # `--fuzz` runs until interrupted, so the time box is the
+          # runner's. 124 is the timeout firing, which is the *expected*
+          # end of a search; anything else is the fuzzer stopping early,
+          # and a crashing target is exactly that.
+          timeout --signal=INT "${MINUTES}m" zig build test-fuzz --fuzz 2>&1 | tee search.log
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          inputs_found=$(find .zig-cache/f -type f 2>/dev/null | wc -l)
+          echo "inputs=$inputs_found" >> "$GITHUB_OUTPUT"
+          if [ "$status" -ne 124 ] && [ "$status" -ne 0 ]; then
+            echo "::error::the search stopped early (exit $status) — see the log and the corpus artifact"
+            exit 1
+          fi
+          echo "searched ${MINUTES}m, corpus holds ${inputs_found} inputs" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: save the corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .zig-cache/f
+          key: fuzz-corpus-${{ github.run_id }}
+
+      # The corpus is the finding when something crashes: the input that
+      # did it is in there, and `zig build test-fuzz` replays it.
+      - name: upload the corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: |
+            .zig-cache/f
+            search.log
+          if-no-files-found: ignore
+
+      - name: Report to Discord
+        if: always()
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          OUTCOME: ${{ steps.search.outcome }}
+          INPUTS: ${{ steps.search.outputs.inputs }}
+          MINUTES: ${{ inputs.minutes || '20' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$OUTCOME" = success ]; then
+            title="Fuzz search clean"
+            color=3066993
+            detail=$(printf 'Searched %s minutes with every target holding. Corpus: %s inputs.' \
+              "$MINUTES" "${INPUTS:-0}")
+          else
+            title="Fuzz search FOUND SOMETHING"
+            color=15158332
+            detail=$(printf 'A target stopped early. The input that did it is in the `fuzz-corpus` artifact; `zig build test-fuzz` replays it.')
+          fi
+          if [ -z "${WEBHOOK:-}" ]; then
+            echo "::warning::DISCORD_WEBHOOK is not set; skipping the report."
+            printf '%s\n\n%s\n' "$title" "$detail" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          jq -n --arg title "$title" --arg detail "$detail" --argjson color "$color" \
+                --arg url "$RUN_URL" --arg sha "${SHA:0:7}" --arg inputs "${INPUTS:-0}" \
+            '{
+              username: "zssl fuzz",
+              embeds: [{
+                title: $title,
+                description: $detail,
+                color: $color,
+                url: $url,
+                fields: [
+                  {name: "Corpus", value: $inputs, inline: true},
+                  {name: "Commit", value: $sha, inline: true}
+                ]
+              }]
+            }' > payload.json
+          curl -sS -f -X POST -H "Content-Type: application/json" \
+            -d @payload.json "$WEBHOOK" > /dev/null
+          printf '%s\n\n%s\n' "$title" "$detail" >> "$GITHUB_STEP_SUMMARY"

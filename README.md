@@ -254,8 +254,7 @@ RSA-PSS, SNI, ALPN, HelloRetryRequest in both directions, PSK
 resumption, 0-RTT, mutual authentication in both directions, RFC 5705
 exporters, KeyUpdate, and kTLS key export.
 
-Not built: nothing, bar the coverage-guided fuzz *search*, which is
-blocked on a compiler bug rather than on this library. Never:
+Not built: nothing. Never:
 TLS 1.2 and earlier, renegotiation, compression, RSA and DSA key
 exchange, post-handshake client auth, QUIC and DTLS. X.509 chain
 building and RFC 9525 name matching are yours, through
@@ -278,7 +277,7 @@ its own CI workflow, so they run in parallel and fail separately.
 | [**RFC 8448**](src/rfc8448_test.zig) | [![rfc8448](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml) | The RFC's traced bytes, reproduced exactly |
 | [**OpenSSL**](interop/main.zig) | [![interop](https://github.com/zoxy-io/zssl/actions/workflows/interop.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/interop.yml) | Five legs against a real `openssl` binary |
 | [**`std.crypto.tls`**](src/std_interop_test.zig) | [![std.crypto.tls](https://github.com/zoxy-io/zssl/actions/workflows/std-interop.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/std-interop.yml) | A second stack, in memory, both directions |
-| [**Fuzzing**](src/fuzz_test.zig) | [![fuzz](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml) | Nine targets: a value or an error, never a panic |
+| [**Fuzzing**](src/fuzz_test.zig) | [![fuzz](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml)<br>[![fuzz-search](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml) | Nine targets: a value or an error, never a panic. Seeds per PR, coverage-guided search nightly |
 
 Plus directed tests for what only breaks under adversity — fragmented
 ClientHellos, tampered Finished messages, corrupted binders, inverted
@@ -317,8 +316,10 @@ zig build bogo                          # against BoringSSL's BoGo runner
 zig build tlsfuzzer                     # against tlsfuzzer's scripts
 zig build tlsanvil                      # against TLS-Anvil's RFC-derived corpus
 zig build tlsfuzzer-server -- --port 4433   # that server alone, to hand-drive
+zig build test-fuzz                     # the fuzz targets, once over their seeds
+zig build test-fuzz --fuzz              # the coverage-guided search; runs until interrupted
 zig build coverage                      # line coverage, needs kcov (Linux)
-zig fmt --check src interop bogo tlsanvil tlsfuzzer scripts build.zig build.zig.zon
+zig fmt --check src interop bench bogo fuzz tlsanvil tlsfuzzer scripts build.zig build.zig.zon
 ```
 
 RFC 8448 vectors are generated, never transcribed:
