@@ -43,8 +43,11 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
   before the counts — when the harness died mid-run, because a corpus
   that ran against a corpse reports a low number that looks exactly like
   a corpus that refused us. See docs/TLSANVIL.md.
-- `zig fmt --check src interop bench bogo tlsanvil tlsfuzzer scripts
-  build.zig build.zig.zon` — format gate.
+- `zig fmt --check src interop bench bogo fuzz tlsanvil tlsfuzzer
+  scripts build.zig build.zig.zon` — format gate. `fuzz/` is in the list
+  even though its one file is vendored from the compiler: it is
+  zig-fmt-clean upstream, so keeping it under the gate costs nothing and
+  a re-sync that is not costs a one-line `zig fmt`.
 - Run the `tiger-style-reviewer` agent on the working diff before
   committing a slice (same rule as zoxy). Its definition lives in
   `.claude/agents/tiger-style-reviewer.md`; zoxy's copy remains the
