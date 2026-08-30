@@ -22,6 +22,7 @@ const backend = @import("crypto/backend_openssl.zig");
 const key_schedule = @import("key_schedule.zig");
 const protect = @import("protect.zig");
 const client_hello_mod = @import("client_hello.zig");
+const client_messages = @import("client_messages.zig");
 const server_messages = @import("server_messages.zig");
 const transcript = @import("transcript.zig");
 const wire = @import("wire.zig");
@@ -89,6 +90,15 @@ const Harness = struct {
         /// makes it retry a client that shares only x25519, which is
         /// every client this library builds.
         server_groups: []const u16 = &client_hello_mod.groups_supported,
+        /// What the client advertises in `signature_algorithms`, and so
+        /// what §4.4.3 lets the server sign with. Narrowing it is how a
+        /// test reaches the "not offered" abort with a scheme this
+        /// library is perfectly able to verify.
+        client_verify_schemes: []const backend.SignatureScheme =
+            &client_messages.signature_schemes_default,
+        /// §4.4.2's signing set, narrowed. Null leaves the choice to the
+        /// key, which is what almost every test here wants.
+        server_signing_schemes: ?[]const u16 = null,
     };
 
     fn init(harness: *Harness, options: Options) !void {
@@ -120,6 +130,7 @@ const Harness = struct {
             .key_share_private = server_key_share_private,
             .alpn = options.server_alpn,
             .groups = options.server_groups,
+            .signing_schemes = options.server_signing_schemes,
             .reassembly = &harness.server_reassembly,
             .flight = &harness.flight,
             .psk_lookup = if (store) |context| .{
@@ -137,6 +148,7 @@ const Harness = struct {
             .chain_verifier = options.chain_verifier,
             .resume_session = resume_session,
             .retry_key_share_private = options.retry_private,
+            .verify_schemes = options.client_verify_schemes,
             .reassembly = &harness.client_reassembly,
         });
     }
@@ -2180,4 +2192,133 @@ test "§4.6.1: a ticket's early_data limit is read, and its grammar held to" {
             );
         },
     }
+}
+
+test "§4.4.3: a CertificateVerify scheme we never offered is illegal_parameter" {
+    // Two shapes of "not offered", and they used to be indistinguishable
+    // from a signature that failed: both returned `BadSignature`, whose
+    // alert is decrypt_error. §4.4.3 names illegal_parameter for this,
+    // and the difference is not cosmetic — it tells the peer it broke the
+    // negotiation rather than that its key is bad, and it tells the
+    // embedder no signature was ever checked.
+    //
+    // Our own server will not commit either, since it signs only with
+    // what the hello advertised, so both are forged under the genuine
+    // handshake keys.
+    const Shape = struct {
+        name: []const u8,
+        offered: []const backend.SignatureScheme,
+        /// The wire code point the forged CertificateVerify carries.
+        signed_with: u16,
+    };
+    for ([_]Shape{
+        // A code point outside the five this library implements at all.
+        // 0x0807 is ed25519, which §4.4.3 permits and we do not hold.
+        .{
+            .name = "a scheme the library does not implement",
+            .offered = &client_messages.signature_schemes_default,
+            .signed_with = 0x0807,
+        },
+        // A scheme we verify perfectly well, withheld by the embedder.
+        // This is the one that proves `verify_schemes` is a promise
+        // rather than a hint: nothing about 0x0503 is beyond us, and it
+        // is refused because the hello did not offer it.
+        .{
+            .name = "a scheme the embedder withheld",
+            .offered = &.{.ecdsa_secp256r1_sha256},
+            .signed_with = 0x0503,
+        },
+    }) |shape| {
+        var buffers: Buffers = .{};
+        var harness: Harness = undefined;
+        try harness.init(.{ .client_verify_schemes = shape.offered });
+        defer harness.deinit();
+
+        const hello = harness.client.start(&buffers.client_out);
+        const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
+        const server_hello_record = recordAt(flight.send, 0);
+        _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
+
+        var forger = try serverFlightProtector(
+            &client_x25519_private,
+            hello,
+            server_hello_record,
+        );
+        defer forger.deinit();
+
+        // EncryptedExtensions and the server's real Certificate first:
+        // the client refuses a CertificateVerify that arrives out of
+        // order, and this test is about the scheme, not the ordering.
+        var plaintext: [4096]u8 = undefined;
+        var forged: [record.wire_record_bytes_max]u8 = undefined;
+        const extensions = server_messages.encryptedExtensions(&plaintext, "http/1.1", false);
+        _ = try harness.client.handleRecord(try forger.seal(.handshake, extensions, &forged), &buffers.scratch);
+        const chain = server_messages.certificateChain(&plaintext, harness.credentials.chain());
+        _ = try harness.client.handleRecord(try forger.seal(.handshake, chain, &forged), &buffers.scratch);
+
+        // The signature body is deliberately garbage: the scheme check
+        // must fire before anything is verified, and a test that passed
+        // only because the bytes were also wrong would prove nothing.
+        var body: [128]u8 = undefined;
+        const verify = server_messages.certificateVerify(
+            &body,
+            shape.signed_with,
+            &(.{0xa5} ** 64),
+        );
+
+        try testing.expectError(
+            error.UnofferedSignatureScheme,
+            harness.client.handleRecord(
+                try forger.seal(.handshake, verify, &forged),
+                &buffers.scratch,
+            ),
+        );
+        try testing.expectEqual(ClientHandshake.State.failed, harness.client.state);
+        // Nothing was verified, and nothing is claimed to have been.
+        try testing.expect(!harness.client.certificate_verified);
+        try testing.expectEqual(
+            @as(?backend.SignatureScheme, null),
+            harness.client.peer_signature_scheme,
+        );
+    }
+}
+
+test "§4.4.2: the embedder's signing preference is obeyed, and refused when empty" {
+    // An RSA modulus signs under all three PSS digests, so it is the one
+    // fixture where narrowing has something to choose between: the key
+    // could satisfy any of them and the answer has to come from the
+    // configured order rather than the signer's own.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{
+        .leaf = .rsa_2048,
+        // Deliberately *not* the signer's own order, which leads with
+        // sha256 — a test that named sha256 would pass without the
+        // preference being read at all.
+        .server_signing_schemes = &.{ 0x0806, 0x0805, 0x0804 },
+    });
+    defer harness.deinit();
+    try harness.connect(&buffers);
+    try testing.expectEqual(
+        backend.SignatureScheme.rsa_pss_rsae_sha512,
+        harness.server.signature_scheme,
+    );
+    try testing.expect(harness.client.certificate_verified);
+
+    // And the misconfiguration the field documents: a scheme this key
+    // cannot produce is answered on the wire, not asserted away. A P-256
+    // curve over an RSA key is exactly the kind of pin an embedder gets
+    // wrong once, and §4.4.2 leaves it nothing to sign with.
+    var pinned: Harness = undefined;
+    try pinned.init(.{
+        .leaf = .rsa_2048,
+        .server_signing_schemes = &.{0x0403},
+    });
+    defer pinned.deinit();
+    var pinned_buffers: Buffers = .{};
+    const hello = pinned.client.start(&pinned_buffers.client_out);
+    try testing.expectError(
+        error.HandshakeFailure,
+        pinned.server.handleRecord(hello, &pinned_buffers.server_out),
+    );
 }

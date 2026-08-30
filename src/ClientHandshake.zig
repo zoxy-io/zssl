@@ -155,6 +155,11 @@ alpn_selected: ?u8,
 leaf_public_key: [leaf_public_key_bytes_max]u8,
 leaf_public_key_bytes: u16,
 leaf_key_kind: LeafKeyKind,
+/// The scheme the server signed its CertificateVerify with, once one has
+/// verified. Null before that and on a resumed handshake, which carries
+/// no CertificateVerify at all. Read-only to the embedder, and the
+/// mirror of `ServerHandshake.signature_scheme`.
+peer_signature_scheme: ?backend.SignatureScheme,
 
 const ClientHandshake = @This();
 
@@ -302,6 +307,13 @@ pub const Config = struct {
         client_hello.group_secp256r1,
         client_hello.group_secp384r1,
     },
+    /// §4.2.3's `signature_algorithms`: what we will accept in the
+    /// server's CertificateVerify, in preference order. Narrowing it is
+    /// how a deployment refuses a scheme it holds the code for — and
+    /// §4.4.3 makes the list load-bearing rather than advisory, because
+    /// a signature under a scheme *absent from here* is an
+    /// illegal_parameter abort, not a verification that failed.
+    verify_schemes: []const backend.SignatureScheme = &client_messages.signature_schemes_default,
     /// Compatibility session id to send and expect echoed (§4.1.3);
     /// embedder-random, may be empty.
     session_id: []const u8 = &.{},
@@ -410,6 +422,13 @@ pub const Error = backend.Error || protect.Error || session_keys.Error ||
     BadCertificate,
     /// CertificateVerify did not verify against the leaf.
     BadSignature,
+    /// §4.4.3: the CertificateVerify named a signature algorithm absent
+    /// from the `signature_algorithms` we offered. The peer broke the
+    /// negotiation rather than failing a check, so the alert is
+    /// illegal_parameter and no signature was attempted. Distinct from
+    /// `BadSignature`, which is a scheme we did offer whose signature did
+    /// not verify, or one paired with the wrong kind of leaf key.
+    UnofferedSignatureScheme,
     /// The server's Finished MAC did not verify.
     DecryptError,
     /// The server selected an ALPN protocol we did not offer (RFC 7301).
@@ -435,6 +454,29 @@ pub fn init(config: *const Config) ClientHandshake {
         assert(protocol.len <= client_messages.alpn_protocol_bytes_max);
     }
     assert(!std.mem.allEqual(u8, &config.x25519_private, 0));
+    // `groups` is the embedder's, and three things about it are load
+    // bearing. It must name the group we actually share, because §4.2.8
+    // requires every key_share entry to appear in supported_groups and
+    // this client always shares x25519. Every entry must be one we can
+    // complete, for the reason `ServerHandshake` asserts the same: a
+    // group we advertise is a retry we may have to answer. And the list
+    // is bounded because `wire.Builder` bounds nothing — the hello is
+    // built into a fixed buffer.
+    assert(config.groups.len >= 1);
+    assert(config.groups.len <= client_hello.groups_supported.len);
+    // Bounded for the reason `groups` is: the hello is built into a
+    // fixed buffer and `wire.Builder` bounds nothing. An empty list is
+    // refused rather than silently meaning "all" — a client that accepts
+    // no signature can complete no handshake, and saying so at `init` is
+    // better than a handshake_failure three flights later.
+    assert(config.verify_schemes.len >= 1);
+    assert(config.verify_schemes.len <= @typeInfo(backend.SignatureScheme).@"enum".fields.len);
+    var shares_an_advertised_group = false;
+    for (config.groups) |group| {
+        assert(client_hello.groupShareBytes(group) != null);
+        if (group == client_hello.group_x25519) shares_an_advertised_group = true;
+    }
+    assert(shares_an_advertised_group);
     if (config.resume_session) |resumption| {
         assert(resumption.psk_bytes == 32 or resumption.psk_bytes == 48);
         assert(resumption.identity.len >= 1);
@@ -465,6 +507,7 @@ pub fn init(config: *const Config) ClientHandshake {
         .leaf_public_key = undefined,
         .leaf_public_key_bytes = 0,
         .leaf_key_kind = .none,
+        .peer_signature_scheme = null,
     };
 }
 
@@ -523,6 +566,7 @@ pub fn start(self: *ClientHandshake, out: []u8) []const u8 {
         .share_group = client_hello.group_x25519,
         .share_public = self.key_share.?.publicValue(),
         .groups = self.config.groups,
+        .signature_schemes = self.config.verify_schemes,
         .server_name = self.config.server_name,
         .alpn_protocols = self.config.alpn_protocols,
         .psk = psk,
@@ -866,6 +910,7 @@ fn handleHelloRetryRequest(
         .share_group = selected,
         .share_public = share,
         .groups = self.config.groups,
+        .signature_schemes = self.config.verify_schemes,
         .cookie = retry.cookie,
         .server_name = self.config.server_name,
         .alpn_protocols = self.config.alpn_protocols,
@@ -1388,32 +1433,55 @@ fn verifyCertificate(self: *ClientHandshake, arm: anytype, message: handshake.Me
     // where the kind is known.
     assert(self.leaf_key_kind != .none);
     var body = wire.Cursor.init(message.body());
-    const scheme = try body.takeU16();
+    const scheme_wire = try body.takeU16();
     const signature = try body.takeSlice(try body.takeU16());
     // Bytes after the signature are a framing fault; the signature
     // itself may be perfectly good and has not been checked yet.
     if (body.remaining() != 0) return error.MalformedMessage;
+    // §4.4.3: "If the CertificateVerify message contains a signature
+    // algorithm that was not offered in the signature_algorithms
+    // extension, the receiver MUST abort with an illegal_parameter
+    // alert." That is a negotiation the peer broke, and it is not the
+    // same event as a signature that failed to verify — which is why it
+    // is its own error rather than the `BadSignature` this used to
+    // return for every unrecognised code point. Conflating them sent
+    // decrypt_error where §4.4.3 asks for illegal_parameter, and told
+    // the embedder a signature was bad when none had been checked.
+    const scheme = backend.SignatureScheme.fromWire(scheme_wire) orelse
+        return error.UnofferedSignatureScheme;
+    if (!self.offeredScheme(scheme)) return error.UnofferedSignatureScheme;
     var content_buffer: [server_messages.certificate_verify_content_bytes_max]u8 = undefined;
     const content = server_messages.certificateVerifyContent(.server, &arm.transcriptHash(), &content_buffer);
     const public_key = self.leaf_public_key[0..self.leaf_public_key_bytes];
     // The scheme must match the key the leaf actually carries: an ECDSA
     // scheme over an RSA key (or the reverse) is a peer error, not a
     // parse to attempt. Checked here so each verifier's precondition is
-    // the kind it was written for.
-    switch (scheme) {
-        0x0403, 0x0503 => if (self.leaf_key_kind != .ecdsa) return error.BadSignature,
-        0x0804, 0x0805, 0x0806 => if (self.leaf_key_kind != .rsa) return error.BadSignature,
-        else => return error.BadSignature,
+    // the kind it was written for. Distinct from the check above: the
+    // scheme *was* offered, so the fault is the certificate it arrived
+    // beside rather than the negotiation.
+    switch (scheme.keyKind()) {
+        .ecdsa => if (self.leaf_key_kind != .ecdsa) return error.BadSignature,
+        .rsa => if (self.leaf_key_kind != .rsa) return error.BadSignature,
     }
     switch (scheme) {
-        0x0403 => try verifyEcdsa(.ecdsa_secp256r1_sha256, public_key, content, signature),
-        0x0503 => try verifyEcdsa(.ecdsa_secp384r1_sha384, public_key, content, signature),
-        0x0804 => try verifyRsaPss(std.crypto.hash.sha2.Sha256, public_key, content, signature),
-        0x0805 => try verifyRsaPss(std.crypto.hash.sha2.Sha384, public_key, content, signature),
-        0x0806 => try verifyRsaPss(std.crypto.hash.sha2.Sha512, public_key, content, signature),
-        else => unreachable, // The switch above admitted only these.
+        .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384 => try verifyEcdsa(scheme, public_key, content, signature),
+        .rsa_pss_rsae_sha256 => try verifyRsaPss(std.crypto.hash.sha2.Sha256, public_key, content, signature),
+        .rsa_pss_rsae_sha384 => try verifyRsaPss(std.crypto.hash.sha2.Sha384, public_key, content, signature),
+        .rsa_pss_rsae_sha512 => try verifyRsaPss(std.crypto.hash.sha2.Sha512, public_key, content, signature),
     }
+    self.peer_signature_scheme = scheme;
     self.certificate_verified = true;
+}
+
+/// Whether `scheme` was in the `signature_algorithms` we advertised.
+/// §4.4.3 turns this into an abort, so it reads `Config.verify_schemes`
+/// rather than the set the code happens to implement — an embedder that
+/// narrowed the list meant it.
+fn offeredScheme(self: *const ClientHandshake, scheme: backend.SignatureScheme) bool {
+    for (self.config.verify_schemes) |offered| {
+        if (offered == scheme) return true;
+    }
+    return false;
 }
 
 /// ECDSA (§4.4.3's `ecdsa_secp*`), through libcrypto.

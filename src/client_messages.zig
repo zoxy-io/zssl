@@ -13,6 +13,7 @@ const assert = std.debug.assert;
 /// point, two shapes, decided by the message carrying it.
 const extension_early_data: u16 = 42;
 
+const backend = @import("crypto/backend_openssl.zig");
 const cipher_suite = @import("cipher_suite.zig");
 const client_hello = @import("client_hello.zig");
 const handshake = @import("handshake.zig");
@@ -20,6 +21,23 @@ const key_schedule = @import("key_schedule.zig");
 const server_messages = @import("server_messages.zig");
 const wire = @import("wire.zig");
 const CipherSuite = cipher_suite.CipherSuite;
+
+/// §4.2.3's default offer: ECDSA first — it is what zssl's own server
+/// signs with, and the cheaper verify — then RSA-PSS, because a client
+/// that originates to arbitrary upstreams meets RSA leaves constantly
+/// and a list without them is a handshake failure against most of the
+/// public web.
+///
+/// One list, because §4.4.3 makes the hello's offer and the verifier's
+/// accept-set the same promise: `ClientHandshake.Config.verify_schemes`
+/// defaults to this and is what both read.
+pub const signature_schemes_default = [_]backend.SignatureScheme{
+    .ecdsa_secp256r1_sha256,
+    .ecdsa_secp384r1_sha384,
+    .rsa_pss_rsae_sha256,
+    .rsa_pss_rsae_sha384,
+    .rsa_pss_rsae_sha512,
+};
 
 /// Base fields plus every extension at its cap (a 255-byte server name,
 /// a 512-byte ticket identity, a 48-byte binder, a full ALPN list).
@@ -58,6 +76,12 @@ pub const HelloParams = struct {
     /// HelloRetryRequest, which is a way of being untestable as much as
     /// it is a way of being narrow (DESIGN.md §1).
     groups: []const u16,
+    /// §4.2.3's `signature_algorithms`, in preference order — what we
+    /// will accept in the server's CertificateVerify. §4.4.3 makes this
+    /// a promise rather than a hint: a signature under a scheme absent
+    /// from here is an abort, so the list the hello carries and the list
+    /// the verifier enforces have to be the same one.
+    signature_schemes: []const backend.SignatureScheme,
     /// §4.2.2: echoed verbatim from a HelloRetryRequest that sent one.
     /// The server may keep its whole retry state in here, so dropping it
     /// is not a simplification — it is a handshake that cannot complete.
@@ -79,6 +103,7 @@ pub fn clientHello(out: []u8, params: *const HelloParams) []const u8 {
     if (params.server_name) |name| assert(name.len <= 255);
     assert(params.alpn_protocols.len <= alpn_protocols_max);
     assert(params.groups.len >= 1);
+    assert(params.signature_schemes.len >= 1);
     assert(params.share_public.len >= 1);
     if (params.cookie) |cookie| assert(cookie.len >= 1);
     var builder = wire.Builder.init(out);
@@ -124,21 +149,17 @@ fn helloExtensions(builder: *wire.Builder, params: *const HelloParams) void {
     builder.patchU16(group_list);
     builder.patchU16(groups);
     // signature_algorithms (§4.2.3): what we will accept in the server's
-    // CertificateVerify. ECDSA first — it is what zssl's own server signs
-    // with, and the cheaper verify — then RSA-PSS, because a client that
-    // originates to arbitrary upstreams meets RSA leaves constantly and a
-    // list without them is a handshake failure against most of the public
-    // web. rsa_pkcs1_* is absent on purpose: §4.4.3 forbids it in
-    // CertificateVerify, and listing it would invite a signature we then
-    // refuse.
+    // CertificateVerify. The default is ECDSA first — it is what zssl's
+    // own server signs with, and the cheaper verify — then RSA-PSS,
+    // because a client that originates to arbitrary upstreams meets RSA
+    // leaves constantly and a list without them is a handshake failure
+    // against most of the public web. rsa_pkcs1_* cannot appear at all:
+    // §4.4.3 forbids it in CertificateVerify, and `SignatureScheme` has
+    // no code point for it, so the type is what keeps it out.
     builder.putU16(13);
     const schemes = builder.markU16();
     const scheme_list = builder.markU16();
-    builder.putU16(0x0403); // ecdsa_secp256r1_sha256
-    builder.putU16(0x0503); // ecdsa_secp384r1_sha384
-    builder.putU16(0x0804); // rsa_pss_rsae_sha256
-    builder.putU16(0x0805); // rsa_pss_rsae_sha384
-    builder.putU16(0x0806); // rsa_pss_rsae_sha512
+    for (params.signature_schemes) |scheme| builder.putU16(@intFromEnum(scheme));
     builder.patchU16(scheme_list);
     builder.patchU16(schemes);
     if (params.alpn_protocols.len >= 1) {
@@ -282,6 +303,7 @@ test "the production hello parses under our own strict parser" {
         .session_id = &(.{0xee} ** 32),
         .share_group = client_hello.group_x25519,
         .share_public = &public,
+        .signature_schemes = &signature_schemes_default,
         .groups = &.{client_hello.group_x25519},
         .server_name = "origin.internal",
         .alpn_protocols = &.{ "h2", "http/1.1" },
@@ -316,6 +338,7 @@ test "a PSK hello carries a well-formed offer and a patchable binder" {
         .session_id = &.{},
         .share_group = client_hello.group_x25519,
         .share_public = &public,
+        .signature_schemes = &signature_schemes_default,
         .groups = &.{client_hello.group_x25519},
         .psk = .{ .identity = "sealed-ticket", .obfuscated_age = 7, .binder_bytes = 32 },
     });

@@ -221,6 +221,18 @@ pub const Config = struct {
     /// send a retry at all, it is also the only way to put a retry under
     /// an in-tree test rather than leaving it to BoGo.
     groups: []const u16 = &client_hello.groups_supported,
+    /// §4.4.2's signing set, as wire code points, in the embedder's
+    /// preference order. Null leaves the choice to the key, which is
+    /// what an embedder that has not thought about it wants.
+    ///
+    /// Wire values rather than `backend.SignatureScheme` on purpose, the
+    /// same way `groups` is: restricting the server to a scheme this
+    /// build cannot produce is a legal thing to configure, and the
+    /// answer is `HandshakeFailure` — not a type that cannot hold the
+    /// request. An embedder pinning ecdsa_secp384r1_sha384 on a P-256
+    /// key has misconfigured something, and a handshake that says so is
+    /// better than one that quietly signs with the other curve.
+    signing_schemes: ?[]const u16 = null,
     /// Caller-owned space for handshake-message reassembly (client side
     /// of the conversation). A ClientHello budget: 8 KiB is generous.
     reassembly: []u8,
@@ -438,6 +450,13 @@ pub fn init(config: *const Config) ServerHandshake {
     if (config.alpn) |protocol| assert(protocol.len >= 1);
     assert(config.groups.len >= 1);
     assert(config.groups.len <= client_hello.groups_supported.len);
+    // Non-empty, and deliberately unbounded above: unlike `groups`,
+    // nothing is ever *written* from this list — it is only read to
+    // choose among what the key can already do, so there is no buffer to
+    // overrun. Membership is not checked either: naming a scheme the key
+    // cannot produce is the misconfiguration described on the field, and
+    // it is answered on the wire rather than asserted away.
+    if (config.signing_schemes) |schemes| assert(schemes.len >= 1);
     for (config.groups) |group| assert(client_hello.groupShareBytes(group) != null);
     return .{
         .state = .awaiting_client_hello,
@@ -744,7 +763,11 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
         // §4.4.2: the scheme we sign under must be one the client offered,
         // and an RSA key admits three digests — so this is an
         // intersection, not an equality.
-        self.signature_scheme = selectScheme(&hello, self.config.credentials) orelse
+        self.signature_scheme = selectScheme(
+            &hello,
+            self.config.credentials,
+            self.config.signing_schemes,
+        ) orelse
             return error.HandshakeFailure;
     }
     self.captureSessionEcho(&hello);
@@ -976,22 +999,40 @@ fn binderMatches(
     }
 }
 
-/// Our preference order: AES-128-GCM leads (hardware-everywhere), then
-/// ChaCha20 ahead of AES-256 — the §B.4 trio, no more.
 /// §4.4.2's intersection: our key's schemes against the client's offer,
 /// in our preference order so the choice is ours among what it allows.
+///
+/// `restrict` is the embedder's narrowing, and when present its order
+/// wins over the key's — a deployment that lists rsa_pss_rsae_sha512
+/// first meant it. A scheme in `restrict` that the key cannot produce
+/// simply never matches, which is how naming one we do not hold becomes
+/// a `HandshakeFailure` rather than a silent substitution.
 fn selectScheme(
     hello: *const client_hello.ClientHello,
     credentials: *const Credentials,
+    restrict: ?[]const u16,
 ) ?backend.SignatureScheme {
     const supported = credentials.signer.supported();
     assert(supported.len >= 1);
+    if (restrict) |allowed| {
+        for (allowed) |wanted| {
+            if (!hello.offersScheme(wanted)) continue;
+            for (supported) |scheme| {
+                if (@intFromEnum(scheme) == wanted) return scheme;
+            }
+        }
+        return null;
+    }
     for (supported) |scheme| {
         if (hello.offersScheme(@intFromEnum(scheme))) return scheme;
     }
     return null;
 }
 
+/// Our preference order: AES-128-GCM leads (hardware-everywhere), then
+/// ChaCha20 ahead of AES-256 — the §B.4 trio, no more. This sentence
+/// had drifted onto `selectScheme` above, where it described neither the
+/// parameters nor the return.
 fn negotiateSuite(hello: *const client_hello.ClientHello) ?CipherSuite {
     const preference = [_]CipherSuite{
         .aes_128_gcm_sha256,

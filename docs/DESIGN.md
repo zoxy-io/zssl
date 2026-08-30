@@ -33,7 +33,17 @@ the four decisions everything else follows from.
   rsa_pkcs1_* stays out on both sides, because §4.4.3 forbids it in
   CertificateVerify. ECDSA signs through libcrypto, with an opt-in
   RFC 6979 deterministic-nonce mode; a peer's RSA-PSS is checked through
-  `std.crypto`, for the reason §2 records.
+  `std.crypto`, for the reason §2 records. What the client will accept is
+  `Config.verify_schemes`, and §4.4.3 makes that list a promise rather
+  than a hint: a CertificateVerify under a scheme absent from it is an
+  `illegal_parameter` abort with nothing verified, told apart from a
+  signature that simply failed. `ClientHandshake.peer_signature_scheme`
+  reports what the server actually used, mirroring the server's own
+  `signature_scheme`. The server's signing set narrows through
+  `Config.signing_schemes`, whose order wins over the key's — and which
+  takes wire code points rather than an enum, so pinning a scheme the key
+  cannot produce is answered with `HandshakeFailure` rather than being
+  unrepresentable.
 - **PSK resumption.** `psk_lookup` is the embedder seam: an opaque
   identity goes in, the PSK *and its kind* come out, and ticket sealing,
   lifetime and age policy stay the embedder's. Both kinds are accepted
@@ -58,7 +68,14 @@ the four decisions everything else follows from.
 ### Not built
 
 - **Client certificates** — no CertificateRequest on either side.
-- **QUIC and DTLS** — no datagram record layer.
+- **RFC 5705 exporters.** §7.5's `exporter_master` is derived and
+  RFC 8448 checks it (`src/rfc8448_test.zig`), but no API expands it, so
+  an embedder that needs channel binding cannot get it. BoGo declines
+  167 cases on the flag and would run **six** of them — the rest are
+  DTLS, QUIC, or pre-1.3. Six is still the right reason to build it:
+  they cover initial and resumed exchanges, no-context against
+  empty-context, and §7.5's rule that the exporter stays shut while the
+  client is sending 0-RTT.
 - **Appendix E.5's early-data marker.** `Event.application_data` does
   not say whether the bytes arrived as 0-RTT; the embedder infers it
   from the connection's state. That works and is not the same as being
@@ -69,8 +86,9 @@ the four decisions everything else follows from.
 ### Never
 
 TLS 1.2 and earlier, renegotiation, compression, RSA and DSA key
-exchange, SSLv3-era anything, post-handshake client auth. A caller that
-needs these wants a different library.
+exchange, SSLv3-era anything, post-handshake client auth, and **QUIC and
+DTLS** — there is no datagram record layer and none planned. A caller
+that needs these wants a different library.
 
 **X.509 chain validation** is out too, but delegated rather than
 missing: `ClientHandshake.Config.chain_verifier` shows the embedder the

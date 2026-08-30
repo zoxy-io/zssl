@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 324 passed, 0 failed, 6904 declined by the shim (89), floor 324
+bogo: 367 passed, 0 failed, 6795 declined by the shim (89), floor 367
 bogo: PASS
 ```
 
@@ -41,8 +41,11 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**324 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. It was 278 until
+**367 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. It was 348
+until the server's signing preference could be narrowed (finding 20),
+324 until the client could report and restrict its signature algorithms
+(finding 19), and 278 until
 the client could answer a HelloRetryRequest: a single-group client that
 refused every retry structurally kept 26 patterns declined, and
 un-declining them is where the 21 came from. The last seven are the
@@ -76,7 +79,7 @@ extension block, and 143 until §4.6.3's update requests were coalesced, and
 either gets fixed or gets an entry in `DisabledTests` with a one-line
 reason. There are no silent skips.
 
-**6904 declined** — 88% of the corpus. The shim exited 89, PORTING.md's
+**6795 declined** — 86% of the corpus. The shim exited 89, PORTING.md's
 "unimplemented", and the runner counted the case without running it.
 That number is large enough to be the first thing anyone asks about, so
 here is what it is made of. Counting each case by the *first* thing the
@@ -91,7 +94,7 @@ shim declined:
 | 281 | `-enable-ocsp-stapling` / `-ocsp-response`. |
 | 250 | `-signing-prefs` / `-expect-peer-signature-algorithm`. |
 | 248 | `-new-rpk-credential` — raw public keys. |
-| 105 | A group we do not hold, or a `-curves` set our client cannot honour — it offers x25519 alone whatever it is told, and the server cannot be told to accept a narrower set. |
+| 105 | A group we do not hold, or a `-curves` set we cannot honour — now only a set naming a group neither machine completes, or one without x25519, which is the group our client always shares. |
 | 182 | `-accepted-peer-cert-types`. |
 | 167 | `-export-keying-material` — RFC 5705 exporters, which zssl has no API for. |
 | ~1800 | The rest of the flag surface, one flag at a time. |
@@ -99,12 +102,51 @@ shim declined:
 Roughly 3400 of those — DTLS, QUIC, client certificates, ECH,
 compliance policies, X.509 validation — are scope decisions written down
 in DESIGN.md §1 and will never come back. The rest is headroom: the
-largest single wins available are an RFC 5705 exporter (167 cases),
-exposing the peer's negotiated signature algorithm (128), honouring
-`-signing-prefs` (122), and letting the two machines be *told* which
-groups to use — a server that can be restricted to a subset and a client
-that can offer something other than x25519 would let the rest of the
-`-curves` corpus run against the key exchange that already completes it.
+largest rows left are an RFC 5705 exporter (167 cases), exposing the
+peer's negotiated signature algorithm (128), and honouring
+`-signing-prefs` (122) — *rows*, deliberately, not wins. All three have
+now been sampled, and they came out very differently:
+
+| Row | Cases | Would run | What is in the way |
+| --- | ---: | ---: | --- |
+| `-export-keying-material` | 167 | **6** | the rest are DTLS, QUIC or pre-1.3 |
+| `-expect-peer-signature-algorithm` | 128 | **~32** | half are pre-1.3; half of the rest verify a *client* certificate |
+| `-signing-prefs` | 122 | **~31** | `Client-Sign-*` is client certificates |
+
+The exporter row is small because `cipher_suite_tests.go` sets the flag
+on every `-server`/`-client` case but generates none at TLS 1.3, and the
+dedicated `export_tests.go` family is mostly DTLS and QUIC.
+
+The two signature-algorithm rows are the real headroom, and cheaper than
+they look because each has a precedent in the tree. The client never
+records the peer's scheme — it is a local in `verifyCertificate`,
+checked and dropped — while the server already keeps `signature_scheme`
+and `interop` asserts on it; that is one field. Restricting which
+schemes the server will sign with is `Config.groups` one type over.
+Between them the shim needs three flags it does not have:
+`-expect-peer-signature-algorithm`, `-verify-prefs`, `-signing-prefs`.
+
+Read those two figures as cases that would *run*, not cases that would
+pass. Roughly two thirds of them are algorithms we do not hold, so they
+expect a refusal, and BoGo grades refusals by alert name — finding 8 is
+what that costs when we disagree.
+
+**Read this table as "first thing declined", not "cases a fix would
+buy".** `-curves` is the worked example, and it cost a slice to learn.
+This paragraph used to name it as one of the largest wins, on the
+strength of its 105-case row; both machines now take a configured group
+list, and honouring it un-declined **11** cases, every one of them a
+TLS 1.0/1.1/1.2 conversation we have to decline anyway. The other 94 hit
+a second unimplemented flag immediately behind the first. A row's number
+is an upper bound that is usually loose, because a case declined for one
+reason is very often declined for three.
+
+The 11 are worth keeping in mind for a different reason: `-curves` was
+the *only* thing declining them. The runner sets its `MaxVersion` on its
+own `Config` rather than passing the shim a `-max-version` flag, so
+nothing on the wire tells the shim those cases are pre-1.3 — they were
+being excluded by accident, and their RSA twins had been on the ledger
+by name all along.
 
 Each decline names its flag on stderr, so a case that later turns into a
 failure says which flag it stumbled on rather than leaving it to
@@ -152,12 +194,13 @@ Three bugs, fixed in this slice:
    falsifies. The floor is now the encoded chain's own size.
 
 Twelve more were open, and every one that was a defect is now fixed: 1,
-2, 3, 4, 5, 6, 7, 9, 10 and 12. Three findings still carry ledger
-entries, 8 suppressed cases between them — 5 under finding 10, 2 under
-8, 1 under 11 — and **none of them is an OPEN GAP**. Finding 8 is two
-divergences we intend to keep, 11 is a documented non-defect, and
-finding 10's remaining 5 are a scope decision filed under its number,
-which is why findings marked fixed still have entries against them.
+2, 3, 4, 5, 6, 7, 9, 10 and 12. Four findings still carry ledger
+entries, 13 suppressed cases between them — 5 under finding 10, 5 under
+19, 2 under 8, 1 under 11 — and **none of them is an OPEN GAP**.
+Finding 8 is two divergences we intend to keep and 19 is five more, 11 is
+a documented non-defect, and finding 10's remaining 5 are a scope
+decision filed under its number, which is why findings marked fixed still
+have entries against them.
 `grep 'OPEN GAP' bogo/config.json` returns nothing, which is the whole
 point of reserving that phrase for defects.
 All twelve keep their numbers rather than being renumbered, because the
@@ -886,6 +929,85 @@ name.
 
 None of these are exploitable as far as the runner can show; they are
 laxity, and laxity is what BoGo exists to find.
+
+19. **The peer's signature algorithm, and §4.4.3's other abort.**
+    Twenty-four more cases, from the row this document had been
+    calling one of the largest wins available without anyone checking
+    what was behind it.
+
+    Two flags, both client-side. `-verify-prefs` narrows what the client
+    will accept in a CertificateVerify, which is now
+    `ClientHandshake.Config.verify_schemes` — one list, read both by the
+    hello that advertises it and by the verifier that enforces it,
+    because §4.4.3 makes those the same promise.
+    `-expect-peer-signature-algorithm` asks what the server actually
+    signed with, which the client had been checking and throwing away; it
+    is `peer_signature_scheme` now, the mirror of the server's
+    `signature_scheme` that `interop` has always asserted on.
+
+    The library defect underneath: every unrecognised code point in a
+    CertificateVerify returned `BadSignature`, whose alert is
+    decrypt_error. §4.4.3 asks for illegal_parameter, and the two are not
+    interchangeable — one says the peer's key is bad, the other says it
+    broke a negotiation, and only the second is true when no signature
+    was ever checked. `UnofferedSignatureScheme` is that case, and the
+    in-tree test forges both shapes of it: a code point outside the five
+    we implement, and a scheme we verify perfectly well that the embedder
+    withheld. The second is the one that proves `verify_schemes` is
+    enforced rather than merely advertised.
+
+    A resumption wrinkle worth recording, because it is a seam rather
+    than a bug. BoGo asserts the algorithm on *both* exchanges, and a
+    resumed TLS 1.3 handshake carries no CertificateVerify — so the
+    library reports null and the shim remembers. That is the right split:
+    the scheme is a property of the session, and sessions are the
+    embedder's, exactly as tickets are.
+
+    Five cases stay declined and are marked KEEP, not fixed.
+    `Client-VerifyDefault-` over Ed25519, P-521 and the three ML-DSA
+    sizes pair an unsupported *key type* with an unsupported *signature
+    scheme*, and we notice the key first: those leaves are certificates
+    we cannot use under any scheme we offer, so they earn bad_certificate
+    — or, for ML-DSA, decode_error, because std's certificate parser will
+    not read them at all. BoGo wants illegal_parameter for all five. The
+    divergence is about *where* we notice, not whether we refuse, and the
+    §4.4.3 abort this finding added is what fires when the scheme really
+    is the only thing wrong.
+
+    Twenty-nine more were declined for their version. They are the same
+    accident finding 18's `-curves` note describes: the runner sets
+    MaxVersion on its own Config rather than passing the shim a flag, so
+    nothing on the wire says a case is pre-1.3, and these had been held
+    back only by the two flags this finding added.
+
+20. **The server's signing preference.** Nineteen more cases, and the
+    last of the three decline rows this document used to call wins
+    without having sampled any of them.
+
+    `-signing-prefs` is `ServerHandshake.Config.signing_schemes`: §4.4.2's
+    intersection, narrowed by the embedder, whose order wins over the
+    key's. It takes wire code points rather than
+    `backend.SignatureScheme`, and that is the whole design. Restricting
+    a server to a scheme this build cannot produce is a legal thing to
+    configure — BoGo does it deliberately, expecting handshake_failure —
+    so the type has to be able to hold the request in order to refuse it.
+    An enum would have turned those cases into shim declines and quietly
+    lost the coverage they were there to provide.
+
+    The in-tree oracle uses the RSA fixture, because a modulus signing
+    under all three PSS digests is the only leaf here with a choice to
+    steer: the list names sha512 first, which is *not* the signer's own
+    order, so a preference that was being ignored could not pass. The
+    second half pins an ECDSA scheme on an RSA key and asserts the
+    handshake fails, which is the misconfiguration the field documents.
+
+    Twenty-one cases stay declined and every one is pre-1.3. Twenty say
+    so in their names; `FilterExtraAlgorithms` does not, and is
+    `MaxVersion: VersionTLS12` in `signature_algorithm_tests.go`. That is
+    the exact shape finding 17 was caught by — a case whose name carries
+    no version, passing or failing for a reason that has nothing to do
+    with what it is named for. Its ledger entry says so, so the next
+    sweep does not have to rediscover it.
 
 ## Running it
 

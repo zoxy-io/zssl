@@ -342,6 +342,7 @@ test "§4.4.1: the server verifies a binder on a retry ClientHello" {
         .session_id = &.{},
         .share_group = unusable_group,
         .share_public = &(.{0xab} ** 32),
+        .signature_schemes = &client_messages.signature_schemes_default,
         .groups = &.{client_hello.group_secp256r1},
         .psk = .{ .identity = "ticket", .obfuscated_age = 0, .binder_bytes = 32 },
     });
@@ -389,6 +390,7 @@ test "§4.4.1: the server verifies a binder on a retry ClientHello" {
             .share_group = client_hello.group_secp256r1,
             .share_public = share,
             .groups = &.{client_hello.group_secp256r1},
+            .signature_schemes = &client_messages.signature_schemes_default,
             .psk = if (shape == .omitted)
                 null
             else

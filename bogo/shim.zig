@@ -153,11 +153,27 @@ const Connection = struct {
     expect_alpn: ?[]const u8 = null,
     host_name: ?[]const u8 = null,
 
-    /// The groups `-curves` named, in order. Whether they can be
-    /// honoured is a question for the role: our server completes any of
-    /// the three it holds, while our client offers x25519 alone.
+    /// The groups `-curves` named, in preference order. Both roles take
+    /// a configured list now, so this is honoured rather than merely
+    /// checked — see `configuredGroups`.
     curves: [4]u16 = undefined,
     curve_count: u8 = 0,
+
+    /// The schemes `-verify-prefs` named, in preference order, as wire
+    /// code points — converted at run time, because a scheme we cannot
+    /// verify is a decline rather than a parse error.
+    verify_prefs: [8]u16 = undefined,
+    verify_pref_count: u8 = 0,
+    /// `-expect-peer-signature-algorithm`: the scheme the peer must have
+    /// signed its CertificateVerify with.
+    expect_peer_signature_algorithm: ?u16 = null,
+    /// The schemes `-signing-prefs` named, in preference order, as wire
+    /// code points. Passed through whole: `Config.signing_schemes` takes
+    /// wire values precisely so a case naming a scheme our key cannot
+    /// produce runs and earns the handshake_failure it expects, instead
+    /// of being declined for a type that could not hold it.
+    signing_prefs: [16]u16 = undefined,
+    signing_pref_count: u8 = 0,
 
     expect_version: ?u16 = null,
     expect_curve_id: ?u16 = null,
@@ -272,12 +288,13 @@ const Arity = enum { none, one };
 /// flag as unimplemented rather than guess at its meaning.
 fn flagArity(name: []const u8) ?Arity {
     const with_value = [_][]const u8{
-        "-port",        "-shim-id",                  "-resume-count",
-        "-cert-file",   "-key-file",                 "-trust-cert",
-        "-max-version", "-min-version",              "-expect-version",
-        "-curves",      "-advertise-alpn",           "-select-alpn",
-        "-expect-alpn", "-host-name",                "-expect-curve-id",
-        "-read-size",   "-expect-early-data-reason",
+        "-port",                            "-shim-id",                  "-resume-count",
+        "-cert-file",                       "-key-file",                 "-trust-cert",
+        "-max-version",                     "-min-version",              "-expect-version",
+        "-curves",                          "-advertise-alpn",           "-select-alpn",
+        "-expect-alpn",                     "-host-name",                "-expect-curve-id",
+        "-read-size",                       "-expect-early-data-reason", "-verify-prefs",
+        "-expect-peer-signature-algorithm", "-signing-prefs",
     };
     const without_value = [_][]const u8{
         "-ipv6",                     "-server",             "-shim-writes-first",
@@ -317,6 +334,21 @@ fn applyFlag(connection: *Connection, name: []const u8, value: ?[]const u8) Pars
         if (connection.curve_count == connection.curves.len) return unimplemented(name);
         connection.curves[connection.curve_count] = group;
         connection.curve_count += 1;
+    } else if (std.mem.eql(u8, name, "-verify-prefs")) {
+        // Repeatable, like `-curves`, and recorded rather than acted on:
+        // whether a scheme is one we verify is a question for the role.
+        const scheme = std.fmt.parseInt(u16, value.?, 10) catch return error.BadFlagValue;
+        if (connection.verify_pref_count == connection.verify_prefs.len) return unimplemented(name);
+        connection.verify_prefs[connection.verify_pref_count] = scheme;
+        connection.verify_pref_count += 1;
+    } else if (std.mem.eql(u8, name, "-signing-prefs")) {
+        const scheme = std.fmt.parseInt(u16, value.?, 10) catch return error.BadFlagValue;
+        if (connection.signing_pref_count == connection.signing_prefs.len) return unimplemented(name);
+        connection.signing_prefs[connection.signing_pref_count] = scheme;
+        connection.signing_pref_count += 1;
+    } else if (std.mem.eql(u8, name, "-expect-peer-signature-algorithm")) {
+        connection.expect_peer_signature_algorithm =
+            std.fmt.parseInt(u16, value.?, 10) catch return error.BadFlagValue;
     } else if (std.mem.eql(u8, name, "-expect-curve-id")) {
         connection.expect_curve_id = std.fmt.parseInt(u16, value.?, 10) catch return error.BadFlagValue;
     } else if (std.mem.eql(u8, name, "-advertise-alpn")) {
@@ -409,6 +441,13 @@ const TicketStore = struct {
     /// The suite the ticket was issued under. §4.2.10 wants the resumed
     /// connection to negotiate the same one before early data is read.
     suite: cipher_suite.CipherSuite = .aes_128_gcm_sha256,
+    /// The scheme the peer signed with when this session was first
+    /// established. A resumed TLS 1.3 handshake carries no
+    /// CertificateVerify, so the library reports null for it — the
+    /// scheme is a property of the *session*, and remembering it is the
+    /// embedder's job exactly as remembering the ticket is. BoGo asserts
+    /// it on both exchanges precisely to catch a shim that drops it.
+    peer_signature_scheme: ?zssl.backend.SignatureScheme = null,
     /// Tickets seen on the exchange in progress, which is what
     /// `-expect-no-session` asks about — not what an earlier one left.
     tickets_this_exchange: u32 = 0,
@@ -537,12 +576,19 @@ fn runServer(
     store: *TicketStore,
     pump: *Pump,
 ) !void {
-    // Our server completes every group it holds and cannot be told to
-    // accept a narrower set, so a case naming only groups we hold runs
-    // as asked; one naming any other is asking for a refusal we cannot
-    // configure.
-    for (connection.curves[0..connection.curve_count]) |group| {
-        if (zssl.client_hello.groupShareBytes(group) == null) return unimplemented("-curves");
+    // `-curves` on a server run is the set it will accept, which
+    // `Config.groups` is exactly. Until this was wired the flag was
+    // recorded and thrown away: the server accepted every group it holds
+    // whatever the case named, so a case narrowing it to P-256 was run
+    // against a server that would still have taken x25519.
+    const groups = configuredGroups(connection) orelse return unimplemented("-curves");
+    // On a server run both of these are about the *client's*
+    // CertificateVerify, which needs a CertificateRequest we never send
+    // (DESIGN.md §1). Declined by name so the case says which flag it
+    // stumbled on rather than failing for a reason no one can read.
+    if (connection.verify_pref_count >= 1) return unimplemented("-verify-prefs");
+    if (connection.expect_peer_signature_algorithm != null) {
+        return unimplemented("-expect-peer-signature-algorithm");
     }
     const cert_path = connection.cert_path orelse return unimplemented("-cert-file");
     const key_path = connection.key_path orelse return unimplemented("-key-file");
@@ -567,11 +613,17 @@ fn runServer(
     var strike_entries: [anti_replay.StrikeRegister.probe_max]anti_replay.StrikeRegister.Entry =
         @splat(.free);
     var strike_register: anti_replay.StrikeRegister = .{ .entries = &strike_entries };
+    const signing_schemes: ?[]const u16 = if (connection.signing_pref_count == 0)
+        null
+    else
+        connection.signing_prefs[0..connection.signing_pref_count];
     var server = ServerHandshake.init(&.{
         .credentials = &credentials,
         .server_random = entropy[0..32].*,
         .key_share_private = entropy[32..80].*,
         .alpn = connection.select_alpn,
+        .groups = groups,
+        .signing_schemes = signing_schemes,
         .reassembly = &handshake_reassembly,
         .flight = &flight_storage,
         // A real clock, which an embedder may read and `src/` may not
@@ -596,7 +648,7 @@ fn runServer(
     // the same store the next issuance overwrites.
     const offered = !connection.no_ticket and connection.index >= 1 and store.psk_bytes >= 1;
     pump.handshakeServer(&server) catch |err| return pump.abort(&server, err);
-    try checkNegotiated(connection, server.resumed, offered, null);
+    try checkNegotiated(connection, server.resumed, offered, null, server.key_share_group, null);
     // Checked, not reported. BoGo asks whether early data was accepted,
     // and a shim that answered "yes" without the library having accepted
     // any would pass the case while proving nothing. It is a coarse
@@ -640,12 +692,21 @@ fn runClient(
     store: *TicketStore,
     pump: *Pump,
 ) !void {
-    // `ClientHandshake` offers x25519 and holds one scalar, so a case
-    // naming any other group would be run against a ClientHello it did
-    // not ask for. Declined until the client can choose its group.
-    for (connection.curves[0..connection.curve_count]) |group| {
-        if (group != group_x25519) return unimplemented("-curves");
-    }
+    // `-curves` on a client run is what to advertise, and
+    // `Config.groups` takes it. The one set we cannot honour is one
+    // without x25519: this client always shares x25519, and §4.2.8 wants
+    // every key_share entry to appear in supported_groups, so advertising
+    // a list that excludes it would put an illegal hello on the wire.
+    const groups = configuredGroups(connection) orelse return unimplemented("-curves");
+    for (groups) |group| {
+        if (group == group_x25519) break;
+    } else return unimplemented("-curves:no-x25519");
+    // On a client run this configures the *client's* certificate, which
+    // needs a CertificateRequest we never answer (DESIGN.md §1).
+    if (connection.signing_pref_count >= 1) return unimplemented("-signing-prefs");
+    var verify_storage: [verify_schemes_max]zssl.backend.SignatureScheme = undefined;
+    const verify_schemes = configuredVerifySchemes(connection, &verify_storage) orelse
+        return unimplemented("-verify-prefs");
     var protocols: [alpn_protocols_max][]const u8 = undefined;
     const offered = try splitAlpn(connection.advertise_alpn, &protocols);
 
@@ -673,6 +734,8 @@ fn runClient(
         .retry_key_share_private = entropy[96..144].*,
         .session_id = entropy[64..96],
         .server_name = connection.host_name,
+        .groups = groups,
+        .verify_schemes = verify_schemes,
         .alpn_protocols = offered,
         // Possession, not identity: the leaf's own key must have signed
         // the CertificateVerify. Chain building and RFC 9525 names stay
@@ -686,12 +749,59 @@ fn runClient(
 
     try pump.write(client.start(&pump.out));
     pump.handshakeClient(&client) catch |err| return pump.abort(&client, err);
-    try checkNegotiated(connection, client.resumed, resumption != null, client.alpnSelected());
+    // This handshake's scheme when there was a CertificateVerify to
+    // read, the session's when there was not. See `peer_signature_scheme`
+    // on the store for why the second half is the embedder's to keep.
+    if (client.peer_signature_scheme) |scheme| store.peer_signature_scheme = scheme;
+    try checkNegotiated(
+        connection,
+        client.resumed,
+        resumption != null,
+        client.alpnSelected(),
+        zssl.backend.Group.fromWire(client.share_group),
+        store.peer_signature_scheme,
+    );
 
     try pump.exchange(&client, connection, store);
     if (connection.expect_no_session and store.tickets_this_exchange >= 1) {
         return error.UnexpectedTicket;
     }
+}
+
+/// The group list `-curves` asked for, or the library's default when the
+/// case named none. Null means "we cannot be configured that way": a
+/// group neither machine can complete, or more entries than
+/// `groups_supported` holds — both of which `init` asserts against, and
+/// an assert is not how a shim declines a case.
+fn configuredGroups(connection: *const Connection) ?[]const u16 {
+    if (connection.curve_count == 0) return &zssl.client_hello.groups_supported;
+    if (connection.curve_count > zssl.client_hello.groups_supported.len) return null;
+    const named = connection.curves[0..connection.curve_count];
+    for (named) |group| {
+        if (zssl.client_hello.groupShareBytes(group) == null) return null;
+    }
+    return named;
+}
+
+/// The most schemes `-verify-prefs` can name before we stop honouring
+/// it. Five is every code point `SignatureScheme` has; a case naming
+/// more is naming one we do not verify, and is declined for that.
+const verify_schemes_max = @typeInfo(zssl.backend.SignatureScheme).@"enum".fields.len;
+
+/// The accept-set `-verify-prefs` asked for, written into `out`, or the
+/// library's default when the case named none. Null is a decline: a
+/// scheme outside the five we verify cannot be configured, and the case
+/// that named it is asking about an algorithm we do not hold.
+fn configuredVerifySchemes(
+    connection: *const Connection,
+    out: *[verify_schemes_max]zssl.backend.SignatureScheme,
+) ?[]const zssl.backend.SignatureScheme {
+    if (connection.verify_pref_count == 0) return &zssl.client_messages.signature_schemes_default;
+    if (connection.verify_pref_count > out.len) return null;
+    for (connection.verify_prefs[0..connection.verify_pref_count], 0..) |wire, i| {
+        out[i] = zssl.backend.SignatureScheme.fromWire(wire) orelse return null;
+    }
+    return out[0..connection.verify_pref_count];
 }
 
 /// The `-expect-*` assertions both roles share. A mismatch is the shim's
@@ -703,12 +813,24 @@ fn checkNegotiated(
     resumed: bool,
     offered: bool,
     alpn: ?[]const u8,
+    group: ?zssl.backend.Group,
+    peer_scheme: ?zssl.backend.SignatureScheme,
 ) !void {
     if (connection.expect_version) |version| {
         if (version != version_tls13) return error.UnexpectedVersion;
     }
-    if (connection.expect_curve_id) |group| {
-        if (zssl.client_hello.groupShareBytes(group) == null) return error.UnexpectedCurve;
+    if (connection.expect_peer_signature_algorithm) |wanted| {
+        const expected = zssl.backend.SignatureScheme.fromWire(wanted) orelse
+            return error.UnexpectedSignatureAlgorithm;
+        if (peer_scheme != expected) return error.UnexpectedSignatureAlgorithm;
+    }
+    if (connection.expect_curve_id) |wanted| {
+        // This asked only whether the named group was one we hold, which
+        // every case naming a group we hold passed whatever the handshake
+        // actually negotiated. Now that `-curves` can narrow the set, the
+        // difference is the whole point of the case.
+        const expected = zssl.backend.Group.fromWire(wanted) orelse return error.UnexpectedCurve;
+        if (group != expected) return error.UnexpectedCurve;
     }
     if (connection.expect_alpn) |expected| {
         const selected = alpn orelse return error.NoAlpnSelected;
@@ -1102,6 +1224,9 @@ fn alertFor(err: anyerror) ?alert.Description {
         error.BadKeyShare,
         error.NonMinimalEncoding,
         error.BinderCountMismatch,
+        // §4.4.3 names this alert explicitly for a CertificateVerify
+        // whose scheme we never offered.
+        error.UnofferedSignatureScheme,
         => .illegal_parameter,
         // A well-formed message larger than the reassembly space the
         // embedder handed us. That is our capacity, not the peer's
