@@ -85,47 +85,24 @@ jobs:
             search.log
           if-no-files-found: ignore
 
-      - name: Report to Discord
+      - name: Report
+        # No webhook of our own. `discord.yml` was dropped for the
+        # GitHub→Discord integration the three repositories share, so a
+        # second, hand-rolled poster here would be the only one left and
+        # would double every message the integration already sends. The
+        # run summary is what this step is for; the integration carries
+        # the notification.
         if: always()
         env:
-          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           OUTCOME: ${{ steps.search.outcome }}
           INPUTS: ${{ steps.search.outputs.inputs }}
           MINUTES: ${{ inputs.minutes || '20' }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           if [ "$OUTCOME" = success ]; then
-            title="Fuzz search clean"
-            color=3066993
-            detail=$(printf 'Searched %s minutes with every target holding. Corpus: %s inputs.' \
-              "$MINUTES" "${INPUTS:-0}")
+            printf 'Fuzz search clean\n\nSearched %s minutes with every target holding. Corpus: %s inputs.\n' \
+              "$MINUTES" "${INPUTS:-0}" >> "$GITHUB_STEP_SUMMARY"
           else
-            title="Fuzz search FOUND SOMETHING"
-            color=15158332
-            detail=$(printf 'A target stopped early. The input that did it is in the `fuzz-corpus` artifact; `zig build test-fuzz` replays it.')
+            printf 'Fuzz search FOUND SOMETHING\n\nA target stopped early. The input that did it is in the `fuzz-corpus` artifact; `zig build test-fuzz` replays it.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
           fi
-          if [ -z "${WEBHOOK:-}" ]; then
-            echo "::warning::DISCORD_WEBHOOK is not set; skipping the report."
-            printf '%s\n\n%s\n' "$title" "$detail" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          jq -n --arg title "$title" --arg detail "$detail" --argjson color "$color" \
-                --arg url "$RUN_URL" --arg sha "${SHA:0:7}" --arg inputs "${INPUTS:-0}" \
-            '{
-              username: "zssl fuzz",
-              embeds: [{
-                title: $title,
-                description: $detail,
-                color: $color,
-                url: $url,
-                fields: [
-                  {name: "Corpus", value: $inputs, inline: true},
-                  {name: "Commit", value: $sha, inline: true}
-                ]
-              }]
-            }' > payload.json
-          curl -sS -f -X POST -H "Content-Type: application/json" \
-            -d @payload.json "$WEBHOOK" > /dev/null
-          printf '%s\n\n%s\n' "$title" "$detail" >> "$GITHUB_STEP_SUMMARY"

@@ -28,6 +28,9 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{ .root_module = zssl_module });
     const module_tests = b.addRunArtifact(unit_tests);
 
+    const test_step = b.step("test", "Run unit tests (RFC 8448 vectors + differentials)");
+    test_step.dependOn(&module_tests.step);
+
     // One step per oracle that lives in the suite, so each can carry its
     // own CI workflow and its own badge.
     //
@@ -92,158 +95,16 @@ pub fn build(b: *std.Build) void {
         b.step(suite.step, suite.blurb).dependOn(&suite_run.step);
     }
 
-    // A second build of the same tests, for kcov only.
-    //
-    // `use_llvm` is the whole point. Zig's self-hosted x86_64 backend is
-    // the default for Debug on Linux, and kcov cannot map the DWARF it
-    // emits: pointed at a self-hosted binary it reports 888 source files,
-    // every one of them the vendored OpenSSL C compiled through clang,
-    // and not a single `.zig`. That is what produced a 0% badge from a
-    // run where all 83 tests passed under the tool. macOS defaults to
-    // LLVM, which is why the same command measured 97% there and hid the
-    // problem. Asking for LLVM explicitly makes the two agree.
-    const coverage_tests = b.addTest(.{ .root_module = zssl_module, .use_llvm = true });
-    const test_step = b.step("test", "Run unit tests (RFC 8448 vectors + differentials)");
-    test_step.dependOn(&module_tests.step);
+    addCoverageStep(b, zssl_module);
 
-    // Line coverage over the suite, via kcov's DWARF instrumentation —
-    // the same binary `zig build test` runs, under a tool rather than
-    // directly. Scoped to `src/`: libcrypto is vendored C we do not
-    // write, and the test fixtures are data.
-    //
-    // The patterns have no leading slash on purpose. kcov matches them
-    // against the path as DWARF records it, and that is not the same
-    // shape everywhere: macOS carried absolute paths, so `/src/` worked
-    // there, while Linux recorded them relative to the compilation
-    // directory and `/src/` matched *nothing* — a 0% badge from a run
-    // that instrumented zero files. Without the slash both shapes match.
-    const coverage_run = b.addSystemCommand(&.{
-        "kcov",
-        "--clean",
-        "--include-pattern=src/",
-        "--exclude-pattern=src/testdata/,zig-pkg/,.zig-cache/",
-    });
-    // The build system owns the output directory rather than kcov: kcov
-    // creates its target but not the target's parent, and nothing else in
-    // this build has any reason to create `zig-out`, so a first run on a
-    // clean checkout — which is every CI run — died on the missing parent.
-    // `addOutputDirectoryArg` makes the directory, passes it as the
-    // argument, and hands back the path to install from.
-    const coverage_output = coverage_run.addOutputDirectoryArg("coverage");
-    coverage_run.addArtifactArg(coverage_tests);
-    const coverage_install = b.addInstallDirectory(.{
-        .source_dir = coverage_output,
-        .install_dir = .prefix,
-        .install_subdir = "coverage",
-    });
-    const coverage_step = b.step("coverage", "Line coverage of the unit suite (needs kcov)");
-    coverage_step.dependOn(&coverage_install.step);
+    addGateSteps(b, target, optimize, zssl_module);
+}
 
-    // The interop gate: our machines against the real `openssl` binary —
-    // genuine libssl, no shared code. Its own executable rather than a
-    // test, because it spawns processes and binds sockets, and because a
-    // developer without an openssl on PATH should get a SKIP they can
-    // read rather than a red unit suite.
-    const interop_module = b.createModule(.{
-        .root_source_file = b.path("interop/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    interop_module.addImport("zssl", zssl_module);
-    interop_module.addAnonymousImport("cert_pem", .{ .root_source_file = b.path("src/testdata/cert.pem") });
-    interop_module.addAnonymousImport("key_pem", .{ .root_source_file = b.path("src/testdata/key.pem") });
-    interop_module.addAnonymousImport("p384_cert_pem", .{ .root_source_file = b.path("src/testdata/p384-cert.pem") });
-    interop_module.addAnonymousImport("p384_key_pem", .{ .root_source_file = b.path("src/testdata/p384-key.pem") });
-    const interop_exe = b.addExecutable(.{ .name = "zssl-interop", .root_module = interop_module });
-    const interop_run = b.addRunArtifact(interop_exe);
-    interop_run.has_side_effects = true;
-    const interop_step = b.step("interop", "Interop gate: openssl s_client/s_server against zssl");
-    interop_step.dependOn(&interop_run.step);
-
-    // The adversarial gate: BoringSSL's BoGo runner plays a hostile peer
-    // and asks what we *refuse*. `bogo/shim.zig` is the binary it drives;
-    // `bogo/run.zig` fetches the pinned runner, invokes it, and holds the
-    // result against the floor recorded in bogo/config.json. Like the
-    // interop gate it is an executable rather than a test: it clones,
-    // spawns `go`, and binds sockets, and a machine without Go should get
-    // a SKIP it can read rather than a red suite.
-    const shim_module = b.createModule(.{
-        .root_source_file = b.path("bogo/shim.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    shim_module.addImport("zssl", zssl_module);
-    const shim_exe = b.addExecutable(.{ .name = "zssl-bogo-shim", .root_module = shim_module });
-
-    const bogo_module = b.createModule(.{
-        .root_source_file = b.path("bogo/run.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const bogo_exe = b.addExecutable(.{ .name = "zssl-bogo", .root_module = bogo_module });
-    const bogo_run = b.addRunArtifact(bogo_exe);
-    bogo_run.has_side_effects = true;
-    bogo_run.addArg("--shim");
-    bogo_run.addArtifactArg(shim_exe);
-    bogo_run.addArg("--config");
-    bogo_run.addFileArg(b.path("bogo/config.json"));
-    if (b.args) |forwarded| bogo_run.addArgs(forwarded);
-    const bogo_step = b.step("bogo", "Adversarial gate: BoringSSL's BoGo runner against zssl");
-    bogo_step.dependOn(&bogo_run.step);
-
-    // The second adversarial gate: tlsfuzzer, a TLS client in Python over
-    // tlslite-ng. It drives our *server* through hundreds of
-    // conversations per script, which is the half BoGo reaches least.
-    const tlsfuzzer_server_module = b.createModule(.{
-        .root_source_file = b.path("tlsfuzzer/server.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    tlsfuzzer_server_module.addImport("zssl", zssl_module);
-    const tlsfuzzer_server = b.addExecutable(.{
-        .name = "zssl-tlsfuzzer-server",
-        .root_module = tlsfuzzer_server_module,
-    });
-    const tlsfuzzer_module = b.createModule(.{
-        .root_source_file = b.path("tlsfuzzer/run.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const tlsfuzzer_exe = b.addExecutable(.{
-        .name = "zssl-tlsfuzzer",
-        .root_module = tlsfuzzer_module,
-    });
-    const tlsfuzzer_run = b.addRunArtifact(tlsfuzzer_exe);
-    tlsfuzzer_run.has_side_effects = true;
-    tlsfuzzer_run.addArg("--server");
-    tlsfuzzer_run.addArtifactArg(tlsfuzzer_server);
-    tlsfuzzer_run.addArg("--config");
-    tlsfuzzer_run.addFileArg(b.path("tlsfuzzer/scripts.json"));
-    const tlsfuzzer_step = b.step("tlsfuzzer", "Adversarial gate: tlsfuzzer's scripts against our server");
-    tlsfuzzer_step.dependOn(&tlsfuzzer_run.step);
-
-    // The third adversarial gate: TLS-Anvil's RFC-derived corpus, in a
-    // container, against the same server harness tlsfuzzer drives. It
-    // reuses that harness rather than growing a third one — see
-    // tlsanvil/run.zig.
-    const tlsanvil_module = b.createModule(.{
-        .root_source_file = b.path("tlsanvil/run.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const tlsanvil_exe = b.addExecutable(.{
-        .name = "zssl-tlsanvil",
-        .root_module = tlsanvil_module,
-    });
-    const tlsanvil_run = b.addRunArtifact(tlsanvil_exe);
-    tlsanvil_run.has_side_effects = true;
-    tlsanvil_run.addArg("--server");
-    tlsanvil_run.addArtifactArg(tlsfuzzer_server);
-    tlsanvil_run.addArg("--config");
-    tlsanvil_run.addFileArg(b.path("tlsanvil/tests.json"));
-    const tlsanvil_step = b.step("tlsanvil", "Adversarial gate: TLS-Anvil's RFC corpus against our server");
-    tlsanvil_step.dependOn(&tlsanvil_run.step);
-
+/// The rustls comparison harness. Its own function because `build` was
+/// 197 code lines against TIGER_STYLE's 70-line hard limit, and this is
+/// the largest block in it that is not a gate — it asserts nothing, and
+/// nothing else in the graph depends on it.
+fn addBenchStep(b: *std.Build, target: std.Build.ResolvedTarget) void {
     // The rustls comparison harness. Not a gate: it asserts nothing and
     // gates nothing, it only reports numbers.
     //
@@ -301,6 +162,192 @@ pub fn build(b: *std.Build) void {
     if (b.args) |forwarded| bench_run.addArgs(forwarded);
     const bench_step = b.step("bench", "Throughput harness for the rustls comparison (JSON lines)");
     bench_step.dependOn(&bench_run.step);
+}
+
+/// Line coverage, over a second build of the same suite. Its own
+/// function for the reason `addBenchStep` is: `build` was over
+/// TIGER_STYLE's 70-line limit and this block answers to kcov rather
+/// than to any gate.
+fn addCoverageStep(b: *std.Build, zssl_module: *std.Build.Module) void {
+    // A second build of the same tests, for kcov only.
+    //
+    // `use_llvm` is the whole point. Zig's self-hosted x86_64 backend is
+    // the default for Debug on Linux, and kcov cannot map the DWARF it
+    // emits: pointed at a self-hosted binary it reports 888 source files,
+    // every one of them the vendored OpenSSL C compiled through clang,
+    // and not a single `.zig`. That is what produced a 0% badge from a
+    // run where all 83 tests passed under the tool. macOS defaults to
+    // LLVM, which is why the same command measured 97% there and hid the
+    // problem. Asking for LLVM explicitly makes the two agree.
+    const coverage_tests = b.addTest(.{ .root_module = zssl_module, .use_llvm = true });
+
+    // Line coverage over the suite, via kcov's DWARF instrumentation —
+    // the same binary `zig build test` runs, under a tool rather than
+    // directly. Scoped to `src/`: libcrypto is vendored C we do not
+    // write, and the test fixtures are data.
+    //
+    // The patterns have no leading slash on purpose. kcov matches them
+    // against the path as DWARF records it, and that is not the same
+    // shape everywhere: macOS carried absolute paths, so `/src/` worked
+    // there, while Linux recorded them relative to the compilation
+    // directory and `/src/` matched *nothing* — a 0% badge from a run
+    // that instrumented zero files. Without the slash both shapes match.
+    const coverage_run = b.addSystemCommand(&.{
+        "kcov",
+        "--clean",
+        "--include-pattern=src/",
+        "--exclude-pattern=src/testdata/,zig-pkg/,.zig-cache/",
+    });
+    // The build system owns the output directory rather than kcov: kcov
+    // creates its target but not the target's parent, and nothing else in
+    // this build has any reason to create `zig-out`, so a first run on a
+    // clean checkout — which is every CI run — died on the missing parent.
+    // `addOutputDirectoryArg` makes the directory, passes it as the
+    // argument, and hands back the path to install from.
+    const coverage_output = coverage_run.addOutputDirectoryArg("coverage");
+    coverage_run.addArtifactArg(coverage_tests);
+    const coverage_install = b.addInstallDirectory(.{
+        .source_dir = coverage_output,
+        .install_dir = .prefix,
+        .install_subdir = "coverage",
+    });
+    const coverage_step = b.step("coverage", "Line coverage of the unit suite (needs kcov)");
+    coverage_step.dependOn(&coverage_install.step);
+}
+
+/// The four external gates: `openssl` over real sockets, BoringSSL's
+/// BoGo runner, tlsfuzzer's Python client, and TLS-Anvil's corpus —
+/// plus the standalone server the last two drive.
+///
+/// One function because `build` was 197 code lines against
+/// TIGER_STYLE's 70-line hard limit, and these four share a shape: each
+/// spawns an external tool, each has side effects, and none of them is
+/// reachable from `zig build` with no arguments.
+fn addGateSteps(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    zssl_module: *std.Build.Module,
+) void {
+    // The interop gate: our machines against the real `openssl` binary —
+    // genuine libssl, no shared code. Its own executable rather than a
+    // test, because it spawns processes and binds sockets, and because a
+    // developer without an openssl on PATH should get a SKIP they can
+    // read rather than a red unit suite.
+    const interop_module = b.createModule(.{
+        .root_source_file = b.path("interop/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    interop_module.addImport("zssl", zssl_module);
+    interop_module.addAnonymousImport("cert_pem", .{ .root_source_file = b.path("src/testdata/cert.pem") });
+    interop_module.addAnonymousImport("key_pem", .{ .root_source_file = b.path("src/testdata/key.pem") });
+    interop_module.addAnonymousImport("p384_cert_pem", .{ .root_source_file = b.path("src/testdata/p384-cert.pem") });
+    interop_module.addAnonymousImport("p384_key_pem", .{ .root_source_file = b.path("src/testdata/p384-key.pem") });
+    const interop_exe = b.addExecutable(.{ .name = "zssl-interop", .root_module = interop_module });
+    const interop_run = b.addRunArtifact(interop_exe);
+    interop_run.has_side_effects = true;
+    const interop_step = b.step("interop", "Interop gate: openssl s_client/s_server against zssl");
+    interop_step.dependOn(&interop_run.step);
+
+    // The adversarial gate: BoringSSL's BoGo runner plays a hostile peer
+    // and asks what we *refuse*. `bogo/shim.zig` is the binary it drives;
+    // `bogo/run.zig` fetches the pinned runner, invokes it, and holds the
+    // result against the floor recorded in bogo/config.json. Like the
+    // interop gate it is an executable rather than a test: it clones,
+    // spawns `go`, and binds sockets, and a machine without Go should get
+    // a SKIP it can read rather than a red suite.
+    const shim_module = b.createModule(.{
+        .root_source_file = b.path("bogo/shim.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    shim_module.addImport("zssl", zssl_module);
+    const shim_exe = b.addExecutable(.{ .name = "zssl-bogo-shim", .root_module = shim_module });
+
+    const bogo_module = b.createModule(.{
+        .root_source_file = b.path("bogo/run.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bogo_exe = b.addExecutable(.{ .name = "zssl-bogo", .root_module = bogo_module });
+    const bogo_run = b.addRunArtifact(bogo_exe);
+    bogo_run.has_side_effects = true;
+    bogo_run.addArg("--shim");
+    bogo_run.addArtifactArg(shim_exe);
+    bogo_run.addArg("--config");
+    bogo_run.addFileArg(b.path("bogo/config.json"));
+    if (b.args) |forwarded| bogo_run.addArgs(forwarded);
+    const bogo_step = b.step("bogo", "Adversarial gate: BoringSSL's BoGo runner against zssl");
+    bogo_step.dependOn(&bogo_run.step);
+
+    addPythonGateSteps(b, target, optimize, zssl_module);
+}
+
+/// tlsfuzzer and TLS-Anvil, plus the standalone server both drive. Split
+/// from `addGateSteps` because that was 97 code lines against
+/// TIGER_STYLE's 70-line hard limit; the seam is the one the gates
+/// already have — these two share a harness, the other two do not.
+fn addPythonGateSteps(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    zssl_module: *std.Build.Module,
+) void {
+    // The second adversarial gate: tlsfuzzer, a TLS client in Python over
+    // tlslite-ng. It drives our *server* through hundreds of
+    // conversations per script, which is the half BoGo reaches least.
+    const tlsfuzzer_server_module = b.createModule(.{
+        .root_source_file = b.path("tlsfuzzer/server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tlsfuzzer_server_module.addImport("zssl", zssl_module);
+    const tlsfuzzer_server = b.addExecutable(.{
+        .name = "zssl-tlsfuzzer-server",
+        .root_module = tlsfuzzer_server_module,
+    });
+    const tlsfuzzer_module = b.createModule(.{
+        .root_source_file = b.path("tlsfuzzer/run.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const tlsfuzzer_exe = b.addExecutable(.{
+        .name = "zssl-tlsfuzzer",
+        .root_module = tlsfuzzer_module,
+    });
+    const tlsfuzzer_run = b.addRunArtifact(tlsfuzzer_exe);
+    tlsfuzzer_run.has_side_effects = true;
+    tlsfuzzer_run.addArg("--server");
+    tlsfuzzer_run.addArtifactArg(tlsfuzzer_server);
+    tlsfuzzer_run.addArg("--config");
+    tlsfuzzer_run.addFileArg(b.path("tlsfuzzer/scripts.json"));
+    const tlsfuzzer_step = b.step("tlsfuzzer", "Adversarial gate: tlsfuzzer's scripts against our server");
+    tlsfuzzer_step.dependOn(&tlsfuzzer_run.step);
+
+    // The third adversarial gate: TLS-Anvil's RFC-derived corpus, in a
+    // container, against the same server harness tlsfuzzer drives. It
+    // reuses that harness rather than growing a third one — see
+    // tlsanvil/run.zig.
+    const tlsanvil_module = b.createModule(.{
+        .root_source_file = b.path("tlsanvil/run.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const tlsanvil_exe = b.addExecutable(.{
+        .name = "zssl-tlsanvil",
+        .root_module = tlsanvil_module,
+    });
+    const tlsanvil_run = b.addRunArtifact(tlsanvil_exe);
+    tlsanvil_run.has_side_effects = true;
+    tlsanvil_run.addArg("--server");
+    tlsanvil_run.addArtifactArg(tlsfuzzer_server);
+    tlsanvil_run.addArg("--config");
+    tlsanvil_run.addFileArg(b.path("tlsanvil/tests.json"));
+    const tlsanvil_step = b.step("tlsanvil", "Adversarial gate: TLS-Anvil's RFC corpus against our server");
+    tlsanvil_step.dependOn(&tlsanvil_run.step);
+
+    addBenchStep(b, target);
 
     const tlsfuzzer_server_step = b.step(
         "tlsfuzzer-server",

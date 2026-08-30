@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 424 passed, 0 failed, 6596 declined by the shim (89), floor 424
+bogo: 445 passed, 0 failed, 6541 declined by the shim (89), floor 445
 bogo: PASS
 ```
 
@@ -41,9 +41,10 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**424 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. It was 401
-until client certificates landed (finding 23), 367 until §7.5's exporter
+**445 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. It was 424
+until a review found the server role still declining two flags it could
+answer (finding 24), 401 until client certificates landed (finding 23), 367 until §7.5's exporter
 did (finding 21), 348 until the server's
 signing preference could be narrowed (finding 20),
 324 until the client could report and restrict its signature algorithms
@@ -81,7 +82,7 @@ extension block, and 143 until §4.6.3's update requests were coalesced, and
 either gets fixed or gets an entry in `DisabledTests` with a one-line
 reason. There are no silent skips.
 
-**6596 declined** — 84% of the corpus. The shim exited 89, PORTING.md's
+**6541 declined** — 83% of the corpus. The shim exited 89, PORTING.md's
 "unimplemented", and the runner counted the case without running it.
 That number is large enough to be the first thing anyone asks about, so
 here is what it is made of. Counting each case by the *first* thing the
@@ -1145,6 +1146,46 @@ laxity, and laxity is what BoGo exists to find.
     trailing `-TLS` is the *protocol* and not the version. Each was
     checked against its generator rather than assumed, which is finding
     17's lesson applied a third time.
+
+24. **A decline that outlived its reason, found by review rather than by
+    the corpus.** Twenty-one more cases, 424 to 445, and not one line of
+    library code changed to get them.
+
+    `runServer` declined `-verify-prefs` and
+    `-expect-peer-signature-algorithm` on the grounds that both concern a
+    client's CertificateVerify, "which needs a CertificateRequest we
+    never send". That was true when it was written and false thirty-nine
+    lines later in the same function, where `client_auth` sends exactly
+    that — added in the same session, by the same hand, without the
+    decline being revisited.
+
+    This is finding 18's `-curves` lesson repeating with the roles
+    swapped, and it is worth being precise about why it is dangerous. A
+    decline does not fail. The case exits 89, lands in the declined
+    bucket, and never reaches `bogo/config.json` — so the ledger, which
+    is the thing that is supposed to make every exclusion visible and
+    argued, never sees it. Twenty-one cases of mutual-authentication
+    coverage were absorbed silently, and the passing count went on
+    looking healthy.
+
+    The fix is entirely in the shim: thread `configuredVerifySchemes`
+    into `client_auth.verify_schemes`, and pass `server.peer.scheme` to
+    `checkNegotiated` instead of the `null` that had been standing in for
+    it. That `null` was the same shape as the `-expect-curve-id` bug
+    finding 18 fixed — a parameter always plausible and never wired to
+    reality.
+
+    Resumption needed the same treatment the client half already had:
+    §4.3.2 forbids the request under a PSK, so a resumed handshake
+    verifies nothing and the library reports null, while BoGo asks on
+    both exchanges. The shim remembers the session's scheme, because the
+    scheme is a property of the session and sessions are the embedder's.
+
+    Five cases stay declined, marked KEEP, and they are the exact mirror
+    of finding 19's five: `Server-VerifyDefault-` over Ed25519, P-521 and
+    the three ML-DSA sizes pair an unsupported key type with an
+    unsupported scheme, and we notice the key first. Twenty-nine more are
+    pre-1.3.
 
 ## Running it
 

@@ -152,7 +152,32 @@ pub fn main(init: std.process.Init) !u8 {
     }
     var served: u64 = 0;
     while (true) : (served += 1) {
-        const stream = listener.accept(io) catch continue;
+        // Named members, not the whole set. TIGER_STYLE calls this out by
+        // incident: a `while (true) … catch continue` met a persistently
+        // full heap and spun at 100% CPU forever, because the error that
+        // would have shed load never came back. A connection that fails
+        // to arrive is retryable; a listener that cannot accept at all is
+        // not, and has to propagate on the first occurrence.
+        const stream = listener.accept(io) catch |err| switch (err) {
+            // Retryable, and all four are about *this* connection: the
+            // peer went away before the accept completed, a firewall
+            // refused it, its protocol handshake failed, or there was
+            // nothing pending. The next script's connection is
+            // unaffected, so continuing is right.
+            error.ConnectionAborted,
+            error.BlockedByFirewall,
+            error.ProtocolFailure,
+            error.WouldBlock,
+            => continue,
+            // Everything else is terminal and must propagate on the
+            // first occurrence. `ProcessFdQuotaExceeded` and
+            // `SystemFdQuotaExceeded` are precisely the condition
+            // TIGER_STYLE's #222 describes: retrying a persistently
+            // exhausted resource changes nothing and burns the CPU the
+            // process needs to recover. `Canceled` is the watchdog
+            // asking us to stop, which a `continue` would ignore.
+            else => return err,
+        };
         // A deadline, because this listener is sequential and a client
         // that stops talking without closing would otherwise hold the
         // accept loop forever — starving every later script rather than

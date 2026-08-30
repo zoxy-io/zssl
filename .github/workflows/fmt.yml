@@ -12,6 +12,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: every gate only reads the tree. Declared rather
+# than inherited, so a change to the repository default cannot widen
+# it silently.
+permissions:
+  contents: read
+
 jobs:
   fmt:
     runs-on: ubuntu-latest

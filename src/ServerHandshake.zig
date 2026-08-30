@@ -530,6 +530,14 @@ pub fn init(config: *const Config) ServerHandshake {
     // cannot produce is the misconfiguration described on the field, and
     // it is answered on the wire rather than asserted away.
     if (config.signing_schemes) |schemes| assert(schemes.len >= 1);
+    // Told at `init`, where the embedder can see which value was wrong,
+    // rather than inside `certificateRequest`'s encoder three flights
+    // later. `signing_schemes` above needs no upper bound because
+    // nothing is written from it; this one goes on the wire.
+    if (config.client_auth) |auth| {
+        assert(auth.verify_schemes.len >= 1);
+        assert(auth.verify_schemes.len <= server_messages.certificate_request_schemes_max);
+    }
     for (config.groups) |group| assert(client_hello.groupShareBytes(group) != null);
     return .{
         .state = .awaiting_client_hello,
@@ -563,6 +571,9 @@ pub fn deinit(self: *ServerHandshake) void {
     if (self.ladder) |*ladder| switch (ladder.*) {
         inline else => |*arm| arm.deinit(),
     };
+    // See `ClientHandshake.deinit`: `Config` is held by value, so the
+    // (EC)DHE scalar outlives every derived secret we do wipe.
+    std.crypto.secureZero(u8, &self.config.key_share_private);
     self.* = undefined;
 }
 
@@ -2047,6 +2058,7 @@ fn LadderOf(comptime suite: CipherSuite) type {
             if (self.send) |*protector| protector.deinit();
             if (self.session) |*session| session.deinit();
             if (self.schedule) |*schedule| schedule.wipe();
+            std.crypto.secureZero(u8, &self.finished_hash);
             std.crypto.secureZero(u8, &self.client_finished_hash);
             std.crypto.secureZero(u8, &self.client_handshake_traffic);
             std.crypto.secureZero(u8, &self.server_handshake_traffic);

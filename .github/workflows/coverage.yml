@@ -18,6 +18,12 @@ env:
   # the same tool rather than whatever an archive happens to carry.
   KCOV_VERSION: v43
 
+# Least privilege: every gate only reads the tree. Declared rather
+# than inherited, so a change to the repository default cannot widen
+# it silently.
+permissions:
+  contents: read
+
 jobs:
   coverage:
     # kcov is built from a pinned tag rather than installed from apt,
