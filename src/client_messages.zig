@@ -9,6 +9,10 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+/// §4.2.10, empty here and a `uint32` in a NewSessionTicket — one code
+/// point, two shapes, decided by the message carrying it.
+const extension_early_data: u16 = 42;
+
 const cipher_suite = @import("cipher_suite.zig");
 const client_hello = @import("client_hello.zig");
 const handshake = @import("handshake.zig");
@@ -32,6 +36,11 @@ pub const PskParams = struct {
     obfuscated_age: u32,
     /// One hash length — decides the binder placeholder's size.
     binder_bytes: u8,
+    /// §4.2.10: offer 0-RTT against this identity. Empty on the wire —
+    /// the offer *is* the extension's presence — and legal only beside a
+    /// `pre_shared_key`, which is why it lives here rather than beside
+    /// `alpn_protocols`.
+    early_data: bool = false,
 };
 
 pub const HelloParams = struct {
@@ -176,7 +185,15 @@ fn helloExtensions(builder: *wire.Builder, params: *const HelloParams) void {
     builder.putByte(1);
     builder.putByte(0x01);
     builder.patchU16(modes);
-    if (params.psk) |psk| helloPreSharedKey(builder, &psk);
+    if (params.psk) |psk| {
+        // §4.2.10's extension goes ahead of `pre_shared_key`, because
+        // §4.2 makes that one last and everything else is "before".
+        if (psk.early_data) {
+            builder.putU16(extension_early_data);
+            builder.patchU16(builder.markU16());
+        }
+        helloPreSharedKey(builder, &psk);
+    }
 }
 
 /// §4.2's one ordering rule: pre_shared_key is the last extension in the

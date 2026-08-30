@@ -7,6 +7,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
 
+const ClientHandshake = @import("ClientHandshake.zig");
 const Credentials = @import("Credentials.zig");
 const ServerHandshake = @import("ServerHandshake.zig");
 const backend = @import("crypto/backend_openssl.zig");
@@ -1100,4 +1101,300 @@ test "§4.6.1: the largest legal ticket still fits with 0-RTT advertised" {
     // the property an over-run would break first.
     const declared = std.mem.readInt(u24, largest[1..4], .big);
     try testing.expectEqual(largest.len - 4, declared);
+}
+
+test "§4.2.10 end to end: our client offers 0-RTT and our server takes it" {
+    // Both production machines, both directions of the same feature.
+    // Every earlier test drove one side against bytes the test built;
+    // this is the client deriving `c e traffic` from a ticket it was
+    // issued, and the server deriving the same secret from the hello it
+    // received — agreement between two independent derivations, which
+    // is what the RFC 8448 vectors cannot show because they check one.
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var early_out: [record.wire_record_bytes_max]u8 = undefined;
+
+    var registry: [anti_replay.StrikeRegister.probe_max]anti_replay.StrikeRegister.Entry =
+        @splat(.free);
+    var register: anti_replay.StrikeRegister = .{ .entries = &registry };
+    var store = EarlyDataFixture.store(1024, .aes_128_gcm_sha256);
+    var harness: Harness = undefined;
+    try harness.initLookup(.{ .context = &store, .lookup = EarlyDataStore.lookup });
+    defer harness.deinit();
+    harness.server.config.now_ms = EarlyDataFixture.now_ms;
+    harness.server.config.strike_register = &register;
+
+    var reassembly: [16 * 1024]u8 = undefined;
+    var resumption: ClientHandshake.Resumption = .{
+        .identity = "ticket",
+        .obfuscated_age = 250 +% EarlyDataFixture.age_add,
+        .psk = undefined,
+        .psk_bytes = 32,
+        .early_data = .{ .bytes_max = 1024, .suite = .aes_128_gcm_sha256 },
+    };
+    @memset(&resumption.psk, 0);
+    @memcpy(resumption.psk[0..EarlyDataFixture.psk.len], &EarlyDataFixture.psk);
+    var client = ClientHandshake.init(&.{
+        .client_random = .{0x2c} ** 32,
+        .x25519_private = client_x25519_private,
+        .session_id = &(.{0x33} ** 32),
+        .server_name = "spike.zoxy.test",
+        .certificate_policy = .insecure_no_verification,
+        .resume_session = resumption,
+        .reassembly = &reassembly,
+    });
+    defer client.deinit();
+
+    const hello = client.start(&client_out);
+    // Offered, and keyed: `sendEarlyData` answers bytes rather than null.
+    const early = (try client.sendEarlyData("GET /0rtt HTTP/1.1\r\n\r\n", &early_out)).?;
+
+    var hello_storage: [record.wire_record_bytes_max]u8 = undefined;
+    @memcpy(hello_storage[0..hello.len], hello);
+    const flight = (try harness.server.handleRecord(hello_storage[0..hello.len], &server_out)).?;
+    try testing.expectEqual(std.meta.activeTag(flight), .send);
+    try testing.expect(harness.server.early_data_accepted);
+    // Copied out before anything else touches `server_out`, which the
+    // very next `handleRecord` does.
+    var flight_storage: [2 * record.wire_record_bytes_max]u8 = undefined;
+    @memcpy(flight_storage[0..flight.send.len], flight.send);
+    const flight_bytes = flight_storage[0..flight.send.len];
+
+    // The server reads what the client sent, under a secret neither of
+    // them exchanged.
+    const early_event = (try harness.server.handleRecord(early, &server_out)).?;
+    try testing.expectEqualSlices(u8, "GET /0rtt HTTP/1.1\r\n\r\n", early_event.application_data);
+
+    // And the handshake completes, which only works if both ends agree
+    // that EndOfEarlyData belongs in the client Finished's transcript
+    // (§4.4) and not in the application secrets (§7.1).
+    var reply: []const u8 = &.{};
+    var index: usize = 0;
+    var count: u8 = 0;
+    while (index < flight_bytes.len) : (count += 1) {
+        try testing.expect(count < 8);
+        const length = std.mem.readInt(u16, flight_bytes[index + 3 ..][0..2], .big);
+        const one = flight_bytes[index..][0 .. record.header_bytes + length];
+        if (try client.handleRecord(one, &client_out)) |event| switch (event) {
+            .connected => |bytes| reply = bytes,
+            else => return error.TestUnexpectedResult,
+        };
+        index += one.len;
+    }
+    try testing.expect(client.early_data_accepted);
+    try testing.expect(reply.len >= 1);
+
+    var final: ?ServerHandshake.Event = null;
+    index = 0;
+    count = 0;
+    while (index < reply.len) : (count += 1) {
+        try testing.expect(count < 8);
+        const length = std.mem.readInt(u16, reply[index + 3 ..][0..2], .big);
+        const one = reply[index..][0 .. record.header_bytes + length];
+        if (try harness.server.handleRecord(one, &server_out)) |event| final = event;
+        index += one.len;
+    }
+    try testing.expectEqual(std.meta.activeTag(final.?), .connected);
+    try testing.expectEqual(ServerHandshake.State.connected, harness.server.state);
+    try testing.expect(harness.server.resumed);
+}
+
+/// A resumed client offering 0-RTT on the terms a test picks. Split out
+/// so the suite can vary — which is the whole point of the test below.
+fn offeringClient(
+    reassembly: []u8,
+    psk: []const u8,
+    terms: ?ClientHandshake.EarlyData,
+) ClientHandshake {
+    var resumption: ClientHandshake.Resumption = .{
+        .identity = "ticket",
+        .obfuscated_age = 250 +% EarlyDataFixture.age_add,
+        .psk = undefined,
+        .psk_bytes = @intCast(psk.len),
+        .early_data = terms,
+    };
+    @memset(&resumption.psk, 0);
+    @memcpy(resumption.psk[0..psk.len], psk);
+    return ClientHandshake.init(&.{
+        .client_random = .{0x2c} ** 32,
+        .x25519_private = client_x25519_private,
+        .session_id = &(.{0x33} ** 32),
+        .certificate_policy = .insecure_no_verification,
+        .resume_session = resumption,
+        .reassembly = reassembly,
+    });
+}
+
+test "§4.2.10: early keys follow the ticket's suite, not the PSK's length" {
+    // Two suites share SHA-256, so a 32-byte PSK does not settle which
+    // AEAD the early records are sealed under. A binder can afford that
+    // ambiguity — it needs only the hash — and early data cannot: the
+    // key length differs, the AEAD differs, and a server that derives
+    // the other one answers bad_record_mac and kills the connection.
+    //
+    // This is the test that would have caught it. The two clients differ
+    // in exactly one field.
+    const psk = [_]u8{0x7e} ** 32;
+    var aes_reassembly: [16 * 1024]u8 = undefined;
+    var chacha_reassembly: [16 * 1024]u8 = undefined;
+    var aes_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var chacha_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var aes_early: [record.wire_record_bytes_max]u8 = undefined;
+    var chacha_early: [record.wire_record_bytes_max]u8 = undefined;
+
+    var aes = offeringClient(&aes_reassembly, &psk, .{
+        .bytes_max = 1024,
+        .suite = .aes_128_gcm_sha256,
+    });
+    defer aes.deinit();
+    var chacha = offeringClient(&chacha_reassembly, &psk, .{
+        .bytes_max = 1024,
+        .suite = .chacha20_poly1305_sha256,
+    });
+    defer chacha.deinit();
+
+    _ = aes.start(&aes_out);
+    _ = chacha.start(&chacha_out);
+    const under_aes = (try aes.sendEarlyData("same plaintext", &aes_early)).?;
+    const under_chacha = (try chacha.sendEarlyData("same plaintext", &chacha_early)).?;
+
+    // Same hello, same PSK, same plaintext — and different ciphertext,
+    // because the suite the ticket named reached the key schedule. If it
+    // had not, these would be byte-identical.
+    try testing.expect(!std.mem.eql(u8, under_aes, under_chacha));
+    // AES-128-GCM keys are 16 bytes and ChaCha20's are 32, so the two
+    // records are not even the same length of ciphertext for the same
+    // input under §5.2's framing... they are, in fact, and that is why
+    // the comparison above is on content: the tag and the AEAD differ,
+    // the framing does not.
+    try testing.expectEqual(under_aes.len, under_chacha.len);
+}
+
+test "§4.2.10: what a client will not offer, and will not overspend" {
+    const psk = [_]u8{0x7e} ** 32;
+    var reassembly: [16 * 1024]u8 = undefined;
+    var out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var early_out: [record.wire_record_bytes_max]u8 = undefined;
+
+    // No terms: `sendEarlyData` answers null rather than failing. "This
+    // connection is not doing 0-RTT" is an ordinary answer, and the data
+    // belongs on the 1-RTT stream instead.
+    {
+        var client = offeringClient(&reassembly, &psk, null);
+        defer client.deinit();
+        _ = client.start(&out);
+        try testing.expectEqual(
+            @as(?[]const u8, null),
+            try client.sendEarlyData("nowhere to go", &early_out),
+        );
+    }
+
+    // A limit of zero is a server that advertised none, so there is
+    // nothing to offer against and the extension does not go out.
+    {
+        var client = offeringClient(&reassembly, &psk, .{
+            .bytes_max = 0,
+            .suite = .aes_128_gcm_sha256,
+        });
+        defer client.deinit();
+        _ = client.start(&out);
+        try testing.expect(!client.early_data_offered);
+        try testing.expectEqual(
+            @as(?[]const u8, null),
+            try client.sendEarlyData("still nowhere", &early_out),
+        );
+    }
+
+    // And the ticket's limit is a promise the server sized its own
+    // ceiling against, so going past it is this client's fault.
+    {
+        var client = offeringClient(&reassembly, &psk, .{
+            .bytes_max = 8,
+            .suite = .aes_128_gcm_sha256,
+        });
+        defer client.deinit();
+        _ = client.start(&out);
+        try testing.expect(client.early_data_offered);
+        _ = (try client.sendEarlyData("12345678", &early_out)).?;
+        try testing.expectError(
+            error.TooMuchEarlyData,
+            client.sendEarlyData("9", &early_out),
+        );
+    }
+}
+
+test "§4.1.2: a HelloRetryRequest withdraws the 0-RTT offer, keys and all" {
+    // The second ClientHello does not carry `early_data` — that much was
+    // already true, because the retry builds its hello without one. What
+    // was not true is that the *state* went with it: the keys were
+    // derived over CH1, whose transcript the retry has just replaced, so
+    // anything still holding them would seal against a hello the server
+    // never saw. A server answering `early_data` after a retry would
+    // then have been believed.
+    const psk = [_]u8{0x7e} ** 32;
+    var reassembly: [16 * 1024]u8 = undefined;
+    var out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var early_out: [record.wire_record_bytes_max]u8 = undefined;
+
+    var resumption: ClientHandshake.Resumption = .{
+        .identity = "ticket",
+        .obfuscated_age = 250 +% EarlyDataFixture.age_add,
+        .psk = undefined,
+        .psk_bytes = 32,
+        .early_data = .{ .bytes_max = 1024, .suite = .aes_128_gcm_sha256 },
+    };
+    @memset(&resumption.psk, 0);
+    @memcpy(resumption.psk[0..psk.len], &psk);
+    var client = ClientHandshake.init(&.{
+        .client_random = .{0x2c} ** 32,
+        .x25519_private = client_x25519_private,
+        .session_id = &(.{0x33} ** 32),
+        .certificate_policy = .insecure_no_verification,
+        .resume_session = resumption,
+        .retry_key_share_private = .{0x71} ** 48,
+        .reassembly = &reassembly,
+    });
+    defer client.deinit();
+
+    _ = client.start(&out);
+    try testing.expect(client.early_data_offered);
+    _ = (try client.sendEarlyData("sent under CH1", &early_out)).?;
+
+    // A retry into a group we advertised.
+    var message_buffer: [server_messages.server_hello_bytes_max]u8 = undefined;
+    const retry = server_messages.helloRetryRequest(
+        &message_buffer,
+        &(.{0x33} ** 32),
+        .aes_128_gcm_sha256,
+        client_hello.group_secp256r1,
+    );
+    var retry_record: [record.wire_record_bytes_max]u8 = undefined;
+    const framed = frameHandshake(&retry_record, retry);
+    const second = (try client.handleRecord(framed, &out)).?;
+    try testing.expectEqual(std.meta.activeTag(second), .send);
+
+    // The offer is gone in every sense: not on CH2's wire, not in the
+    // state a server's acceptance would be checked against, and not
+    // sealable any more.
+    try testing.expect(!client.early_data_offered);
+    try testing.expectEqual(
+        @as(?[]const u8, null),
+        try client.sendEarlyData("after the retry", &early_out),
+    );
+    const hello = client_hello.parse(lastRecordOf(second.send)[record.header_bytes..]) catch
+        return error.TestUnexpectedResult;
+    try testing.expect(!hello.early_data);
+}
+
+/// The last record in a run of them — a client flight may lead with
+/// §D.4's compatibility CCS.
+fn lastRecordOf(bytes: []const u8) []const u8 {
+    var index: usize = 0;
+    var last: []const u8 = &.{};
+    while (index < bytes.len) {
+        const length = std.mem.readInt(u16, bytes[index + 3 ..][0..2], .big);
+        last = bytes[index..][0 .. record.header_bytes + length];
+        index += last.len;
+    }
+    return last;
 }
