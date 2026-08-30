@@ -589,7 +589,16 @@ fn runClientLeg(
     watchdog_child_pid.store(child.id orelse 0, .release);
     defer watchdog_child_pid.store(0, .release);
 
-    const stream = try connectWithRetry(io, port);
+    const stream = connectWithRetry(io, port) catch |err| {
+        // The one failure where openssl's own account is the whole
+        // story, and the one place this harness used to throw it away.
+        // A server that never listened has usually said why — a cert it
+        // could not read, a port already held, an argument it did not
+        // like — and `ServerNeverListened` on its own tells a reader
+        // none of that.
+        try printFile(io, arena, options.log_path);
+        return err;
+    };
     defer stream.close(io);
 
     var reassembly: [16384]u8 = undefined;
@@ -701,13 +710,28 @@ fn printFile(io: Io, arena: std.mem.Allocator, path: []const u8) !void {
     if (contents.len >= 1) std.debug.print("interop: {s}:\n{s}\n", .{ path, contents });
 }
 
+/// How long to let `openssl s_server` reach the point of listening.
+///
+/// Twenty seconds, not the five this started with. The old budget failed
+/// once on a shared CI runner and passed on a rerun of the same commit,
+/// which is the signature of a bound set against a quiet machine: ten
+/// jobs share that runner and a process spawn is not the instant thing
+/// it looks like locally. Twenty is still far under the 90-second
+/// watchdog, so a genuinely broken `s_server` is reported by this leg
+/// with its log rather than by a timeout with none.
+const connect_attempts_max: u16 = 800;
+const connect_retry_ms: u64 = 25;
+
 fn connectWithRetry(io: Io, port: u16) !Io.net.Stream {
     var attempt: u16 = 0;
-    while (attempt < 200) : (attempt += 1) {
-        assert(attempt < 200);
+    while (attempt < connect_attempts_max) : (attempt += 1) {
+        assert(attempt < connect_attempts_max);
         var address: Io.net.IpAddress = .{ .ip4 = .loopback(port) };
         return address.connect(io, .{ .mode = .stream }) catch {
-            io.sleep(Io.Duration.fromNanoseconds(25 * std.time.ns_per_ms), .awake) catch {};
+            io.sleep(
+                Io.Duration.fromNanoseconds(connect_retry_ms * std.time.ns_per_ms),
+                .awake,
+            ) catch {};
             continue;
         };
     }
