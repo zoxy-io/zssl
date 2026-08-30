@@ -99,9 +99,14 @@ shim declined:
 Roughly 3400 of those — DTLS, QUIC, client certificates, ECH,
 compliance policies, X.509 validation — are scope decisions written down
 in DESIGN.md §1 and will never come back. The rest is headroom: the
-largest single wins available are an RFC 5705 exporter (167 cases),
-exposing the peer's negotiated signature algorithm (128), and honouring
-`-signing-prefs` (122).
+largest rows left are an RFC 5705 exporter (167 cases), exposing the
+peer's negotiated signature algorithm (128), and honouring
+`-signing-prefs` (122) — *rows*, deliberately, not wins. The exporter
+row was sampled after the `-curves` lesson below and is worth **six**
+cases to us: `cipher_suite_tests.go` sets the flag on every
+`-server`/`-client` case but generates none at TLS 1.3, so all of those
+are pre-1.3, and the dedicated `export_tests.go` family is mostly DTLS
+and QUIC. The other two rows have not been sampled.
 
 **Read this table as "first thing declined", not "cases a fix would
 buy".** `-curves` is the worked example, and it cost a slice to learn.

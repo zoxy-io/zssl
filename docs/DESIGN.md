@@ -60,8 +60,12 @@ the four decisions everything else follows from.
 - **Client certificates** — no CertificateRequest on either side.
 - **RFC 5705 exporters.** §7.5's `exporter_master` is derived and
   RFC 8448 checks it (`src/rfc8448_test.zig`), but no API expands it, so
-  an embedder that needs channel binding cannot get it. The largest
-  single gap BoGo can measure, at 167 declined cases.
+  an embedder that needs channel binding cannot get it. BoGo declines
+  167 cases on the flag and would run **six** of them — the rest are
+  DTLS, QUIC, or pre-1.3. Six is still the right reason to build it:
+  they cover initial and resumed exchanges, no-context against
+  empty-context, and §7.5's rule that the exporter stays shut while the
+  client is sending 0-RTT.
 - **Appendix E.5's early-data marker.** `Event.application_data` does
   not say whether the bytes arrived as 0-RTT; the embedder infers it
   from the connection's state. That works and is not the same as being
