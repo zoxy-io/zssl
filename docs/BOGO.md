@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 367 passed, 0 failed, 6795 declined by the shim (89), floor 367
+bogo: 401 passed, 0 failed, 6664 declined by the shim (89), floor 401
 bogo: PASS
 ```
 
@@ -41,9 +41,10 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**367 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. It was 348
-until the server's signing preference could be narrowed (finding 20),
+**401 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. It was 367
+until §7.5's exporter landed (finding 21), 348 until the server's
+signing preference could be narrowed (finding 20),
 324 until the client could report and restrict its signature algorithms
 (finding 19), and 278 until
 the client could answer a HelloRetryRequest: a single-group client that
@@ -79,7 +80,7 @@ extension block, and 143 until §4.6.3's update requests were coalesced, and
 either gets fixed or gets an entry in `DisabledTests` with a one-line
 reason. There are no silent skips.
 
-**6795 declined** — 86% of the corpus. The shim exited 89, PORTING.md's
+**6664 declined** — 84% of the corpus. The shim exited 89, PORTING.md's
 "unimplemented", and the runner counted the case without running it.
 That number is large enough to be the first thing anyone asks about, so
 here is what it is made of. Counting each case by the *first* thing the
@@ -1008,6 +1009,60 @@ laxity, and laxity is what BoGo exists to find.
     no version, passing or failing for a reason that has nothing to do
     with what it is named for. Its ledger entry says so, so the next
     sweep does not have to rediscover it.
+21. **RFC 5705 exporters, and a reachable assertion on our own
+    configuration.** Thirty-four more cases, 367 to 401. Five are the
+    exporter corpus this document had sized at six; the other
+    twenty-nine came free, because the flag had been the *first* thing
+    declining a pile of pre-1.3 cipher-suite cases that now decline for
+    their version instead.
+
+    §7.5's construction lives in `key_schedule.exporter`, and both
+    machines expose it as `exporter(label, context, out)`. The name sits
+    uncomfortably close to `exportKeyMaterial`, which hands the record
+    layer's traffic keys to the kernel and is unrelated; the RFCs' names
+    are equally close, and both doc comments say so.
+
+    Two limits in `hkdf.zig` had to move, and both were there on purpose.
+    `label_bytes_max` is 18 because RFC 8446's own labels top out at "e
+    exp master" — but §7.5's labels are the *application's*, and
+    "EXPORTER-Channel-Binding" alone is 24. And `expandLabel` was written
+    as the single-block special case, asserting that no RFC 8446
+    derivation asks for more than one hash length. That was true until an
+    exporter asked for 1024 bytes. `expandLabelLong` is RFC 5869 §2.3's
+    full ladder, kept separate so every key-schedule derivation does not
+    carry its four-times-larger info buffer.
+
+    The oracle for the ladder is `std.crypto.kdf.hkdf` — a second
+    RFC 5869 implementation sharing no code with ours — at seven output
+    lengths chosen to land in different places in the loop. No traced
+    vector in this tree asks Expand-Label for more than a hash length, so
+    RFC 8448 could not answer this one.
+
+    **A reachable assertion, from the embedder's own configuration.**
+    `exporter` asserted `label.len >= 1`, and BoGo passes an *empty*
+    label in two of its cases: the shim panicked on its own argv. §7.1
+    writes the field as `opaque label<7..255>` and "tls13 " is six of
+    those, so an empty application label encodes something the grammar
+    does not admit — but HkdfLabel is hashed and never transmitted, so
+    nothing parses it against that grammar, and the runner's own exporter
+    feeds the label straight through. Refusing would have left us
+    deriving different bytes from everyone else, which is the one thing
+    an exporter must not do. The assertion is gone and an in-tree test
+    pins the empty label on both machines.
+
+    One case of the six stays declined:
+    `NoEarlyKeyingMaterial-Client-InEarlyData` asks a client to *refuse*
+    an export while it is still sending 0-RTT. Our shim exports after the
+    handshake returns, so it never makes that call; the library would
+    answer `HandshakeNotComplete` if it did, which is the behaviour the
+    case wants.
+
+    A test of ours was wrong in a way worth recording, because the
+    sabotage pass is what caught it. It compared a 1024-byte export
+    against 32-byte ones to prove the context was bound — but §7.1 puts
+    the requested length *inside* HkdfLabel, so those differ no matter
+    what else is equal. It passed with the context dropped entirely.
+    Every comparison now derives its baseline at the same length.
 
 ## Running it
 
