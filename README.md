@@ -40,10 +40,11 @@ know about.
 interoperates with OpenSSL and `std.crypto.tls` in both directions, and
 both halves run under BoringSSL's adversarial BoGo runner, which has
 found real defects — a remote panic on a garbage certificate among them —
-and leaves nine findings still on the ledger, all recorded in
-[docs/BOGO.md](docs/BOGO.md). The server half also runs under tlsfuzzer,
-which has found three ([docs/TLSFUZZER.md](docs/TLSFUZZER.md)). It has had
-no external audit. Don't put it in front of anything you care about yet.
+and leaves eight cases suppressed on its ledger, none of them an open
+gap, all recorded in [docs/BOGO.md](docs/BOGO.md). The server half also
+runs under tlsfuzzer, which has found seven more
+([docs/TLSFUZZER.md](docs/TLSFUZZER.md)). It has had no external audit.
+Don't put it in front of anything you care about yet.
 
 ## Why
 
@@ -240,31 +241,19 @@ refused, not downgraded.
 
 ## Scope
 
-**In:** TLS 1.3 (RFC 8446), the three standard cipher suites, key
-exchange over x25519, secp256r1 and secp384r1 (server side; the client
-offers x25519 alone), ECDSA P-256/P-384 and RSA-PSS signing and
-verification, SNI, ALPN,
-HelloRetryRequest (the server issues it; the client refuses it
-structurally, holding keys for one group), PSK resumption with
-server-side tickets, KeyUpdate, and kTLS key export.
+TLS 1.3 (RFC 8446) and nothing older, both handshake halves, the three
+standard suites, x25519/secp256r1/secp384r1, ECDSA P-256/P-384 and
+RSA-PSS, SNI, ALPN, HelloRetryRequest in both directions, PSK
+resumption, 0-RTT, KeyUpdate, and kTLS key export.
 
-ECDSA is still the key to *deploy* — an RSA sign is a millisecond where
-ECDSA is a few hundred microseconds, and that gap is why zssl needs no
-worker pool. RSA is supported because a library should be able to
-present a key its embedder already owns, not because it is the one to
-choose. RSA keys are bounded at 2048..4096 bits and refused at load
-outside it.
+Not built: client certificates, QUIC and DTLS. Never: TLS 1.2 and
+earlier, renegotiation, compression, RSA and DSA key exchange,
+post-handshake client auth. X.509 chain building and RFC 9525 name
+matching are yours, through `chain_verifier`, as above.
 
-**Out, permanently:** TLS 1.2 and earlier, renegotiation, compression,
-RSA and DSA *key exchange*, rsa_pkcs1_* signatures (§4.4.3 forbids them
-in CertificateVerify). A caller that needs these wants a different
-library.
-
-**Out, for now:** 0-RTT (a replay-analysis decision, not a convenience),
-X.509 chain validation (the embedder's, through `chain_verifier`),
-client certificates, and QUIC.
-
-Everything above is argued in [docs/DESIGN.md](docs/DESIGN.md) §1.
+[docs/DESIGN.md](docs/DESIGN.md) §1 is the full list and the argument
+for every line of it — including why RSA is supported when ECDSA is the
+key to deploy, and why 0-RTT went from out to in.
 
 ## Testing
 
@@ -291,10 +280,11 @@ scripts of 62, and 321 of TLS-Anvil's 437 tests opt out against a
 TLS 1.3-only server. That is why each carries a second, counted badge
 rather than a bare pass mark, and why each holds its passing count
 against a floor, so a regression or a quiet suppression stops the build.
-Nine findings sit on BoGo's ledger, tlsfuzzer's 36 declines are all
-triaged and none of them now stands on an open gap, and TLS-Anvil has two
-open failures it refuses to suppress; the three documents name every one,
-with a reason.
+Eight cases sit suppressed on BoGo's ledger and none of them is an open
+gap, tlsfuzzer's 40 declines are all triaged and none stands on one
+either, and TLS-Anvil suppresses exactly one test, on a rule we
+deliberately read more strictly than it does; the three documents name
+every one, with a reason.
 
 ## Development
 
