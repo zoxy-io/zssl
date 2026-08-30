@@ -121,6 +121,27 @@ var watchdog_stage: std.atomic.Value(u8) = .init(0);
 var watchdog_child_pid: std.atomic.Value(i32) = .init(0);
 var watchdog_server_pids: [leaves.len]std.atomic.Value(i32) = @splat(.init(0));
 
+/// The ledger has to name every script the checkout carries: a pin bump
+/// adds cases, and one nobody triaged is one the gate silently does not
+/// run. Split out of `main` to keep it under TIGER_STYLE's 70-line
+/// limit — which is also what `tlsanvil/run.zig`'s `verdict` says it did,
+/// and that claim was false for this file until now.
+///
+/// Non-null is an exit code and `main` should return it.
+fn refuseUnnamedScripts(io: Io, arena: std.mem.Allocator, scripts: Scripts) !?u8 {
+    const unnamed = countUnnamedScripts(io, arena, scripts) catch |err| {
+        std.debug.print("tlsfuzzer: could not read the checkout's scripts ({t})\n", .{err});
+        return 2;
+    };
+    if (unnamed == 0) return null;
+    std.debug.print(
+        "tlsfuzzer: {d} `test-tls13-*` script(s) in the checkout that scripts.json does " ++
+            "not name. A pin bump adds cases; each needs a Run entry or a Disabled reason.\n",
+        .{unnamed},
+    );
+    return 1;
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const arena = init.arena.allocator();
@@ -159,18 +180,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     watchdog_stage.store(3, .release);
     const scripts = try loadScripts(io, arena, options.config_path);
-    const unnamed = countUnnamedScripts(io, arena, scripts) catch |err| {
-        std.debug.print("tlsfuzzer: could not read the checkout's scripts ({t})\n", .{err});
-        return 2;
-    };
-    if (unnamed > 0) {
-        std.debug.print(
-            "tlsfuzzer: {d} `test-tls13-*` script(s) in the checkout that scripts.json does " ++
-                "not name. A pin bump adds cases; each needs a Run entry or a Disabled reason.\n",
-            .{unnamed},
-        );
-        return 1;
-    }
+    if (try refuseUnnamedScripts(io, arena, scripts)) |code| return code;
     std.debug.print(
         "tlsfuzzer: {d} scripts to run, {d} disabled ({d} of those untriaged)\n",
         .{ scripts.run.len, scripts.disabled, scripts.untriaged },

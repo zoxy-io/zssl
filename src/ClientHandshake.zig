@@ -581,6 +581,14 @@ pub fn deinit(self: *ClientHandshake) void {
         inline else => |*arm| arm.deinit(),
     };
     if (self.key_share) |*share| share.deinit();
+    // The scalars themselves, not just `KeyShare`'s copy of them.
+    // `Config` is taken by value at `init`, so this machine holds the
+    // (EC)DHE private keys for its whole life — and disposing of them is
+    // the entire content of the word "ephemeral". `self.* = undefined`
+    // is not a wipe: it is a value assignment the compiler may elide,
+    // which is why every other secret here is `secureZero`'d before it.
+    std.crypto.secureZero(u8, &self.config.x25519_private);
+    if (self.config.retry_key_share_private) |*scalar| std.crypto.secureZero(u8, scalar);
     self.* = undefined;
 }
 

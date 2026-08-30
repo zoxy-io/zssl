@@ -324,19 +324,12 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             @memcpy(message[message.len - hash_bytes ..], &binder);
         }
 
-        fn buildHelloExtensions(self: *Self, builder: *wire.Builder, with_x25519: bool, with_decoy: bool) void {
-            assert(builder.index >= 40);
-            if (self.options.server_name) |name| {
-                builder.putU16(0); // server_name
-                const body = builder.markU16();
-                const list = builder.markU16();
-                builder.putByte(0);
-                const name_mark = builder.markU16();
-                builder.putSlice(name);
-                builder.patchU16(name_mark);
-                builder.patchU16(list);
-                builder.patchU16(body);
-            }
+        /// supported_groups and signature_algorithms: the two extensions
+        /// this client never varies, and so the part of
+        /// `buildHelloExtensions` that carries no test's intent. Lifted
+        /// out because that function was 86 code lines against
+        /// TIGER_STYLE's 70-line hard limit.
+        fn buildFixedExtensions(builder: *wire.Builder) void {
             builder.putU16(10); // supported_groups: x25519 and P-256.
             const groups = builder.markU16();
             const group_list = builder.markU16();
@@ -351,6 +344,33 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             builder.putU16(0x0503);
             builder.patchU16(scheme_list);
             builder.patchU16(schemes);
+        }
+
+        /// §4.2.1, and the only version this client speaks. Beside
+        /// `buildFixedExtensions` for the same reason: it varies with
+        /// nothing.
+        fn buildSupportedVersions(builder: *wire.Builder) void {
+            builder.putU16(43); // supported_versions
+            const versions = builder.markU16();
+            builder.putByte(2);
+            builder.putU16(0x0304);
+            builder.patchU16(versions);
+        }
+
+        fn buildHelloExtensions(self: *Self, builder: *wire.Builder, with_x25519: bool, with_decoy: bool) void {
+            assert(builder.index >= 40);
+            if (self.options.server_name) |name| {
+                builder.putU16(0); // server_name
+                const body = builder.markU16();
+                const list = builder.markU16();
+                builder.putByte(0);
+                const name_mark = builder.markU16();
+                builder.putSlice(name);
+                builder.patchU16(name_mark);
+                builder.patchU16(list);
+                builder.patchU16(body);
+            }
+            buildFixedExtensions(builder);
             if (self.options.alpn) |protocol| {
                 builder.putU16(16);
                 const body = builder.markU16();
@@ -360,11 +380,7 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                 builder.patchU16(list);
                 builder.patchU16(body);
             }
-            builder.putU16(43); // supported_versions
-            const versions = builder.markU16();
-            builder.putByte(2);
-            builder.putU16(0x0304);
-            builder.patchU16(versions);
+            buildSupportedVersions(builder);
             if (self.options.offer_early_data) {
                 builder.putU16(42); // early_data
                 const early = builder.markU16();
@@ -684,10 +700,17 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             if (context_bytes != 0) return error.BadCertificate;
             _ = try cursor.takeU24();
             const leaf_bytes = try cursor.takeU24();
-            if (leaf_bytes == 0) return error.BadCertificate;
+            // Both bounds with `if`, because both are the peer's number.
+            // `Credentials.chain_bytes_max` is 8192 and this buffer is
+            // 4096, so a server with a chain the *library* considers
+            // legitimate crashed this oracle rather than declining it —
+            // and an oracle that aborts on a legal input reports a
+            // library bug that is not there.
+            if (leaf_bytes == 0 or leaf_bytes > self.leaf_storage.len) {
+                return error.BadCertificate;
+            }
             const der = try cursor.takeSlice(leaf_bytes);
             assert(der.len >= 1);
-            assert(der.len <= self.leaf_storage.len);
             @memcpy(self.leaf_storage[0..der.len], der);
             self.leaf_der = self.leaf_storage[0..der.len];
         }
@@ -766,55 +789,11 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             assert(self.ticket_count <= self.tickets.len);
         }
 
-        fn finishHandshake(self: *Self, message: handshake.Message, out: []u8) Error!Event {
-            assert(self.certificate_verified or self.psk_accepted);
-            assert(self.schedule.?.stage == .handshake);
-            if (message.body().len != hash_bytes) return error.BadFinished;
-            const server_key = Schedule.finishedKey(&self.server_handshake_traffic);
-            const expected = Schedule.verifyData(&server_key, &self.transcript.currentHash());
-            if (!std.crypto.timing_safe.eql([hash_bytes]u8, message.body()[0..hash_bytes].*, expected)) {
-                return error.BadFinished;
-            }
-            self.transcript.update(message.bytes);
-            self.finished_hash = self.transcript.currentHash();
-            self.schedule.?.advanceToMaster();
-            const client_ap = self.schedule.?.deriveAt(.master, "c ap traffic", &self.finished_hash);
-            const server_ap = self.schedule.?.deriveAt(.master, "s ap traffic", &self.finished_hash);
-            self.transmit_keys = Schedule.trafficKeys(&client_ap);
-            self.receive_keys = Schedule.trafficKeys(&server_ap);
-
-            var builder = wire.Builder.init(out);
-            if (self.options.send_change_cipher_spec) {
-                builder.putSlice(&server_messages.change_cipher_spec_record);
-            }
-            // §4.5, out under the *early* keys — the last thing they
-            // protect — before the Finished switches to the handshake
-            // ones. It joins the transcript here, which is why the
-            // verify_data below reads `currentHash` rather than the
-            // `finished_hash` the application secrets came from: §4.4
-            // puts EndOfEarlyData in the client's handshake context and
-            // §7.1 leaves it out of the secrets. With no early data the
-            // two hashes are equal and this is a no-op.
-            if (self.early_send) |*early| {
-                const end_of_early_data = [_]u8{
-                    @intFromEnum(handshake.MessageType.end_of_early_data),
-                    0,
-                    0,
-                    0,
-                };
-                self.transcript.update(&end_of_early_data);
-                const sealed_end = try early.seal(
-                    .handshake,
-                    &end_of_early_data,
-                    builder.bytes[builder.index..],
-                );
-                builder.index += sealed_end.len;
-                early.deinit();
-                self.early_send = null;
-            }
-            // §4.4.2: a client that was asked answers, even to decline —
-            // an empty certificate_list rather than silence, and in the
-            // transcript its own Finished MACs.
+        /// §4.4.2's answer, and the hostile shapes the options ask for.
+        /// Its own function because `finishHandshake` was 102 code lines
+        /// against TIGER_STYLE's 70-line hard limit and this was most of
+        /// the excess — the same split `ClientHandshake` took.
+        fn sendClientAuth(self: *Self, builder: *wire.Builder) Error!void {
             if (self.certificate_requested or self.options.volunteer_certificate) {
                 // One entry of three bytes, or none at all. The
                 // non-empty shape exists so a `certificate_verifies`
@@ -865,6 +844,58 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                     builder.index += sealed_verify.len;
                 }
             }
+        }
+
+        fn finishHandshake(self: *Self, message: handshake.Message, out: []u8) Error!Event {
+            assert(self.certificate_verified or self.psk_accepted);
+            assert(self.schedule.?.stage == .handshake);
+            if (message.body().len != hash_bytes) return error.BadFinished;
+            const server_key = Schedule.finishedKey(&self.server_handshake_traffic);
+            const expected = Schedule.verifyData(&server_key, &self.transcript.currentHash());
+            if (!std.crypto.timing_safe.eql([hash_bytes]u8, message.body()[0..hash_bytes].*, expected)) {
+                return error.BadFinished;
+            }
+            self.transcript.update(message.bytes);
+            self.finished_hash = self.transcript.currentHash();
+            self.schedule.?.advanceToMaster();
+            const client_ap = self.schedule.?.deriveAt(.master, "c ap traffic", &self.finished_hash);
+            const server_ap = self.schedule.?.deriveAt(.master, "s ap traffic", &self.finished_hash);
+            self.transmit_keys = Schedule.trafficKeys(&client_ap);
+            self.receive_keys = Schedule.trafficKeys(&server_ap);
+
+            var builder = wire.Builder.init(out);
+            if (self.options.send_change_cipher_spec) {
+                builder.putSlice(&server_messages.change_cipher_spec_record);
+            }
+            // §4.5, out under the *early* keys — the last thing they
+            // protect — before the Finished switches to the handshake
+            // ones. It joins the transcript here, which is why the
+            // verify_data below reads `currentHash` rather than the
+            // `finished_hash` the application secrets came from: §4.4
+            // puts EndOfEarlyData in the client's handshake context and
+            // §7.1 leaves it out of the secrets. With no early data the
+            // two hashes are equal and this is a no-op.
+            if (self.early_send) |*early| {
+                const end_of_early_data = [_]u8{
+                    @intFromEnum(handshake.MessageType.end_of_early_data),
+                    0,
+                    0,
+                    0,
+                };
+                self.transcript.update(&end_of_early_data);
+                const sealed_end = try early.seal(
+                    .handshake,
+                    &end_of_early_data,
+                    builder.bytes[builder.index..],
+                );
+                builder.index += sealed_end.len;
+                early.deinit();
+                self.early_send = null;
+            }
+            // §4.4.2: a client that was asked answers, even to decline —
+            // an empty certificate_list rather than silence, and in the
+            // transcript its own Finished MACs.
+            try self.sendClientAuth(&builder);
             const client_key = Schedule.finishedKey(&self.client_handshake_traffic);
             const verify_data = Schedule.verifyData(&client_key, &self.transcript.currentHash());
             var message_buffer: [handshake.header_bytes + hash_bytes]u8 = undefined;

@@ -563,6 +563,9 @@ pub fn deinit(self: *ServerHandshake) void {
     if (self.ladder) |*ladder| switch (ladder.*) {
         inline else => |*arm| arm.deinit(),
     };
+    // See `ClientHandshake.deinit`: `Config` is held by value, so the
+    // (EC)DHE scalar outlives every derived secret we do wipe.
+    std.crypto.secureZero(u8, &self.config.key_share_private);
     self.* = undefined;
 }
 
@@ -2047,6 +2050,7 @@ fn LadderOf(comptime suite: CipherSuite) type {
             if (self.send) |*protector| protector.deinit();
             if (self.session) |*session| session.deinit();
             if (self.schedule) |*schedule| schedule.wipe();
+            std.crypto.secureZero(u8, &self.finished_hash);
             std.crypto.secureZero(u8, &self.client_finished_hash);
             std.crypto.secureZero(u8, &self.client_handshake_traffic);
             std.crypto.secureZero(u8, &self.server_handshake_traffic);
