@@ -96,6 +96,9 @@ const Harness = struct {
         /// library is perfectly able to verify.
         client_verify_schemes: []const backend.SignatureScheme =
             &client_messages.signature_schemes_default,
+        /// §4.4.2's signing set, narrowed. Null leaves the choice to the
+        /// key, which is what almost every test here wants.
+        server_signing_schemes: ?[]const u16 = null,
     };
 
     fn init(harness: *Harness, options: Options) !void {
@@ -127,6 +130,7 @@ const Harness = struct {
             .key_share_private = server_key_share_private,
             .alpn = options.server_alpn,
             .groups = options.server_groups,
+            .signing_schemes = options.server_signing_schemes,
             .reassembly = &harness.server_reassembly,
             .flight = &harness.flight,
             .psk_lookup = if (store) |context| .{
@@ -2277,4 +2281,44 @@ test "§4.4.3: a CertificateVerify scheme we never offered is illegal_parameter"
             harness.client.peer_signature_scheme,
         );
     }
+}
+
+test "§4.4.2: the embedder's signing preference is obeyed, and refused when empty" {
+    // An RSA modulus signs under all three PSS digests, so it is the one
+    // fixture where narrowing has something to choose between: the key
+    // could satisfy any of them and the answer has to come from the
+    // configured order rather than the signer's own.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{
+        .leaf = .rsa_2048,
+        // Deliberately *not* the signer's own order, which leads with
+        // sha256 — a test that named sha256 would pass without the
+        // preference being read at all.
+        .server_signing_schemes = &.{ 0x0806, 0x0805, 0x0804 },
+    });
+    defer harness.deinit();
+    try harness.connect(&buffers);
+    try testing.expectEqual(
+        backend.SignatureScheme.rsa_pss_rsae_sha512,
+        harness.server.signature_scheme,
+    );
+    try testing.expect(harness.client.certificate_verified);
+
+    // And the misconfiguration the field documents: a scheme this key
+    // cannot produce is answered on the wire, not asserted away. A P-256
+    // curve over an RSA key is exactly the kind of pin an embedder gets
+    // wrong once, and §4.4.2 leaves it nothing to sign with.
+    var pinned: Harness = undefined;
+    try pinned.init(.{
+        .leaf = .rsa_2048,
+        .server_signing_schemes = &.{0x0403},
+    });
+    defer pinned.deinit();
+    var pinned_buffers: Buffers = .{};
+    const hello = pinned.client.start(&pinned_buffers.client_out);
+    try testing.expectError(
+        error.HandshakeFailure,
+        pinned.server.handleRecord(hello, &pinned_buffers.server_out),
+    );
 }

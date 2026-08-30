@@ -39,7 +39,11 @@ the four decisions everything else follows from.
   `illegal_parameter` abort with nothing verified, told apart from a
   signature that simply failed. `ClientHandshake.peer_signature_scheme`
   reports what the server actually used, mirroring the server's own
-  `signature_scheme`.
+  `signature_scheme`. The server's signing set narrows through
+  `Config.signing_schemes`, whose order wins over the key's — and which
+  takes wire code points rather than an enum, so pinning a scheme the key
+  cannot produce is answered with `HandshakeFailure` rather than being
+  unrepresentable.
 - **PSK resumption.** `psk_lookup` is the embedder seam: an opaque
   identity goes in, the PSK *and its kind* come out, and ticket sealing,
   lifetime and age policy stay the embedder's. Both kinds are accepted
