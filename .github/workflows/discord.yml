@@ -1,23 +1,22 @@
 name: discord
 
-# Repository events into a Discord channel, on zoxy's conventions —
-# `secrets.DISCORD_WEBHOOK`, `jq -n --arg` payloads, and a report mirrored
-# into the run summary so the message survives without Discord.
+# Repository events into a Discord channel. This file is shared by zoxy,
+# zrk and zssl and differs only in two places — the workflow list it
+# watches and the `username` the payload posts under — so a fix to one
+# belongs in all three.
 #
 # Three kinds of event, chosen so the channel stays readable: a gate that
 # *fails*, a push to main, and a pull request opening or closing.
-# Successful gates are deliberately silent — ten workflows run on every
-# push, and ten green messages per commit is a channel nobody reads,
-# which is the same as no notifications at all. The README badges already
-# say what is green.
+# Successful gates are deliberately silent — every gate runs on every
+# push, and a green message per gate per commit is a channel nobody
+# reads, which is the same as no notifications at all. The README badges
+# already say what is green.
 #
-# Note that this is chattier than zoxy, which notifies only from
-# `nightly-sim.yml` and leaves `ci.yml` silent. zssl has ten gates and no
-# nightly job, so the failures are the thing worth carrying.
-#
-# The webhook is a secret and never a literal: this repository is public,
-# and anyone holding that URL can post to the channel until it is rotated
-# in Discord.
+# The webhook is a secret and never a literal: these repositories are
+# public, and anyone holding that URL can post to the channel until it is
+# rotated in Discord. It is also withheld from a pull request opened from
+# a fork, which is why every job tolerates an empty `WEBHOOK` and falls
+# back to the run summary instead of failing.
 #
 # Every payload is built by `jq --arg` from environment variables, never
 # by interpolating `${{ }}` into a shell script. A branch name or PR
