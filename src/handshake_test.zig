@@ -27,6 +27,14 @@ const Harness = struct {
     server: ServerHandshake,
 
     fn init(harness: *Harness, alpn: ?[]const u8) !void {
+        return harness.initWith(alpn, null);
+    }
+
+    fn initWith(
+        harness: *Harness,
+        alpn: ?[]const u8,
+        client_auth: ?ServerHandshake.ClientAuth,
+    ) !void {
         harness.credentials = try Credentials.load(
             @embedFile("testdata/cert.pem"),
             @embedFile("testdata/key.pem"),
@@ -38,6 +46,7 @@ const Harness = struct {
             .server_random = server_random,
             .key_share_private = server_key_share_private,
             .alpn = alpn,
+            .client_auth = client_auth,
             .reassembly = &harness.reassembly,
             .flight = &harness.flight,
         });
@@ -623,4 +632,68 @@ test "§4.2.10: early_data carries no body in a ClientHello, and none on a retry
             harness.server.handleRecord(second.send, &server_out),
         );
     }
+}
+
+test "§4.3.2: the server asks for a certificate, and §4.4.2.1 decides what a refusal costs" {
+    // Three claims, and the middle one is the reason this exists: a
+    // server that asks and then accepts silence has authenticated
+    // nobody while looking like it did.
+    const cases = [_]struct { require: bool, completes: bool }{
+        .{ .require = true, .completes = false },
+        .{ .require = false, .completes = true },
+    };
+    for (cases) |case| {
+        var harness: Harness = undefined;
+        try harness.initWith("http/1.1", .{ .require = case.require });
+        defer harness.deinit();
+
+        var client = Client.init(&client_x25519_private, &.{ .alpn = "http/1.1" });
+        defer client.deinit();
+        var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+        var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+
+        const hello = client.helloRecord(&client_out);
+        const flight = try feedRecords(&harness.server, hello, &server_out);
+
+        // The request really went out: our own client saw one and owes
+        // an answer. Asserting on the client rather than on our encoder
+        // is what makes this a wire check.
+        const reply = try client.absorb(flight.send, &client_out);
+        try testing.expectEqual(std.meta.activeTag(reply), .connected);
+        try testing.expect(client.certificate_requested);
+
+        // And the answer — an empty certificate_list — is judged by
+        // `require` and nothing else.
+        if (case.completes) {
+            _ = try feedRecords(&harness.server, reply.connected, &server_out);
+            try testing.expectEqual(ServerHandshake.State.connected, harness.server.state);
+            // Completing is not the same as authenticating, and an
+            // embedder that conflates them is why this field is public.
+            try testing.expect(!harness.server.peer.verified);
+        } else {
+            try testing.expectError(
+                error.CertificateRequired,
+                feedRecords(&harness.server, reply.connected, &server_out),
+            );
+        }
+    }
+}
+
+test "§4.3.2: no CertificateRequest unless the embedder asked for one" {
+    // The default, and the one that must not regress: a server that was
+    // never configured for mTLS sends nothing extra and our client never
+    // sees a request.
+    var harness: Harness = undefined;
+    try harness.init("http/1.1");
+    defer harness.deinit();
+
+    var client = Client.init(&client_x25519_private, &.{ .alpn = "http/1.1" });
+    defer client.deinit();
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+
+    const hello = client.helloRecord(&client_out);
+    const flight = try feedRecords(&harness.server, hello, &server_out);
+    _ = try client.absorb(flight.send, &client_out);
+    try testing.expect(!client.certificate_requested);
 }

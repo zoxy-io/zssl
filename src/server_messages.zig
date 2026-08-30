@@ -7,6 +7,7 @@ const assert = std.debug.assert;
 
 const cipher_suite = @import("cipher_suite.zig");
 const client_hello = @import("client_hello.zig");
+const backend = @import("crypto/backend_openssl.zig");
 const handshake = @import("handshake.zig");
 const wire = @import("wire.zig");
 const CipherSuite = cipher_suite.CipherSuite;
@@ -15,6 +16,7 @@ const extension_key_share: u16 = 51;
 const extension_supported_versions: u16 = 43;
 const extension_alpn: u16 = 16;
 const extension_early_data: u16 = 42;
+const extension_signature_algorithms: u16 = 13;
 const extension_pre_shared_key: u16 = 41;
 const tls13_wire_version: u16 = 0x0304;
 
@@ -148,6 +150,39 @@ pub fn encryptedExtensions(out: []u8, alpn_selected: ?[]const u8, early_data: bo
     return builder.written();
 }
 
+/// §4.3.2's CertificateRequest — the message that makes a handshake
+/// mutual.
+///
+/// `certificate_request_context` is always empty here, and that is the
+/// RFC's rule rather than a simplification: the field "SHALL be zero
+/// length unless used for the post-handshake authentication exchanges",
+/// which DESIGN.md §1 puts permanently out of scope. Nothing has to
+/// track an echo, and a client sending a non-empty one is answering a
+/// request we did not make.
+///
+/// One extension, and §4.3.2 makes it mandatory: `signature_algorithms`
+/// is what the client's CertificateVerify must choose from.
+/// `certificate_authorities` and `oid_filters` are omitted — a server
+/// that names no CAs is asking for any certificate, and the embedder's
+/// `chain_verifier` is where that judgement belongs.
+pub fn certificateRequest(out: []u8, schemes: []const backend.SignatureScheme) []const u8 {
+    assert(schemes.len >= 1);
+    assert(out.len >= certificate_request_bytes_max);
+    var builder = wire.Builder.init(out);
+    const message = handshake.beginMessage(&builder, .certificate_request);
+    builder.putByte(0); // certificate_request_context: empty, per §4.3.2.
+    const extensions = builder.markU16();
+    builder.putU16(extension_signature_algorithms);
+    const body = builder.markU16();
+    const list = builder.markU16();
+    for (schemes) |scheme| builder.putU16(@intFromEnum(scheme));
+    builder.patchU16(list);
+    builder.patchU16(body);
+    builder.patchU16(extensions);
+    handshake.endMessage(&builder, message);
+    return builder.written();
+}
+
 /// §4.4.2, server shape: empty certificate_request_context, then the
 /// chain, leaf first, each entry with empty extensions.
 pub fn certificateChain(out: []u8, certificates: []const []const u8) []const u8 {
@@ -216,6 +251,13 @@ pub const ticket_lifetime_s_max: u32 = 604800;
 /// maximum-size ticket and an out-of-bounds write.
 pub const new_session_ticket_bytes_max: u16 =
     @as(u16, handshake.header_bytes) + 4 + 4 + 1 + 255 + 2 + ticket_bytes_max + 2 + 8;
+
+/// §4.3.2 with one extension: 4 header + 1 context + 2 extensions
+/// length + 2 type + 2 body + 2 list + two bytes per scheme. Five
+/// schemes is every code point `SignatureScheme` has, so 32 is generous
+/// and fixed — `wire.Builder` bounds nothing, and this is the number
+/// that keeps it from having to.
+pub const certificate_request_bytes_max: usize = 32;
 
 /// §4.6.1, and the other half of accepting 0-RTT: a client offers early
 /// data only against a ticket that told it how much it may send, so a

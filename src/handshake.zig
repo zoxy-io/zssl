@@ -19,6 +19,11 @@ pub const MessageType = enum(u8) {
     end_of_early_data = 5,
     encrypted_extensions = 8,
     certificate = 11,
+    /// §4.3.2. Only a server sends one, and only in the main handshake:
+    /// post-handshake authentication is out of scope (DESIGN.md §1), so
+    /// a client seeing this after `connected` is a protocol error rather
+    /// than a second exchange.
+    certificate_request = 13,
     certificate_verify = 15,
     finished = 20,
     key_update = 24,

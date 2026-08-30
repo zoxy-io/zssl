@@ -21,6 +21,8 @@ const backend = @import("crypto/backend_openssl.zig");
 const cipher_suite = @import("cipher_suite.zig");
 const flood = @import("flood.zig");
 const client_hello = @import("client_hello.zig");
+const peer_certificate = @import("peer_certificate.zig");
+const client_messages = @import("client_messages.zig");
 const handshake = @import("handshake.zig");
 const key_schedule = @import("key_schedule.zig");
 const ktls = @import("ktls.zig");
@@ -40,6 +42,11 @@ key_share_group: backend.Group,
 /// the first of our key's schemes the client offered. Meaningless on a
 /// resumed handshake, which signs nothing.
 signature_scheme: backend.SignatureScheme,
+/// The client's certificate, when `Config.client_auth` asked for one.
+/// Read `peer.verified` to learn whether the client proved possession —
+/// and read it even under `require`, because a resumed session skips
+/// client auth entirely (§4.3.2 forbids the request under a PSK).
+peer: peer_certificate.PeerCertificate,
 assembler: handshake.Assembler,
 ladder: ?Ladder,
 /// §5.1 and §4.6.3 flood ceilings: consecutive empty records and
@@ -197,6 +204,39 @@ fn afterCloseReceived(self: *const ServerHandshake) State {
     };
 }
 
+/// What a server asks of a client, and what it does with the answer.
+///
+/// The split is the same one `ClientHandshake` draws in the other
+/// direction and DESIGN.md §1 states: possession is ours — the leaf's
+/// own key must have signed §4.4.3's transcript — and identity is the
+/// embedder's, through `chain_verifier`. A server that configures no
+/// verifier has proven the client holds the key in that certificate and
+/// nothing whatever about who the client is.
+pub const ClientAuth = struct {
+    /// §4.4.2.1: what to do when the client answers with an empty
+    /// certificate_list, which is its way of saying it has none.
+    ///
+    /// True aborts with `certificate_required`, which is the alert §6.2
+    /// added for exactly this. False completes the handshake with an
+    /// unauthenticated client — the "request but do not require" shape,
+    /// which is only safe if the embedder then *checks* `peer.verified`
+    /// rather than assuming it. Defaulting to true is the safer of the
+    /// two to get wrong.
+    require: bool = true,
+    /// §4.3.2's mandatory `signature_algorithms`: what we advertise in
+    /// the request and, because §4.4.3 makes the two the same promise,
+    /// what we will accept in the answer.
+    verify_schemes: []const backend.SignatureScheme =
+        &client_messages.signature_schemes_default,
+    /// Identity, the embedder's. Shown the client's chain, leaf first,
+    /// while the bytes are live; returning false aborts.
+    chain_verifier: ?peer_certificate.ChainVerifier = null,
+    /// `.insecure_no_verification` accepts any certificate without
+    /// checking possession. For tests and pinned transports, and named
+    /// so nobody reaches for it by accident.
+    policy: peer_certificate.Policy = .leaf_signature,
+};
+
 pub const Config = struct {
     credentials: *const Credentials,
     /// Embedder-supplied entropy; zssl generates none.
@@ -233,6 +273,11 @@ pub const Config = struct {
     /// key has misconfigured something, and a handshake that says so is
     /// better than one that quietly signs with the other curve.
     signing_schemes: ?[]const u16 = null,
+    /// §4.3.2's CertificateRequest, and everything that follows from
+    /// sending one. Null never asks, which is every connection that is
+    /// not mTLS — and is the default because a server that asks without
+    /// meaning it gets certificates it then has to decide about.
+    client_auth: ?ClientAuth = null,
     /// Caller-owned space for handshake-message reassembly (client side
     /// of the conversation). A ClientHello budget: 8 KiB is generous.
     reassembly: []u8,
@@ -410,6 +455,7 @@ pub const Event = union(enum) {
 };
 
 pub const Error = backend.SignError || protect.Error || handshake.Assembler.Error ||
+    peer_certificate.Error ||
     client_hello.Error || alert.Error || error{
     /// The record or message is legal TLS arriving at the wrong moment.
     UnexpectedMessage,
@@ -442,6 +488,12 @@ pub const Error = backend.SignError || protect.Error || handshake.Assembler.Erro
     IllegalRetry,
     /// The client's Finished MAC did not verify (§4.4.4).
     DecryptError,
+    /// §4.4.2.1: we sent a CertificateRequest and the client answered
+    /// with an empty certificate_list, under a `client_auth` that
+    /// requires one. The alert is `certificate_required`, which exists
+    /// for this and says something `bad_certificate` does not: there was
+    /// no certificate to judge, rather than one we judged badly.
+    CertificateRequired,
     /// The peer sent a fatal alert; the connection is over.
     PeerAlert,
     /// A KeyUpdate whose body breaks §4.6.3's one-byte grammar.
@@ -487,6 +539,7 @@ pub fn init(config: *const Config) ServerHandshake {
         // embedder reads it before then.
         .key_share_group = backend.Group.fromWire(config.groups[0]).?,
         .signature_scheme = config.credentials.signer.supported()[0],
+        .peer = .{},
         .ticket_permitted = false,
         .assembler = handshake.Assembler.init(config.reassembly),
         .ladder = null,
@@ -1231,6 +1284,19 @@ fn buildFlightPlaintext(
     // EncryptedExtensions and Finished — no certificate, nothing signed.
     var chain_bytes: usize = 0;
     if (!self.resumed) {
+        // §4.3.2, before our own Certificate and after
+        // EncryptedExtensions. Only on a full handshake: "servers which
+        // are authenticating with a PSK MUST NOT send the
+        // CertificateRequest message in the main handshake", and a
+        // resumed session is authenticated by the PSK.
+        if (self.config.client_auth) |auth| {
+            const request = server_messages.certificateRequest(
+                flight[builder.index..],
+                auth.verify_schemes,
+            );
+            builder.index += request.len;
+            arm.absorbMessage(request);
+        }
         const chain = server_messages.certificateChain(
             flight[builder.index..],
             self.config.credentials.chain(),
@@ -1424,15 +1490,84 @@ fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []c
         return null;
     }
     if (self.state != .awaiting_finished) return self.nextPostHandshake(arm, out);
-    const message = (try self.assembler.next()) orelse return null;
-    if (message.messageType() != .finished) return error.UnexpectedMessage;
-    // The Finished is the last thing in its flight; anything packed
-    // after it is arriving before the keys that would carry it.
-    if (!self.assembler.empty()) return error.UnexpectedMessage;
-    if (!arm.verifyClientFinished(message)) return error.DecryptError;
-    try arm.startApplicationKeys(message);
-    self.state = .connected;
-    return .connected;
+    // §4.3.2's answer, then §4.4.4's Finished. Without client auth the
+    // first two arms are unreachable and this is the single-message
+    // shape it has always been.
+    var messages_seen: u8 = 0;
+    while (try self.assembler.next()) |message| : (messages_seen += 1) {
+        assert(messages_seen < 3); // Certificate, CertificateVerify, Finished.
+        switch (message.messageType() orelse return error.UnexpectedMessage) {
+            .certificate => {
+                // A certificate we never asked for. §4.4.2 sends one only
+                // in answer to a CertificateRequest, so this is a client
+                // answering a question we did not put.
+                const auth = self.config.client_auth orelse return error.UnexpectedMessage;
+                if (self.peer.seen) return error.UnexpectedMessage;
+                try self.peer.capture(message.body(), .{
+                    .policy = auth.policy,
+                    .chain_verifier = auth.chain_verifier,
+                    // §4.4.2: an empty certificate_list is how a client
+                    // says it has none. Whether that ends the handshake
+                    // is `require`'s call, at the Finished below.
+                    .allow_empty = true,
+                });
+                arm.absorbClientAuth(message.bytes);
+            },
+            .certificate_verify => {
+                const auth = self.config.client_auth orelse return error.UnexpectedMessage;
+                // §4.4.3 signs what §4.4.2 presented, so the order is
+                // fixed — and a client that sent an empty list has
+                // nothing to sign with.
+                if (!self.peer.seen or self.peer.empty) return error.UnexpectedMessage;
+                try self.peer.verify(message, .{
+                    .policy = auth.policy,
+                    .side = .client,
+                    // The transcript through the client's Certificate and
+                    // no further: `absorbClientAuth` has taken that one
+                    // and not this one, which is the content §4.4.3
+                    // signs.
+                    .transcript_hash = &arm.transcriptHash(),
+                    .accepted = auth.verify_schemes,
+                });
+                arm.absorbClientAuth(message.bytes);
+            },
+            .finished => {
+                if (self.config.client_auth) |auth| try self.checkClientAuth(auth);
+                // The Finished is the last thing in its flight; anything
+                // packed after it is arriving before the keys that would
+                // carry it.
+                if (!self.assembler.empty()) return error.UnexpectedMessage;
+                if (!arm.verifyClientFinished(message)) return error.DecryptError;
+                try arm.startApplicationKeys(message);
+                self.state = .connected;
+                return .connected;
+            },
+            else => return error.UnexpectedMessage,
+        }
+    }
+    return null;
+}
+
+/// §4.4.2.1, at the moment the client says it is done talking: did we get
+/// what we asked for?
+///
+/// Checked at the Finished rather than when the Certificate arrives,
+/// because a client declining is not an error until it stops having the
+/// chance to change its mind — and because a client that sends no
+/// Certificate at all has to be caught somewhere, which is here.
+fn checkClientAuth(self: *const ServerHandshake, auth: ClientAuth) Error!void {
+    // §4.3.2 forbids the request under a PSK, so we never sent one and
+    // there is nothing to have answered.
+    if (self.resumed) return;
+    if (!self.peer.seen or self.peer.empty) {
+        if (auth.require) return error.CertificateRequired;
+        return;
+    }
+    // A certificate arrived and its signature did not verify — or never
+    // came. Either way the client has not proven possession, and
+    // `.insecure_no_verification` is the only configuration that says
+    // not to care.
+    if (auth.policy == .leaf_signature and !self.peer.verified) return error.BadCertificate;
 }
 
 /// One post-handshake message, already pulled from the assembler. Null
@@ -1946,6 +2081,16 @@ fn LadderOf(comptime suite: CipherSuite) type {
         /// EndOfEarlyData (§4.5) has been absorbed: the early keys have
         /// nothing left to open, and the client's Finished now MACs a
         /// transcript one message longer than the server's did.
+        /// §4.4: the client's Certificate and CertificateVerify are in
+        /// the context its Finished MACs, so absorbing one moves that
+        /// hash forward. `finished_hash` does *not* move: §7.1's
+        /// application secrets are fixed at the server Finished, and
+        /// mixing these in would derive keys the client never derived.
+        fn absorbClientAuth(self: *Self, message: []const u8) void {
+            self.transcript.update(message);
+            self.client_finished_hash = self.transcriptHash();
+        }
+
         fn finishEarlyData(self: *Self) void {
             assert(self.early_recv != null);
             self.early_recv.?.deinit();
