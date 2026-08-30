@@ -390,6 +390,21 @@ pub const Event = union(enum) {
     connected,
     /// Decrypted application bytes, sliced from `out`.
     application_data: []const u8,
+    /// Decrypted **0-RTT** application bytes, sliced from `out`. Only a
+    /// server that opted into §8's machinery ever sees this: without
+    /// `now_ms` and a `strike_register` early data is skipped, never
+    /// accepted, and this variant is unreachable.
+    ///
+    /// A separate variant rather than a flag on `application_data`,
+    /// because Appendix E.5 is a warning an embedder has to *act* on and
+    /// a bool is a thing one forgets to read. These bytes arrived before
+    /// the client proved liveness: they are not forward secret, and §8's
+    /// strike register bounds replay without eliminating it. An
+    /// application that answers them must be one whose 0-RTT profile
+    /// says it may — idempotent requests, no state change — and an
+    /// application that has not thought about it should treat this arm
+    /// as an error. Making the switch exhaustive is how it gets asked.
+    early_data: []const u8,
     /// The peer ended the connection cleanly.
     closed,
 };
@@ -1376,7 +1391,11 @@ fn acceptEarlyData(self: *ServerHandshake, plaintext: []const u8) Error!?Event {
     assert(self.state == .awaiting_end_of_early_data);
     self.early_data_bytes +|= @intCast(plaintext.len);
     if (self.early_data_bytes > self.early_data_bytes_max) return error.TooMuchEarlyData;
-    return .{ .application_data = plaintext };
+    // Appendix E.5, on the event surface rather than in a comment: these
+    // bytes are replayable and not forward secret, and the embedder has
+    // to be able to tell. Before this variant existed they arrived as
+    // `application_data` and nothing distinguished them.
+    return .{ .early_data = plaintext };
 }
 
 fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []const u8, out: []u8) Error!?Event {

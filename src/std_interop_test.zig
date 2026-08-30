@@ -76,6 +76,10 @@ const Duplex = struct {
             if (try duplex.server.handleRecord(one, &duplex.server_out)) |event| switch (event) {
                 .send => |reply| duplex.enqueue(reply),
                 .connected => duplex.server_connected = true,
+                // This duplex never offers a PSK, so no early data can
+                // reach it; an arm that fires would be a bug in the
+                // machine rather than a shape this test drives.
+                .early_data => return error.UnexpectedEarlyData,
                 .application_data => |plaintext| {
                     const target = duplex.application_received[duplex.application_received_bytes..];
                     std.debug.assert(plaintext.len <= target.len);

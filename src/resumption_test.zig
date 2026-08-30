@@ -828,7 +828,7 @@ test "§4.2.10 end to end: early data is accepted, read, and the session complet
     @memcpy(flight_storage[0..flight.send.len], flight.send);
     const flight_bytes = flight_storage[0..flight.send.len];
     const early_event = (try harness.server.handleRecord(early, &server_out)).?;
-    try testing.expectEqualSlices(u8, "GET /0rtt", early_event.application_data);
+    try testing.expectEqualSlices(u8, "GET /0rtt", early_event.early_data);
     try testing.expectEqual(@as(u32, 9), harness.server.early_data_bytes);
 
     // The client's flight carries EndOfEarlyData and then its Finished,
@@ -998,7 +998,7 @@ test "§4.6.1: early data past the ticket's own limit ends the connection" {
     try testing.expect(harness.server.early_data_accepted);
     // Exactly the limit is inside it.
     const event = (try harness.server.handleRecord(first, &server_out)).?;
-    try testing.expectEqualSlices(u8, "12345678", event.application_data);
+    try testing.expectEqualSlices(u8, "12345678", event.early_data);
     try testing.expectEqual(@as(u32, 8), harness.server.early_data_bytes);
     // One byte past is not.
     try testing.expectError(
@@ -1165,7 +1165,7 @@ test "§4.2.10 end to end: our client offers 0-RTT and our server takes it" {
     // The server reads what the client sent, under a secret neither of
     // them exchanged.
     const early_event = (try harness.server.handleRecord(early, &server_out)).?;
-    try testing.expectEqualSlices(u8, "GET /0rtt HTTP/1.1\r\n\r\n", early_event.application_data);
+    try testing.expectEqualSlices(u8, "GET /0rtt HTTP/1.1\r\n\r\n", early_event.early_data);
 
     // And the handshake completes, which only works if both ends agree
     // that EndOfEarlyData belongs in the client Finished's transcript
@@ -1199,6 +1199,17 @@ test "§4.2.10 end to end: our client offers 0-RTT and our server takes it" {
     try testing.expectEqual(std.meta.activeTag(final.?), .connected);
     try testing.expectEqual(ServerHandshake.State.connected, harness.server.state);
     try testing.expect(harness.server.resumed);
+
+    // Appendix E.5 on one connection: the same bytes, sent twice, arrive
+    // under two different tags. The early ones were replayable and not
+    // forward secret; these are neither, and an embedder that answers
+    // both has said so in two places rather than none. Asserting the
+    // pair together is the point — either tag alone would still pass if
+    // the machine reported everything as one kind.
+    const late = try client.sendApplicationData("GET /0rtt HTTP/1.1\r\n\r\n", &client_out);
+    const late_event = (try harness.server.handleRecord(late, &server_out)).?;
+    try testing.expectEqual(std.meta.activeTag(late_event), .application_data);
+    try testing.expectEqualSlices(u8, "GET /0rtt HTTP/1.1\r\n\r\n", late_event.application_data);
 }
 
 /// A resumed client offering 0-RTT on the terms a test picks. Split out

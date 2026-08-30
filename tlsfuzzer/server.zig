@@ -356,7 +356,11 @@ const Pump = struct {
                 .send => |bytes| try pump.write(bytes),
                 .connected => {},
                 .closed => return error.PeerClosedDuringHandshake,
-                .application_data => return error.UnexpectedEvent,
+                // This harness never supplies `now_ms` or a strike
+                // register, so §8's gates are all off and early data is
+                // skipped rather than accepted — `early_data` here would
+                // mean the library accepted 0-RTT nobody opted into.
+                .early_data, .application_data => return error.UnexpectedEvent,
             };
         }
     }
@@ -494,6 +498,13 @@ const Pump = struct {
                     },
                     .send => |bytes| try pump.write(bytes),
                     .connected => {},
+                    // Unreachable twice over: §8's gates are off in this
+                    // harness, so no early data is ever accepted, and
+                    // this loop runs past `connected` where none could
+                    // arrive anyway. An error rather than a silent arm,
+                    // because either way round it would mean the machine
+                    // handed us 0-RTT nobody asked for.
+                    .early_data => return error.UnexpectedEvent,
                 }
             }
             // A record that delivered no application data ends the run,

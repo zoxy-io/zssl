@@ -20,6 +20,8 @@ while (event) |ready| : (event = try server.drain(&out)) {
     switch (ready) {
         .send => |bytes| try socket.writeAll(bytes),
         .application_data => |plaintext| try onRequest(plaintext),
+        // 0-RTT bytes: replayable, so a separate arm on purpose.
+        .early_data => return error.NoEarlyDataProfile,
         .connected, .closed => {},
     }
 }
@@ -144,6 +146,11 @@ stream: while (try records.next()) |wire_record| {
             .connected => {},
             // Decrypted application bytes, valid until the next call.
             .application_data => |plaintext| try onRequest(plaintext),
+            // The same bytes, arrived as 0-RTT. A separate arm because
+            // they are replayable and not forward secret: answer them
+            // only if your protocol has a 0-RTT profile that says you
+            // may, and refuse them here if it does not.
+            .early_data => return error.NoEarlyDataProfile,
             // The peer sent close_notify. The label is not decoration —
             // an unlabelled break would leave only the drain loop.
             .closed => break :stream,
@@ -246,8 +253,7 @@ standard suites, x25519/secp256r1/secp384r1, ECDSA P-256/P-384 and
 RSA-PSS, SNI, ALPN, HelloRetryRequest in both directions, PSK
 resumption, 0-RTT, KeyUpdate, and kTLS key export.
 
-Not built: client certificates, RFC 5705 exporters, and a marker on the
-event surface saying which application bytes arrived as 0-RTT. Never:
+Not built: client certificates and RFC 5705 exporters. Never:
 TLS 1.2 and earlier, renegotiation, compression, RSA and DSA key
 exchange, post-handshake client auth, QUIC and DTLS. X.509 chain
 building and RFC 9525 name matching are yours, through

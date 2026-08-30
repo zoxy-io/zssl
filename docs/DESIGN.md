@@ -58,7 +58,9 @@ the four decisions everything else follows from.
   lesson). Scope cut: psk_ke without (EC)DHE is never accepted.
 - **0-RTT**, offered by the client and accepted or declined by the
   server, with §8's anti-replay checked here rather than promised by the
-  embedder. See below.
+  embedder. Accepted bytes arrive as `Event.early_data`, never as
+  `application_data`: Appendix E.5 is a warning the embedder has to act
+  on, and an exhaustive switch is how it gets asked. See below.
 - **SNI and ALPN** reads, with RFC 7301 selection checks client-side.
 - **KeyUpdate** (§4.6.3), living once in `session_keys.zig` and shared
   by both machines: rotation resets the sequence space, and a rotation
@@ -76,10 +78,6 @@ the four decisions everything else follows from.
   they cover initial and resumed exchanges, no-context against
   empty-context, and §7.5's rule that the exporter stays shut while the
   client is sending 0-RTT.
-- **Appendix E.5's early-data marker.** `Event.application_data` does
-  not say whether the bytes arrived as 0-RTT; the embedder infers it
-  from the connection's state. That works and is not the same as being
-  told.
 - **Coverage-guided fuzzing.** The targets exist and run once per build;
   the search does not (§6).
 
@@ -163,6 +161,13 @@ Rejecting 0-RTT was always the separable half and came first: a server
 that declines early data still has to skip past what the client already
 sent, because §5 gives it no way to say no in time (docs/BOGO.md
 finding 14).
+
+Appendix E.5 wants the application to tell early data from ordinary
+data, and it can: accepted 0-RTT arrives as `Event.early_data`, never as
+`application_data`. A separate variant rather than a flag on the
+existing one, because a bool is a thing an embedder forgets to read and
+an exhaustive switch is not. One that has no 0-RTT profile writes that
+arm as an error — the honest answer, and one line.
 
 ## §2 The trust split
 

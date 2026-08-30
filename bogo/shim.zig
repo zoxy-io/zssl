@@ -933,7 +933,13 @@ const Pump = struct {
                 // what BoGo's `ExpectHalfRTTData` blocks waiting for.
                 // Complemented, which is the same reply `exchange` gives
                 // ordinary application data and what `bssl_shim` sends.
-                .application_data => |bytes| {
+                //
+                // `bssl_shim` answers 0-RTT bytes the same way it answers
+                // any other, so this shim does too — one arm, and the
+                // distinction Appendix E.5 asks for is a decision this
+                // embedder makes by writing both cases here rather than
+                // one it can no longer see.
+                .early_data, .application_data => |bytes| {
                     if (bytes.len == 0) continue;
                     assert(bytes.len <= pump.scratch.len);
                     // Copied out first: `bytes` points into `pump.out`,
@@ -961,6 +967,8 @@ const Pump = struct {
                 .send, .connected => |bytes| try pump.write(bytes),
                 .closed => return error.PeerClosedDuringHandshake,
                 .application_data, .ticket => return error.UnexpectedEvent,
+                // `ClientHandshake.Event` has no `early_data`: only a
+                // server ever reads any. Nothing to handle here.
             };
         }
     }
@@ -1014,9 +1022,13 @@ const Pump = struct {
             // still the whole of it.
             .closed => return true,
             .send => |bytes| try pump.write(bytes),
-            // Only the client machine has `ticket`, so the branch is
-            // chosen by the machine's type rather than the tag — the
-            // server arm never analyses a field it lacks.
+            // Only the client machine has `ticket` and only the server
+            // has `early_data`, so the branch is chosen by the machine's
+            // type rather than the tag — the server arm never analyses a
+            // field it lacks, and neither tag can be named here without
+            // breaking the other instantiation. `early_data` reaching
+            // this far *is* an error: 0-RTT arrives before `connected`,
+            // which is `handshakeServer`'s loop, never this one.
             else => if (@TypeOf(machine.*) == ClientHandshake) {
                 captureTicket(machine, event, store);
             } else {
