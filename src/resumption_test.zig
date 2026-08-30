@@ -146,6 +146,14 @@ const Harness = struct {
     server: ServerHandshake,
 
     fn init(harness: *Harness, store: ?*TicketStore) !void {
+        return harness.initWithClientAuth(store, null);
+    }
+
+    fn initWithClientAuth(
+        harness: *Harness,
+        store: ?*TicketStore,
+        client_auth: ?ServerHandshake.ClientAuth,
+    ) !void {
         harness.credentials = try Credentials.load(
             @embedFile("testdata/cert.pem"),
             @embedFile("testdata/key.pem"),
@@ -158,6 +166,7 @@ const Harness = struct {
             .key_share_private = server_key_share_private,
             .reassembly = &harness.reassembly,
             .flight = &harness.flight,
+            .client_auth = client_auth,
             .psk_lookup = if (store) |context| .{
                 .context = context,
                 .lookup = TicketStore.lookup,
@@ -1410,4 +1419,138 @@ fn lastRecordOf(bytes: []const u8) []const u8 {
         index += last.len;
     }
     return last;
+}
+
+test "§4.3.2: a resumed handshake refuses a certificate nobody asked for" {
+    // §4.3.2 forbids a CertificateRequest under a PSK, so a resumed
+    // handshake never asks — and `checkClientAuth` returns early for
+    // exactly that reason. The message arms gated on the *config*
+    // rather than on `resumed`, so a client holding any ticket could
+    // volunteer a self-signed certificate and have `peer.verified` come
+    // out true for an identity nobody requested and `require` never
+    // judged. Worse than silent: the field's own documentation tells an
+    // embedder it may read `peer.verified` on a resumed connection
+    // precisely because client auth is skipped there.
+    //
+    // It takes a hostile client to reach. Ours declines to send one on a
+    // resumed handshake, which is why the first version of this test
+    // passed with the guard removed — the sabotage pass is what caught
+    // that, not the test.
+    var store: TicketStore = .empty;
+
+    var first: Harness = undefined;
+    try first.initWithClientAuth(&store, .{ .require = false });
+    defer first.deinit();
+    var client_one = Client.init(&client_x25519_private, &.{});
+    defer client_one.deinit();
+    try completeHandshake(&first.server, &client_one);
+
+    var ticket_out: [record.wire_record_bytes_max]u8 = undefined;
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    const nonce = [1]u8{0x00};
+    var psk_buffer: [cipher_suite.hash_bytes_max]u8 = undefined;
+    const psk = first.server.resumptionPsk(&nonce, &psk_buffer);
+    store.add("sealed-ticket", psk);
+    const sealed = try first.server.sendNewSessionTicket(&.{
+        .lifetime_s = 3600,
+        .age_add = 0xdeadbeef,
+        .ticket_nonce = &nonce,
+        .ticket = "sealed-ticket",
+    }, &ticket_out);
+    _ = try client_one.absorb(sealed, &client_out);
+    try testing.expectEqual(@as(u8, 1), client_one.ticket_count);
+
+    var second: Harness = undefined;
+    try second.initWithClientAuth(&store, .{ .require = false });
+    defer second.deinit();
+    var client_two = Client.init(&client_x25519_private, &.{
+        .resume_with = &client_one.tickets[0],
+        .volunteer_certificate = true,
+    });
+    defer client_two.deinit();
+
+    // The server resumes, so it sent no CertificateRequest. The
+    // certificate that arrives anyway is §4.4.2's "if and only if"
+    // broken, and must not become an identity.
+    try testing.expectError(error.UnexpectedMessage, completeHandshake(&second.server, &client_two));
+    try testing.expect(!second.server.peer.verified);
+    try testing.expect(!second.server.peer.seen);
+}
+
+test "§4.2.10: an accepted offer whose keys were never built errors, not panics" {
+    // `start` writes the early_data extension before `startEarlyKeys`
+    // runs, and deliberately leaves the offer standing if the protector
+    // cannot be built — the comment there reasons that a server
+    // accepting then "costs us one round trip". It did not: nothing
+    // downstream fell back, and `completeHandshake` unwrapped
+    // `early_send.?` on the strength of `early_data_accepted` alone. A
+    // *compliant* server taking the offer panicked the client.
+    //
+    // `AeadKey.init` failing is what produces that state — libcrypto
+    // allocating from the fixed heap DESIGN.md §3 describes, under load.
+    // It cannot be induced from here, so the state is built directly:
+    // the offer stands, the keys are gone, and the server says yes.
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+
+    var registry: [anti_replay.StrikeRegister.probe_max]anti_replay.StrikeRegister.Entry =
+        @splat(.free);
+    var register: anti_replay.StrikeRegister = .{ .entries = &registry };
+    var store = EarlyDataFixture.store(1024, .aes_128_gcm_sha256);
+    var harness: Harness = undefined;
+    try harness.initLookup(.{ .context = &store, .lookup = EarlyDataStore.lookup });
+    defer harness.deinit();
+    harness.server.config.now_ms = EarlyDataFixture.now_ms;
+    harness.server.config.strike_register = &register;
+
+    var reassembly: [16 * 1024]u8 = undefined;
+    var resumption: ClientHandshake.Resumption = .{
+        .identity = "ticket",
+        .obfuscated_age = 250 +% EarlyDataFixture.age_add,
+        .psk = undefined,
+        .psk_bytes = 32,
+        .early_data = .{ .bytes_max = 1024, .suite = .aes_128_gcm_sha256 },
+    };
+    @memset(&resumption.psk, 0);
+    @memcpy(resumption.psk[0..EarlyDataFixture.psk.len], &EarlyDataFixture.psk);
+    var client = ClientHandshake.init(&.{
+        .client_random = .{0x2c} ** 32,
+        .x25519_private = client_x25519_private,
+        .session_id = &(.{0x33} ** 32),
+        .server_name = "spike.zoxy.test",
+        .certificate_policy = .insecure_no_verification,
+        .resume_session = resumption,
+        .reassembly = &reassembly,
+    });
+    defer client.deinit();
+
+    const hello = client.start(&client_out);
+    // Exactly what a failed `startEarlyKeys` leaves: the extension is on
+    // the wire and the protector is not.
+    try testing.expect(client.early_data_offered);
+    client.early_send.?.deinit();
+    client.early_send = null;
+
+    var hello_storage: [record.wire_record_bytes_max]u8 = undefined;
+    @memcpy(hello_storage[0..hello.len], hello);
+    const flight = (try harness.server.handleRecord(hello_storage[0..hello.len], &server_out)).?;
+    try testing.expect(harness.server.early_data_accepted);
+
+    var flight_storage: [2 * record.wire_record_bytes_max]u8 = undefined;
+    @memcpy(flight_storage[0..flight.send.len], flight.send);
+    const flight_bytes = flight_storage[0..flight.send.len];
+
+    // The server accepted. §4.5's EndOfEarlyData has to go out under
+    // keys we do not have, so there is no honest flight to send — and
+    // an error is the answer, not a panic.
+    var index: usize = 0;
+    var count: u8 = 0;
+    const outcome = while (index < flight_bytes.len) : (count += 1) {
+        try testing.expect(count < 8);
+        const length = std.mem.readInt(u16, flight_bytes[index + 3 ..][0..2], .big);
+        const one = flight_bytes[index..][0 .. record.header_bytes + length];
+        _ = client.handleRecord(one, &client_out) catch |err| break err;
+        index += one.len;
+    } else error.NoError;
+    try testing.expectEqual(error.LibcryptoFailed, outcome);
 }

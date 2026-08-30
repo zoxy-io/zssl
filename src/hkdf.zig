@@ -148,13 +148,20 @@ pub fn Hkdf(comptime Hash: type) type {
             var block: [prk_bytes]u8 = undefined;
             defer std.crypto.secureZero(u8, &block);
             var filled: usize = 0;
-            var counter: u8 = 1;
+            // `u16`, not the `u8` it is written as. The continue
+            // expression runs once more after the block that fills
+            // `out`, so a request needing exactly 255 blocks took the
+            // counter to 256 and trapped — at precisely the ceiling the
+            // assertion above calls legal. An assertion that promises
+            // what the loop cannot deliver is worse than none.
+            var counter: u16 = 1;
             while (filled < out.len) : (counter += 1) {
+                assert(counter <= 255);
                 var mac = Hmac.init(prk);
                 // T(0) is empty; every later block feeds back the last.
                 if (counter > 1) mac.update(&block);
                 mac.update(written);
-                mac.update(&[1]u8{counter});
+                mac.update(&[1]u8{@intCast(counter)});
                 mac.final(&block);
                 const take = @min(@as(usize, prk_bytes), out.len - filled);
                 @memcpy(out[filled..][0..take], block[0..take]);
@@ -199,6 +206,21 @@ test "§7.5: the multi-block ladder agrees with std's HKDF-Expand" {
         std.crypto.kdf.hkdf.HkdfSha256.expand(theirs[0..bytes], written, vectors.early_secret);
 
         try std.testing.expectEqualSlices(u8, theirs[0..bytes], ours[0..bytes]);
+    }
+}
+
+test "§7.5: the ladder reaches the ceiling its assertion claims" {
+    // 255 blocks exactly — `255 * prk_bytes` is what `expandLabelLong`
+    // asserts is legal, and the loop's counter used to trap one
+    // increment past the last block it needed. Three lengths, because
+    // the bug lived in the boundary rather than in the arithmetic.
+    const vectors = @import("rfc8448_vectors.zig");
+    var empty_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&.{}, &empty_hash, .{});
+    var out: [255 * 32]u8 = undefined;
+    for ([_]usize{ 255 * 32, 255 * 32 - 1, 254 * 32 + 1 }) |bytes| {
+        HkdfSha256.expandLabelLong(&vectors.early_secret, "label", &empty_hash, out[0..bytes]);
+        try std.testing.expect(!std.mem.allEqual(u8, out[0..bytes], 0));
     }
 }
 

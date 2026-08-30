@@ -70,6 +70,11 @@ pub const PeerCertificate = struct {
     /// the caller, which is the only side that knows which it is talking
     /// to.
     empty: bool = false,
+    /// A CertificateVerify arrived, whatever we concluded from it.
+    /// Distinct from `verified`, which stays false under
+    /// `.insecure_no_verification` — so a caller policing §4.4.3's "one
+    /// per flight" cannot key off `verified` and must read this.
+    verify_seen: bool = false,
     /// A CertificateVerify verified against `key`.
     verified: bool = false,
     /// The scheme it verified under, for the embedder to read.
@@ -175,6 +180,10 @@ pub const PeerCertificate = struct {
 
     /// §4.4.3, taken against the *presented* leaf: possession, not identity.
     pub fn verify(self: *PeerCertificate, message: handshake.Message, options: VerifyOptions) Error!void {
+        // Recorded before the policy check, because a caller counting
+        // messages needs to know one arrived even when we decline to
+        // look at it.
+        self.verify_seen = true;
         if (options.policy == .insecure_no_verification) return;
         // A leaf was captured — the flight ordering in `drainFlight` guarantees
         // it. Deliberately *not* an assertion about the key's length: that is a
