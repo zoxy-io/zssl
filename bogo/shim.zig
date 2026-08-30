@@ -45,7 +45,15 @@ const version_tls13: u16 = 0x0304;
 const group_x25519: u16 = 29;
 
 /// A session that needs more records than this is wedged, not slow.
-const records_per_phase_max: u32 = 4096;
+///
+/// 16384 rather than 4096 since client authentication: a mutual flight
+/// carries a chain and a signature on top of the Finished, and BoGo
+/// splits handshake messages one byte to a record. The old bound was
+/// sized for a flight with two fewer messages in it and refused
+/// `ClientAuth-Server-TLS13-TLS-Sync-SplitHandshakeRecords` on length
+/// alone. Still a refusal rather than an assertion: how many records a
+/// flight takes is the peer's choice, not our invariant.
+const records_per_phase_max: u32 = 16384;
 
 /// The most keying material one case asks for. BoGo's largest request is
 /// 1024 bytes; the headroom is so a corpus bump does not turn a bigger
@@ -192,6 +200,12 @@ const Connection = struct {
     expect_session_miss: bool = false,
     expect_no_session: bool = false,
 
+    /// §4.3.2, as BoGo asks for it. `-require-any-client-certificate`
+    /// asks and refuses an empty answer; `-verify-peer` asks and accepts
+    /// one, which is §4.4.2.1's `require` in its two positions.
+    require_client_certificate: bool = false,
+    verify_peer: bool = false,
+
     no_ticket: bool = false,
     /// `-enable-early-data`: the embedder's opt-in, which for this shim
     /// means minting tickets that advertise 0-RTT and answering
@@ -315,7 +329,8 @@ fn flagArity(name: []const u8) ?Arity {
         "-expect-session-miss",      "-expect-no-session",  "-decline-alpn",
         "-no-tls1",                  "-no-tls11",           "-no-tls12",
         "-expect-no-hrr",            "-enable-early-data",  "-expect-accept-early-data",
-        "-expect-reject-early-data", "-use-export-context",
+        "-expect-reject-early-data", "-use-export-context", "-require-any-client-certificate",
+        "-verify-peer",
     };
     for (with_value) |candidate| if (std.mem.eql(u8, name, candidate)) return .one;
     for (without_value) |candidate| if (std.mem.eql(u8, name, candidate)) return .none;
@@ -347,6 +362,10 @@ fn applyFlag(connection: *Connection, name: []const u8, value: ?[]const u8) Pars
         if (connection.curve_count == connection.curves.len) return unimplemented(name);
         connection.curves[connection.curve_count] = group;
         connection.curve_count += 1;
+    } else if (std.mem.eql(u8, name, "-require-any-client-certificate")) {
+        connection.require_client_certificate = true;
+    } else if (std.mem.eql(u8, name, "-verify-peer")) {
+        connection.verify_peer = true;
     } else if (std.mem.eql(u8, name, "-verify-prefs")) {
         // Repeatable, like `-curves`, and recorded rather than acted on:
         // whether a scheme is one we verify is a question for the role.
@@ -452,7 +471,14 @@ fn applyFlag(connection: *Connection, name: []const u8, value: ?[]const u8) Pars
 /// resume: server side, the PSK behind the identity we issued; client
 /// side, the ticket we captured and the PSK we derived for it.
 const TicketStore = struct {
-    identity: [256]u8 = undefined,
+    /// 2048, not 256. A ticket is opaque to the client and its size is
+    /// the *server's* choice: BoGo's runner mints 829 bytes once a
+    /// client certificate is in the session, and the old cap dropped
+    /// those on the floor. Silently — which is how
+    /// `CertificateRequestInResumption` presented as "didResume is
+    /// false" with no error anywhere, and cost an instrumented run to
+    /// find.
+    identity: [2048]u8 = undefined,
     identity_bytes: u16 = 0,
     psk: [cipher_suite.hash_bytes_max]u8 = undefined,
     psk_bytes: u8 = 0,
@@ -479,6 +505,9 @@ const TicketStore = struct {
     /// Tickets seen on the exchange in progress, which is what
     /// `-expect-no-session` asks about — not what an earlier one left.
     tickets_this_exchange: u32 = 0,
+    /// A ticket arrived that `identity` could not hold, so this session
+    /// cannot resume for a reason that is ours rather than the peer's.
+    oversized_ticket: bool = false,
 
     fn lookup(
         context: *anyopaque,
@@ -585,7 +614,7 @@ fn runExchange(
     if (connection.is_server) {
         try runServer(io, arena, connection, store, pump);
     } else {
-        try runClient(io, connection, store, pump);
+        try runClient(io, arena, connection, store, pump);
     }
 }
 
@@ -652,6 +681,14 @@ fn runServer(
         .alpn = connection.select_alpn,
         .groups = groups,
         .signing_schemes = signing_schemes,
+        // Identity stays unconfigured on purpose: BoGo's client
+        // certificates are its own fixtures and no chain we could build
+        // would judge them. Possession is what this shim proves, which
+        // is what DESIGN.md §1 says the library is for.
+        .client_auth = if (connection.require_client_certificate or connection.verify_peer)
+            .{ .require = connection.require_client_certificate }
+        else
+            null,
         .reassembly = &handshake_reassembly,
         .flight = &flight_storage,
         // A real clock, which an embedder may read and `src/` may not
@@ -717,6 +754,7 @@ fn runServer(
 
 fn runClient(
     io: Io,
+    arena: std.mem.Allocator,
     connection: *const Connection,
     store: *TicketStore,
     pump: *Pump,
@@ -730,9 +768,31 @@ fn runClient(
     for (groups) |group| {
         if (group == group_x25519) break;
     } else return unimplemented("-curves:no-x25519");
-    // On a client run this configures the *client's* certificate, which
-    // needs a CertificateRequest we never answer (DESIGN.md §1).
+    // `-signing-prefs` narrows which scheme the *client* certificate
+    // signs with. `ClientHandshake` picks from the intersection of its
+    // key and the server's request and takes no preference of its own,
+    // so a case naming one is asking for a choice we do not expose.
     if (connection.signing_pref_count >= 1) return unimplemented("-signing-prefs");
+
+    // §4.3.2's answer. On a client run `-cert-file` is the *client's*
+    // certificate, which is the same pair of flags the server role reads
+    // for its own — BoGo does not distinguish them, and neither does
+    // `Credentials`.
+    var client_chain_storage: [Credentials.chain_bytes_max]u8 = undefined;
+    var client_credentials: ?Credentials = null;
+    defer if (client_credentials) |*credentials| credentials.deinit();
+    if (connection.cert_path) |cert_path| {
+        const key_path = connection.key_path orelse return unimplemented("-key-file");
+        const cert_pem = try readFile(io, arena, cert_path);
+        const key_pem = try readFile(io, arena, key_path);
+        client_credentials = Credentials.load(cert_pem, key_pem, &client_chain_storage, false) catch |err| switch (err) {
+            // ECDSA signing only, by embedder policy — the same decline
+            // the server role makes for the same reason.
+            error.UnsupportedKey => return unimplemented("-cert-file:not-ecdsa"),
+            else => return err,
+        };
+    }
+    var client_auth_flight: [Credentials.chain_bytes_max + 1024]u8 = undefined;
     var verify_storage: [verify_schemes_max]zssl.backend.SignatureScheme = undefined;
     const verify_schemes = configuredVerifySchemes(connection, &verify_storage) orelse
         return unimplemented("-verify-prefs");
@@ -765,6 +825,8 @@ fn runClient(
         .server_name = connection.host_name,
         .groups = groups,
         .verify_schemes = verify_schemes,
+        .client_credentials = if (client_credentials) |*credentials| credentials else null,
+        .client_auth_flight = &client_auth_flight,
         .alpn_protocols = offered,
         // Possession, not identity: the leaf's own key must have signed
         // the CertificateVerify. Chain building and RFC 9525 names stay
@@ -793,6 +855,7 @@ fn runClient(
     try writeExportedMaterial(pump, &client, connection);
 
     try pump.exchange(&client, connection, store);
+    if (store.oversized_ticket) return error.TicketTooLargeForShim;
     if (connection.expect_no_session and store.tickets_this_exchange >= 1) {
         return error.UnexpectedTicket;
     }
@@ -1218,7 +1281,14 @@ const Pump = struct {
 fn captureTicket(machine: anytype, event: anytype, store: *TicketStore) void {
     const ticket = event.ticket;
     store.tickets_this_exchange += 1;
-    if (ticket.ticket.len > store.identity.len) return;
+    // Loud, not silent. Dropping a ticket makes the next exchange a full
+    // handshake, and a case that expected resumption then fails with no
+    // error to trace — the shim's own limit reported as the library's
+    // behaviour. If this ever fires, raise the bound.
+    if (ticket.ticket.len > store.identity.len) {
+        store.oversized_ticket = true;
+        return;
+    }
     @memcpy(store.identity[0..ticket.ticket.len], ticket.ticket);
     store.identity_bytes = @intCast(ticket.ticket.len);
     store.psk_bytes = @intCast(machine.resumptionPsk(ticket.nonce, &store.psk).len);
@@ -1328,6 +1398,11 @@ fn alertFor(err: anyerror) ?alert.Description {
         // never offered, or a malformed one, is looking at an illegal
         // parameter — which is the alert the far side is entitled to read.
         error.NoApplicationProtocol => .no_application_protocol,
+        // §4.4.2.1's own alert, and the reason it exists: "there was no
+        // certificate" is not the same message as "the certificate was
+        // bad". Without this arm the error fell to the catch-all and the
+        // peer read a reset instead of a reason.
+        error.CertificateRequired => .certificate_required,
         error.BadAlpn => .illegal_parameter,
         // Our side broke, not theirs.
         error.SequenceExhausted,
