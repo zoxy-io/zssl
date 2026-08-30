@@ -167,6 +167,13 @@ const Connection = struct {
     /// `-expect-peer-signature-algorithm`: the scheme the peer must have
     /// signed its CertificateVerify with.
     expect_peer_signature_algorithm: ?u16 = null,
+    /// The schemes `-signing-prefs` named, in preference order, as wire
+    /// code points. Passed through whole: `Config.signing_schemes` takes
+    /// wire values precisely so a case naming a scheme our key cannot
+    /// produce runs and earns the handshake_failure it expects, instead
+    /// of being declined for a type that could not hold it.
+    signing_prefs: [16]u16 = undefined,
+    signing_pref_count: u8 = 0,
 
     expect_version: ?u16 = null,
     expect_curve_id: ?u16 = null,
@@ -287,7 +294,7 @@ fn flagArity(name: []const u8) ?Arity {
         "-curves",                          "-advertise-alpn",           "-select-alpn",
         "-expect-alpn",                     "-host-name",                "-expect-curve-id",
         "-read-size",                       "-expect-early-data-reason", "-verify-prefs",
-        "-expect-peer-signature-algorithm",
+        "-expect-peer-signature-algorithm", "-signing-prefs",
     };
     const without_value = [_][]const u8{
         "-ipv6",                     "-server",             "-shim-writes-first",
@@ -334,6 +341,11 @@ fn applyFlag(connection: *Connection, name: []const u8, value: ?[]const u8) Pars
         if (connection.verify_pref_count == connection.verify_prefs.len) return unimplemented(name);
         connection.verify_prefs[connection.verify_pref_count] = scheme;
         connection.verify_pref_count += 1;
+    } else if (std.mem.eql(u8, name, "-signing-prefs")) {
+        const scheme = std.fmt.parseInt(u16, value.?, 10) catch return error.BadFlagValue;
+        if (connection.signing_pref_count == connection.signing_prefs.len) return unimplemented(name);
+        connection.signing_prefs[connection.signing_pref_count] = scheme;
+        connection.signing_pref_count += 1;
     } else if (std.mem.eql(u8, name, "-expect-peer-signature-algorithm")) {
         connection.expect_peer_signature_algorithm =
             std.fmt.parseInt(u16, value.?, 10) catch return error.BadFlagValue;
@@ -601,12 +613,17 @@ fn runServer(
     var strike_entries: [anti_replay.StrikeRegister.probe_max]anti_replay.StrikeRegister.Entry =
         @splat(.free);
     var strike_register: anti_replay.StrikeRegister = .{ .entries = &strike_entries };
+    const signing_schemes: ?[]const u16 = if (connection.signing_pref_count == 0)
+        null
+    else
+        connection.signing_prefs[0..connection.signing_pref_count];
     var server = ServerHandshake.init(&.{
         .credentials = &credentials,
         .server_random = entropy[0..32].*,
         .key_share_private = entropy[32..80].*,
         .alpn = connection.select_alpn,
         .groups = groups,
+        .signing_schemes = signing_schemes,
         .reassembly = &handshake_reassembly,
         .flight = &flight_storage,
         // A real clock, which an embedder may read and `src/` may not
@@ -684,6 +701,9 @@ fn runClient(
     for (groups) |group| {
         if (group == group_x25519) break;
     } else return unimplemented("-curves:no-x25519");
+    // On a client run this configures the *client's* certificate, which
+    // needs a CertificateRequest we never answer (DESIGN.md §1).
+    if (connection.signing_pref_count >= 1) return unimplemented("-signing-prefs");
     var verify_storage: [verify_schemes_max]zssl.backend.SignatureScheme = undefined;
     const verify_schemes = configuredVerifySchemes(connection, &verify_storage) orelse
         return unimplemented("-verify-prefs");

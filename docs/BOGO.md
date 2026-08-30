@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 348 passed, 0 failed, 6835 declined by the shim (89), floor 348
+bogo: 367 passed, 0 failed, 6795 declined by the shim (89), floor 367
 bogo: PASS
 ```
 
@@ -41,9 +41,10 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**348 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. It was 324 until
-the client could report and restrict its signature algorithms
+**367 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. It was 348
+until the server's signing preference could be narrowed (finding 20),
+324 until the client could report and restrict its signature algorithms
 (finding 19), and 278 until
 the client could answer a HelloRetryRequest: a single-group client that
 refused every retry structurally kept 26 patterns declined, and
@@ -78,7 +79,7 @@ extension block, and 143 until §4.6.3's update requests were coalesced, and
 either gets fixed or gets an entry in `DisabledTests` with a one-line
 reason. There are no silent skips.
 
-**6835 declined** — 86% of the corpus. The shim exited 89, PORTING.md's
+**6795 declined** — 86% of the corpus. The shim exited 89, PORTING.md's
 "unimplemented", and the runner counted the case without running it.
 That number is large enough to be the first thing anyone asks about, so
 here is what it is made of. Counting each case by the *first* thing the
@@ -193,12 +194,13 @@ Three bugs, fixed in this slice:
    falsifies. The floor is now the encoded chain's own size.
 
 Twelve more were open, and every one that was a defect is now fixed: 1,
-2, 3, 4, 5, 6, 7, 9, 10 and 12. Three findings still carry ledger
-entries, 8 suppressed cases between them — 5 under finding 10, 2 under
-8, 1 under 11 — and **none of them is an OPEN GAP**. Finding 8 is two
-divergences we intend to keep, 11 is a documented non-defect, and
-finding 10's remaining 5 are a scope decision filed under its number,
-which is why findings marked fixed still have entries against them.
+2, 3, 4, 5, 6, 7, 9, 10 and 12. Four findings still carry ledger
+entries, 13 suppressed cases between them — 5 under finding 10, 5 under
+19, 2 under 8, 1 under 11 — and **none of them is an OPEN GAP**.
+Finding 8 is two divergences we intend to keep and 19 is five more, 11 is
+a documented non-defect, and finding 10's remaining 5 are a scope
+decision filed under its number, which is why findings marked fixed still
+have entries against them.
 `grep 'OPEN GAP' bogo/config.json` returns nothing, which is the whole
 point of reserving that phrase for defects.
 All twelve keep their numbers rather than being renumbered, because the
@@ -977,6 +979,35 @@ laxity, and laxity is what BoGo exists to find.
     MaxVersion on its own Config rather than passing the shim a flag, so
     nothing on the wire says a case is pre-1.3, and these had been held
     back only by the two flags this finding added.
+
+20. **The server's signing preference.** Nineteen more cases, and the
+    last of the three decline rows this document used to call wins
+    without having sampled any of them.
+
+    `-signing-prefs` is `ServerHandshake.Config.signing_schemes`: §4.4.2's
+    intersection, narrowed by the embedder, whose order wins over the
+    key's. It takes wire code points rather than
+    `backend.SignatureScheme`, and that is the whole design. Restricting
+    a server to a scheme this build cannot produce is a legal thing to
+    configure — BoGo does it deliberately, expecting handshake_failure —
+    so the type has to be able to hold the request in order to refuse it.
+    An enum would have turned those cases into shim declines and quietly
+    lost the coverage they were there to provide.
+
+    The in-tree oracle uses the RSA fixture, because a modulus signing
+    under all three PSS digests is the only leaf here with a choice to
+    steer: the list names sha512 first, which is *not* the signer's own
+    order, so a preference that was being ignored could not pass. The
+    second half pins an ECDSA scheme on an RSA key and asserts the
+    handshake fails, which is the misconfiguration the field documents.
+
+    Twenty-one cases stay declined and every one is pre-1.3. Twenty say
+    so in their names; `FilterExtraAlgorithms` does not, and is
+    `MaxVersion: VersionTLS12` in `signature_algorithm_tests.go`. That is
+    the exact shape finding 17 was caught by — a case whose name carries
+    no version, passing or failing for a reason that has nothing to do
+    with what it is named for. Its ledger entry says so, so the next
+    sweep does not have to rediscover it.
 
 ## Running it
 
