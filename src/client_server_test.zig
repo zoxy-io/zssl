@@ -67,6 +67,7 @@ const Harness = struct {
     server_reassembly: [8192]u8,
     flight: [Credentials.chain_bytes_max + 1024]u8,
     client_reassembly: [16384]u8,
+    client_auth_flight: [Credentials.chain_bytes_max + 1024]u8,
     server: ServerHandshake,
     client: ClientHandshake,
 
@@ -99,6 +100,11 @@ const Harness = struct {
         /// §4.4.2's signing set, narrowed. Null leaves the choice to the
         /// key, which is what almost every test here wants.
         server_signing_schemes: ?[]const u16 = null,
+        /// §4.3.2: what the server asks of the client, and null for the
+        /// ordinary one-sided handshake almost every test here wants.
+        client_auth: ?ServerHandshake.ClientAuth = null,
+        /// The client's own certificate, for answering that request.
+        client_credentials: ?*const Credentials = null,
     };
 
     fn init(harness: *Harness, options: Options) !void {
@@ -131,6 +137,7 @@ const Harness = struct {
             .alpn = options.server_alpn,
             .groups = options.server_groups,
             .signing_schemes = options.server_signing_schemes,
+            .client_auth = options.client_auth,
             .reassembly = &harness.server_reassembly,
             .flight = &harness.flight,
             .psk_lookup = if (store) |context| .{
@@ -149,6 +156,11 @@ const Harness = struct {
             .resume_session = resume_session,
             .retry_key_share_private = options.retry_private,
             .verify_schemes = options.client_verify_schemes,
+            .client_credentials = options.client_credentials,
+            .client_auth_flight = if (options.client_credentials != null)
+                &harness.client_auth_flight
+            else
+                &.{},
             .reassembly = &harness.client_reassembly,
         });
     }
@@ -2418,4 +2430,91 @@ test "§7.5: a server can export inside the 0.5-RTT window" {
     var half_rtt: [32]u8 = undefined;
     try harness.server.exporter("EXPORTER-Channel-Binding", "context", &half_rtt);
     try testing.expect(!std.mem.allEqual(u8, &half_rtt, 0));
+}
+
+test "§4.3.2 end to end: mTLS, with the client's possession actually proven" {
+    // Both production machines, mutually authenticated. The claim is not
+    // that the handshake completes — an empty certificate under
+    // `require = false` completes too — but that the *server* verified a
+    // signature the *client* made with a key only it holds.
+    var chain_storage: [Credentials.chain_bytes_max]u8 = undefined;
+    var client_credentials = try Credentials.load(
+        @embedFile("testdata/cert.pem"),
+        @embedFile("testdata/key.pem"),
+        &chain_storage,
+        true,
+    );
+    defer client_credentials.deinit();
+
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{
+        .client_auth = .{ .require = true },
+        .client_credentials = &client_credentials,
+    });
+    defer harness.deinit();
+    try harness.connect(&buffers);
+
+    try testing.expectEqual(ServerHandshake.State.connected, harness.server.state);
+    try testing.expectEqual(ClientHandshake.State.connected, harness.client.state);
+    // The whole point: the server holds a verified client certificate.
+    try testing.expect(harness.server.peer.verified);
+    try testing.expect(!harness.server.peer.empty);
+    try testing.expectEqual(
+        backend.SignatureScheme.ecdsa_secp256r1_sha256,
+        harness.server.peer.scheme.?,
+    );
+    // And in the other direction, unchanged.
+    try testing.expect(harness.client.peer.verified);
+
+    // Working keys after all that: the client-auth messages are in the
+    // transcript both Finisheds MAC, so a mismatch here is the two ends
+    // disagreeing about §4.4's context rather than about the data.
+    const ping = try harness.client.sendApplicationData("mutual", &buffers.client_out);
+    const event = (try harness.server.handleRecord(ping, &buffers.server_out)).?;
+    try testing.expectEqualSlices(u8, "mutual", event.application_data);
+}
+
+test "§4.4.2: a client with no certificate answers, and §4.4.2.1 judges it" {
+    // Our own client this time, not the test client — the same empty
+    // certificate_list, produced by the machine an embedder would ship.
+    for ([_]bool{ true, false }) |require| {
+        var buffers: Buffers = .{};
+        var harness: Harness = undefined;
+        try harness.init(.{ .client_auth = .{ .require = require } });
+        defer harness.deinit();
+
+        if (require) {
+            try testing.expectError(error.CertificateRequired, harness.connect(&buffers));
+        } else {
+            try harness.connect(&buffers);
+            try testing.expectEqual(ServerHandshake.State.connected, harness.server.state);
+            // Completed, and nobody was authenticated.
+            try testing.expect(!harness.server.peer.verified);
+            try testing.expect(harness.server.peer.empty);
+        }
+    }
+}
+
+test "§4.3.2: an unsolicited CertificateRequest declines rather than panicking" {
+    // The client under test configured no credentials and so no
+    // `client_auth_flight` — which is every client that never thought
+    // about mTLS, and exactly the client a server can send an
+    // unsolicited CertificateRequest to. Building the refusal into that
+    // empty buffer was a reachable assertion: a remote panic, found by
+    // BoGo's `CertificateRequestInResumption` and pinned here.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{ .client_auth = .{ .require = false } });
+    defer harness.deinit();
+
+    // No credentials, no flight buffer, and the handshake still
+    // completes — with nobody authenticated, which `require = false`
+    // permits and the server records.
+    try testing.expectEqual(@as(usize, 0), harness.client.config.client_auth_flight.len);
+    try harness.connect(&buffers);
+    try testing.expectEqual(ClientHandshake.State.connected, harness.client.state);
+    try testing.expect(harness.client.certificate_requested);
+    try testing.expect(harness.server.peer.empty);
+    try testing.expect(!harness.server.peer.verified);
 }

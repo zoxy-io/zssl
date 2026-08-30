@@ -1559,15 +1559,28 @@ fn checkClientAuth(self: *const ServerHandshake, auth: ClientAuth) Error!void {
     // §4.3.2 forbids the request under a PSK, so we never sent one and
     // there is nothing to have answered.
     if (self.resumed) return;
-    if (!self.peer.seen or self.peer.empty) {
+    // §4.4.2: "The client MUST send a Certificate message if and only if
+    // the server has requested client authentication." We asked, so its
+    // absence is a mandatory message missing from the flight — not a
+    // refusal, and not `require`'s to forgive. An *empty* one is the
+    // refusal, and that is the next case down.
+    //
+    // Conflating the two accepted a client that skipped the message
+    // outright under `require = false`, which BoGo's
+    // `SkipClientCertificate` caught: an unexpected success, which is
+    // the worst shape a client-auth bug can take.
+    if (!self.peer.seen) return error.UnexpectedMessage;
+    if (self.peer.empty) {
         if (auth.require) return error.CertificateRequired;
         return;
     }
-    // A certificate arrived and its signature did not verify — or never
-    // came. Either way the client has not proven possession, and
-    // `.insecure_no_verification` is the only configuration that says
-    // not to care.
-    if (auth.policy == .leaf_signature and !self.peer.verified) return error.BadCertificate;
+    // A non-empty Certificate arrived and no CertificateVerify followed:
+    // §4.4 fixes that order, so the Finished is standing where a
+    // mandatory message should have been. The same fault the client half
+    // reports, from the other side — BoGo's `ServerSkipCertificateVerify`
+    // drives it as a server test, with the runner's *client* doing the
+    // skipping.
+    if (auth.policy == .leaf_signature and !self.peer.verified) return error.UnexpectedMessage;
 }
 
 /// One post-handshake message, already pulled from the assembler. Null

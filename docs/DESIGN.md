@@ -62,6 +62,15 @@ the four decisions everything else follows from.
   `application_data`: Appendix E.5 is a warning the embedder has to act
   on, and an exhaustive switch is how it gets asked. See below.
 - **SNI and ALPN** reads, with RFC 7301 selection checks client-side.
+- **Client certificates**, both directions (§4.3.2). A server asks
+  through `Config.client_auth` and judges the answer by §4.4.2.1's
+  `require`; a client answers through `Config.client_credentials`, and
+  answers *even to decline*, because §4.4.2's empty certificate_list is
+  the only way to say no. `certificate_request_context` is always empty:
+  §4.3.2 reserves it for post-handshake authentication, which stays out.
+  The possession/identity split is the same one the other direction
+  draws — the leaf's key must have signed §4.4.3's transcript, and who
+  holds it is `chain_verifier`'s to say.
 - **RFC 5705 exporters** (§7.5), on both machines: `exporter(label,
   context, out)`, available to a server from its own Finished — §2's
   0.5-RTT window included — and to a client from `connected`. Not to be
@@ -74,7 +83,6 @@ the four decisions everything else follows from.
 
 ### Not built
 
-- **Client certificates** — no CertificateRequest on either side.
 - **Coverage-guided fuzzing.** The targets exist and run once per build;
   the search does not (§6).
 

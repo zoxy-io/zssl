@@ -41,7 +41,20 @@ pub const signature_schemes_default = [_]backend.SignatureScheme{
 
 /// Base fields plus every extension at its cap (a 255-byte server name,
 /// a 512-byte ticket identity, a 48-byte binder, a full ALPN list).
-pub const hello_bytes_max: u16 = 1280;
+/// 4096, not 1280. A resumption hello carries the ticket the *server*
+/// chose the size of, and §4.2.11 writes `opaque identity<1..2^16-1>`.
+/// 1280 was sized against the tickets zssl issues (512) rather than the
+/// ones it might be handed: BoGo's runner mints 829 bytes once a client
+/// certificate is in the session, and offering one panicked
+/// `helloPreSharedKey` on an assertion — a crash any conforming server
+/// could trigger by issuing a large ticket.
+pub const hello_bytes_max: u16 = 4096;
+
+/// The largest PSK identity a hello can carry, which is what bounds a
+/// ticket an embedder may offer back. Derived from the buffer rather
+/// than from `ticket_bytes_max`: the identity is opaque and its size is
+/// the issuing server's business, not ours.
+pub const psk_identity_bytes_max: u16 = hello_bytes_max - 768;
 
 /// ALPN offer caps. Four is what a client that speaks HTTP needs — `h2`
 /// and `http/1.1` with room to spare — and each name is bounded so the
@@ -221,7 +234,7 @@ fn helloExtensions(builder: *wire.Builder, params: *const HelloParams) void {
 /// ClientHello, because the binder is computed over everything before it.
 fn helloPreSharedKey(builder: *wire.Builder, psk: *const PskParams) void {
     assert(psk.identity.len >= 1);
-    assert(psk.identity.len <= server_messages.ticket_bytes_max);
+    assert(psk.identity.len <= psk_identity_bytes_max);
     assert(psk.binder_bytes == 32 or psk.binder_bytes == 48);
     builder.putU16(41); // pre_shared_key — last, per §4.2.
     const extension = builder.markU16();

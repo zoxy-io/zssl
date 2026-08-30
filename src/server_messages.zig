@@ -183,14 +183,25 @@ pub fn certificateRequest(out: []u8, schemes: []const backend.SignatureScheme) [
     return builder.written();
 }
 
-/// §4.4.2, server shape: empty certificate_request_context, then the
-/// chain, leaf first, each entry with empty extensions.
+/// §4.4.2: empty certificate_request_context, then the chain, leaf
+/// first, each entry with empty extensions.
+///
+/// Both sides send this message and the shape is identical. An *empty*
+/// list is legal from a client and only from a client — §4.4.2's way of
+/// saying it holds no certificate the request fits — so the count floors
+/// at zero here rather than one, and whether an empty one is acceptable
+/// is `ServerHandshake`'s `require` to decide. A server sending one
+/// would be a server with no certificate, which `Credentials.load`
+/// already refuses.
 pub fn certificateChain(out: []u8, certificates: []const []const u8) []const u8 {
-    assert(certificates.len >= 1);
     assert(certificates.len <= 8);
     var total: usize = 0;
     for (certificates) |der| total += der.len;
-    assert(out.len >= total + 64);
+    // Per entry: 3 length bytes and 2 of empty extensions. Plus the
+    // header, the context byte and the list's own u24 — which is what an
+    // *empty* list costs, and the reason a client declining needs no
+    // chain-sized buffer at all.
+    assert(out.len >= handshake.header_bytes + 1 + 3 + total + certificates.len * 5);
     var builder = wire.Builder.init(out);
     const message = handshake.beginMessage(&builder, .certificate);
     builder.putByte(0); // certificate_request_context length
