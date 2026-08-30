@@ -168,6 +168,7 @@ pub fn encryptedExtensions(out: []u8, alpn_selected: ?[]const u8, early_data: bo
 /// `chain_verifier` is where that judgement belongs.
 pub fn certificateRequest(out: []u8, schemes: []const backend.SignatureScheme) []const u8 {
     assert(schemes.len >= 1);
+    assert(schemes.len <= certificate_request_schemes_max);
     assert(out.len >= certificate_request_bytes_max);
     var builder = wire.Builder.init(out);
     const message = handshake.beginMessage(&builder, .certificate_request);
@@ -270,6 +271,16 @@ pub const new_session_ticket_bytes_max: u16 =
 /// and fixed — `wire.Builder` bounds nothing, and this is the number
 /// that keeps it from having to.
 pub const certificate_request_bytes_max: u16 = 32;
+
+/// How many schemes that bound actually admits, derived rather than
+/// asserted separately so the two cannot drift: the 13 fixed bytes are
+/// the header, the context byte, and four nested length fields.
+///
+/// The default list is the five `SignatureScheme` has, but
+/// `ClientAuth.verify_schemes` is the embedder's and nothing else caps
+/// it — so without this a server configured with ten schemes trips
+/// `Builder.putU16` mid-encode instead of failing at the boundary.
+pub const certificate_request_schemes_max: u16 = (certificate_request_bytes_max - 13) / 2;
 
 /// §4.6.1, and the other half of accepting 0-RTT: a client offers early
 /// data only against a ticket that told it how much it may send, so a

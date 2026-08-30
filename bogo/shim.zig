@@ -337,7 +337,12 @@ fn flagArity(name: []const u8) ?Arity {
     return null;
 }
 
-fn applyFlag(connection: *Connection, name: []const u8, value: ?[]const u8) ParseError!void {
+/// The first half of the flag table. Zig has no string switch, so a
+/// chain is forced here — but its *length* was not: `applyFlag` was 95
+/// code lines against TIGER_STYLE's 70-line hard limit, and splitting it
+/// in two is what brings both halves under. Each returns whether it
+/// handled the flag, so the caller can try the next.
+fn applyFlagA(connection: *Connection, name: []const u8, value: ?[]const u8) ParseError!bool {
     if (std.mem.eql(u8, name, "-cert-file")) {
         connection.cert_path = value.?;
     } else if (std.mem.eql(u8, name, "-key-file")) {
@@ -400,7 +405,13 @@ fn applyFlag(connection: *Connection, name: []const u8, value: ?[]const u8) Pars
         connection.expect_curve_id = std.fmt.parseInt(u16, value.?, 10) catch return error.BadFlagValue;
     } else if (std.mem.eql(u8, name, "-advertise-alpn")) {
         connection.advertise_alpn = value.?;
-    } else if (std.mem.eql(u8, name, "-select-alpn")) {
+    } else return false;
+    return true;
+}
+
+/// The second half of the flag table. See `applyFlagA`.
+fn applyFlagB(connection: *Connection, name: []const u8, value: ?[]const u8) ParseError!bool {
+    if (std.mem.eql(u8, name, "-select-alpn")) {
         // `ServerHandshake.init` asserts a non-empty protocol; an empty
         // selection is a case about a shape zssl cannot express.
         if (value.?.len == 0) return unimplemented(name);
@@ -460,9 +471,14 @@ fn applyFlag(connection: *Connection, name: []const u8, value: ?[]const u8) Pars
         std.mem.eql(u8, name, "-no-tls12"))
     {
         // Turning off a version we never had is a no-op, not a refusal.
-    } else {
-        return unimplemented(name);
-    }
+    } else return false;
+    return true;
+}
+
+fn applyFlag(connection: *Connection, name: []const u8, value: ?[]const u8) ParseError!void {
+    if (try applyFlagA(connection, name, value)) return;
+    if (try applyFlagB(connection, name, value)) return;
+    return unimplemented(name);
 }
 
 // ------------------------------------------------------------- exchange
@@ -626,6 +642,57 @@ fn connectToRunner(io: Io, connection: *const Connection) !Io.net.Stream {
     return address.connect(io, .{ .mode = .stream });
 }
 
+/// The `-cert-file`/`-key-file` pair, read. Both roles want it — a
+/// server for its own leaf, a client for the one §4.3.2 asks it to
+/// present — and BoGo does not distinguish them.
+const CredentialPem = struct { cert: []const u8, key: []const u8 };
+
+fn loadCredentialPem(io: Io, arena: std.mem.Allocator, connection: *const Connection) !CredentialPem {
+    const cert_path = connection.cert_path orelse return unimplemented("-cert-file");
+    const key_path = connection.key_path orelse return unimplemented("-key-file");
+    return .{
+        .cert = try readFile(io, arena, cert_path),
+        .key = try readFile(io, arena, key_path),
+    };
+}
+
+/// §4.6.1's issuance, after `connected` and in DESIGN.md §1's order.
+/// Its own function because `runServer` was 85 code lines against
+/// TIGER_STYLE's 70-line hard limit, and this is the part of it that is
+/// about tickets rather than about running a connection.
+fn issueTicket(
+    io: Io,
+    server: *ServerHandshake,
+    connection: *const Connection,
+    store: *TicketStore,
+    pump: *Pump,
+) !void {
+    // DESIGN.md §1's ordering, and §4.6.1's: derive the PSK, then seal
+    // the ticket that stands for it, and only after `connected`.
+    // §4.6.1 is the library's to enforce and the embedder's to respect:
+    // a client that never advertised psk_dhe_ke cannot use a ticket, and
+    // `sendNewSessionTicket` refuses to mint one. Asking first is what
+    // keeps that from being an error path.
+    if (!connection.no_ticket and server.ticketPermitted()) {
+        const psk = server.resumptionPsk(&ticket_nonce, &store.psk);
+        store.psk_bytes = @intCast(psk.len);
+        @memcpy(store.identity[0..ticket_identity.len], ticket_identity);
+        store.identity_bytes = ticket_identity.len;
+        store.issued_at_ms = nowMs(io);
+        store.suite = server.cipherSuite();
+        store.early_data_bytes_max =
+            if (connection.enable_early_data) early_data_bytes_max else null;
+        const sealed = server.sendNewSessionTicket(&.{
+            .lifetime_s = ticket_lifetime_s,
+            .age_add = 0,
+            .ticket_nonce = &ticket_nonce,
+            .ticket = ticket_identity,
+            .early_data_bytes_max = store.early_data_bytes_max,
+        }, &pump.out) catch |err| return pump.abort(server, err);
+        try pump.write(sealed);
+    }
+}
+
 fn runServer(
     io: Io,
     arena: std.mem.Allocator,
@@ -639,20 +706,21 @@ fn runServer(
     // whatever the case named, so a case narrowing it to P-256 was run
     // against a server that would still have taken x25519.
     const groups = configuredGroups(connection) orelse return unimplemented("-curves");
-    // On a server run both of these are about the *client's*
-    // CertificateVerify, which needs a CertificateRequest we never send
-    // (DESIGN.md §1). Declined by name so the case says which flag it
-    // stumbled on rather than failing for a reason no one can read.
-    if (connection.verify_pref_count >= 1) return unimplemented("-verify-prefs");
-    if (connection.expect_peer_signature_algorithm != null) {
-        return unimplemented("-expect-peer-signature-algorithm");
-    }
-    const cert_path = connection.cert_path orelse return unimplemented("-cert-file");
-    const key_path = connection.key_path orelse return unimplemented("-key-file");
-    const cert_pem = try readFile(io, arena, cert_path);
-    const key_pem = try readFile(io, arena, key_path);
+    // Both of these are about the *client's* CertificateVerify, which
+    // this server now asks for — so they are honoured rather than
+    // declined. They were declined on the grounds that we never send a
+    // CertificateRequest, which stopped being true 39 lines below when
+    // `client_auth` landed in the same function, and the reason was
+    // never revisited. That is the `-curves` mistake a second time: a
+    // decline outliving its justification does not fail, it quietly
+    // narrows the corpus, and the ledger never sees it because the case
+    // exits 89 before it reaches one.
+    var server_verify_storage: [verify_schemes_max]zssl.backend.SignatureScheme = undefined;
+    const client_verify_schemes = configuredVerifySchemes(connection, &server_verify_storage) orelse
+        return unimplemented("-verify-prefs");
+    const pem = try loadCredentialPem(io, arena, connection);
 
-    var credentials = Credentials.load(cert_pem, key_pem, &chain_storage, false) catch |err| switch (err) {
+    var credentials = Credentials.load(pem.cert, pem.key, &chain_storage, false) catch |err| switch (err) {
         // ECDSA signing only, by embedder policy (DESIGN.md §1). BoGo
         // hands every server case an RSA leaf unless the case says
         // otherwise, so this is the single largest source of 89s — and a
@@ -686,7 +754,10 @@ fn runServer(
         // would judge them. Possession is what this shim proves, which
         // is what DESIGN.md §1 says the library is for.
         .client_auth = if (connection.require_client_certificate or connection.verify_peer)
-            .{ .require = connection.require_client_certificate }
+            .{
+                .require = connection.require_client_certificate,
+                .verify_schemes = client_verify_schemes,
+            }
         else
             null,
         .reassembly = &handshake_reassembly,
@@ -713,7 +784,23 @@ fn runServer(
     // the same store the next issuance overwrites.
     const offered = !connection.no_ticket and connection.index >= 1 and store.psk_bytes >= 1;
     pump.handshakeServer(&server) catch |err| return pump.abort(&server, err);
-    try checkNegotiated(connection, server.resumed, offered, null, server.key_share_group, null);
+    // The scheme the *client* signed with, not a hardcoded null: that is
+    // what `-expect-peer-signature-algorithm` asks about on a server run.
+    //
+    // Remembered across exchanges for the same reason the client role
+    // remembers it: §4.3.2 forbids a CertificateRequest under a PSK, so
+    // a resumed handshake verifies nothing and the library reports null
+    // — while BoGo asks on both. The scheme is a property of the
+    // session, and sessions are the embedder's.
+    if (server.peer.scheme) |scheme| store.peer_signature_scheme = scheme;
+    try checkNegotiated(
+        connection,
+        server.resumed,
+        offered,
+        null,
+        server.key_share_group,
+        store.peer_signature_scheme,
+    );
     try writeExportedMaterial(pump, &server, connection);
     // Checked, not reported. BoGo asks whether early data was accepted,
     // and a shim that answered "yes" without the library having accepted
@@ -724,32 +811,27 @@ fn runServer(
         if (server.early_data_accepted != wanted) return error.EarlyDataMismatch;
     }
 
-    // DESIGN.md §1's ordering, and §4.6.1's: derive the PSK, then seal
-    // the ticket that stands for it, and only after `connected`.
-    // §4.6.1 is the library's to enforce and the embedder's to respect:
-    // a client that never advertised psk_dhe_ke cannot use a ticket, and
-    // `sendNewSessionTicket` refuses to mint one. Asking first is what
-    // keeps that from being an error path.
-    if (!connection.no_ticket and server.ticketPermitted()) {
-        const psk = server.resumptionPsk(&ticket_nonce, &store.psk);
-        store.psk_bytes = @intCast(psk.len);
-        @memcpy(store.identity[0..ticket_identity.len], ticket_identity);
-        store.identity_bytes = ticket_identity.len;
-        store.issued_at_ms = nowMs(io);
-        store.suite = server.cipherSuite();
-        store.early_data_bytes_max =
-            if (connection.enable_early_data) early_data_bytes_max else null;
-        const sealed = server.sendNewSessionTicket(&.{
-            .lifetime_s = ticket_lifetime_s,
-            .age_add = 0,
-            .ticket_nonce = &ticket_nonce,
-            .ticket = ticket_identity,
-            .early_data_bytes_max = store.early_data_bytes_max,
-        }, &pump.out) catch |err| return pump.abort(&server, err);
-        try pump.write(sealed);
-    }
-
+    try issueTicket(io, &server, connection, store, pump);
     try pump.exchange(&server, connection, store);
+}
+
+/// §4.4.2's answer, when the case gave us one to present. On a client
+/// run `-cert-file` is the *client's* certificate; BoGo does not
+/// distinguish the two roles' flags and neither does `Credentials`.
+fn loadClientCredentials(
+    io: Io,
+    arena: std.mem.Allocator,
+    connection: *const Connection,
+    storage: *[Credentials.chain_bytes_max]u8,
+) !?Credentials {
+    if (connection.cert_path == null) return null;
+    const pem = try loadCredentialPem(io, arena, connection);
+    return Credentials.load(pem.cert, pem.key, storage, false) catch |err| switch (err) {
+        // The same decline the server role makes, for the reason it
+        // makes it: a key this build cannot sign with.
+        error.UnsupportedKey => unimplemented("-cert-file:not-ecdsa"),
+        else => err,
+    };
 }
 
 fn runClient(
@@ -779,19 +861,8 @@ fn runClient(
     // for its own — BoGo does not distinguish them, and neither does
     // `Credentials`.
     var client_chain_storage: [Credentials.chain_bytes_max]u8 = undefined;
-    var client_credentials: ?Credentials = null;
+    var client_credentials = try loadClientCredentials(io, arena, connection, &client_chain_storage);
     defer if (client_credentials) |*credentials| credentials.deinit();
-    if (connection.cert_path) |cert_path| {
-        const key_path = connection.key_path orelse return unimplemented("-key-file");
-        const cert_pem = try readFile(io, arena, cert_path);
-        const key_pem = try readFile(io, arena, key_path);
-        client_credentials = Credentials.load(cert_pem, key_pem, &client_chain_storage, false) catch |err| switch (err) {
-            // ECDSA signing only, by embedder policy — the same decline
-            // the server role makes for the same reason.
-            error.UnsupportedKey => return unimplemented("-cert-file:not-ecdsa"),
-            else => return err,
-        };
-    }
     var client_auth_flight: [Credentials.chain_bytes_max + 1024]u8 = undefined;
     var verify_storage: [verify_schemes_max]zssl.backend.SignatureScheme = undefined;
     const verify_schemes = configuredVerifySchemes(connection, &verify_storage) orelse
