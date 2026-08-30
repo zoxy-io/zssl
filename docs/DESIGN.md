@@ -58,7 +58,10 @@ the four decisions everything else follows from.
 ### Not built
 
 - **Client certificates** — no CertificateRequest on either side.
-- **QUIC and DTLS** — no datagram record layer.
+- **RFC 5705 exporters.** §7.5's `exporter_master` is derived and
+  RFC 8448 checks it (`src/rfc8448_test.zig`), but no API expands it, so
+  an embedder that needs channel binding cannot get it. The largest
+  single gap BoGo can measure, at 167 declined cases.
 - **Appendix E.5's early-data marker.** `Event.application_data` does
   not say whether the bytes arrived as 0-RTT; the embedder infers it
   from the connection's state. That works and is not the same as being
@@ -69,8 +72,9 @@ the four decisions everything else follows from.
 ### Never
 
 TLS 1.2 and earlier, renegotiation, compression, RSA and DSA key
-exchange, SSLv3-era anything, post-handshake client auth. A caller that
-needs these wants a different library.
+exchange, SSLv3-era anything, post-handshake client auth, and **QUIC and
+DTLS** — there is no datagram record layer and none planned. A caller
+that needs these wants a different library.
 
 **X.509 chain validation** is out too, but delegated rather than
 missing: `ClientHandshake.Config.chain_verifier` shows the embedder the
