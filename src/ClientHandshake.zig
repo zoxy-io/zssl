@@ -435,6 +435,22 @@ pub fn init(config: *const Config) ClientHandshake {
         assert(protocol.len <= client_messages.alpn_protocol_bytes_max);
     }
     assert(!std.mem.allEqual(u8, &config.x25519_private, 0));
+    // `groups` is the embedder's, and three things about it are load
+    // bearing. It must name the group we actually share, because §4.2.8
+    // requires every key_share entry to appear in supported_groups and
+    // this client always shares x25519. Every entry must be one we can
+    // complete, for the reason `ServerHandshake` asserts the same: a
+    // group we advertise is a retry we may have to answer. And the list
+    // is bounded because `wire.Builder` bounds nothing — the hello is
+    // built into a fixed buffer.
+    assert(config.groups.len >= 1);
+    assert(config.groups.len <= client_hello.groups_supported.len);
+    var shares_an_advertised_group = false;
+    for (config.groups) |group| {
+        assert(client_hello.groupShareBytes(group) != null);
+        if (group == client_hello.group_x25519) shares_an_advertised_group = true;
+    }
+    assert(shares_an_advertised_group);
     if (config.resume_session) |resumption| {
         assert(resumption.psk_bytes == 32 or resumption.psk_bytes == 48);
         assert(resumption.identity.len >= 1);

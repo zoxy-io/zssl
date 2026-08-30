@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 324 passed, 0 failed, 6904 declined by the shim (89), floor 324
+bogo: 324 passed, 0 failed, 6893 declined by the shim (89), floor 324
 bogo: PASS
 ```
 
@@ -76,7 +76,7 @@ extension block, and 143 until §4.6.3's update requests were coalesced, and
 either gets fixed or gets an entry in `DisabledTests` with a one-line
 reason. There are no silent skips.
 
-**6904 declined** — 88% of the corpus. The shim exited 89, PORTING.md's
+**6893 declined** — 88% of the corpus. The shim exited 89, PORTING.md's
 "unimplemented", and the runner counted the case without running it.
 That number is large enough to be the first thing anyone asks about, so
 here is what it is made of. Counting each case by the *first* thing the
@@ -91,7 +91,7 @@ shim declined:
 | 281 | `-enable-ocsp-stapling` / `-ocsp-response`. |
 | 250 | `-signing-prefs` / `-expect-peer-signature-algorithm`. |
 | 248 | `-new-rpk-credential` — raw public keys. |
-| 105 | A group we do not hold, or a `-curves` set our client cannot honour — it offers x25519 alone whatever it is told, and the server cannot be told to accept a narrower set. |
+| 105 | A group we do not hold, or a `-curves` set we cannot honour — now only a set naming a group neither machine completes, or one without x25519, which is the group our client always shares. |
 | 182 | `-accepted-peer-cert-types`. |
 | 167 | `-export-keying-material` — RFC 5705 exporters, which zssl has no API for. |
 | ~1800 | The rest of the flag surface, one flag at a time. |
@@ -100,11 +100,25 @@ Roughly 3400 of those — DTLS, QUIC, client certificates, ECH,
 compliance policies, X.509 validation — are scope decisions written down
 in DESIGN.md §1 and will never come back. The rest is headroom: the
 largest single wins available are an RFC 5705 exporter (167 cases),
-exposing the peer's negotiated signature algorithm (128), honouring
-`-signing-prefs` (122), and letting the two machines be *told* which
-groups to use — a server that can be restricted to a subset and a client
-that can offer something other than x25519 would let the rest of the
-`-curves` corpus run against the key exchange that already completes it.
+exposing the peer's negotiated signature algorithm (128), and honouring
+`-signing-prefs` (122).
+
+**Read this table as "first thing declined", not "cases a fix would
+buy".** `-curves` is the worked example, and it cost a slice to learn.
+This paragraph used to name it as one of the largest wins, on the
+strength of its 105-case row; both machines now take a configured group
+list, and honouring it un-declined **11** cases, every one of them a
+TLS 1.0/1.1/1.2 conversation we have to decline anyway. The other 94 hit
+a second unimplemented flag immediately behind the first. A row's number
+is an upper bound that is usually loose, because a case declined for one
+reason is very often declined for three.
+
+The 11 are worth keeping in mind for a different reason: `-curves` was
+the *only* thing declining them. The runner sets its `MaxVersion` on its
+own `Config` rather than passing the shim a `-max-version` flag, so
+nothing on the wire tells the shim those cases are pre-1.3 — they were
+being excluded by accident, and their RSA twins had been on the ledger
+by name all along.
 
 Each decline names its flag on stderr, so a case that later turns into a
 failure says which flag it stumbled on rather than leaving it to

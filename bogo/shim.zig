@@ -153,9 +153,9 @@ const Connection = struct {
     expect_alpn: ?[]const u8 = null,
     host_name: ?[]const u8 = null,
 
-    /// The groups `-curves` named, in order. Whether they can be
-    /// honoured is a question for the role: our server completes any of
-    /// the three it holds, while our client offers x25519 alone.
+    /// The groups `-curves` named, in preference order. Both roles take
+    /// a configured list now, so this is honoured rather than merely
+    /// checked — see `configuredGroups`.
     curves: [4]u16 = undefined,
     curve_count: u8 = 0,
 
@@ -537,13 +537,12 @@ fn runServer(
     store: *TicketStore,
     pump: *Pump,
 ) !void {
-    // Our server completes every group it holds and cannot be told to
-    // accept a narrower set, so a case naming only groups we hold runs
-    // as asked; one naming any other is asking for a refusal we cannot
-    // configure.
-    for (connection.curves[0..connection.curve_count]) |group| {
-        if (zssl.client_hello.groupShareBytes(group) == null) return unimplemented("-curves");
-    }
+    // `-curves` on a server run is the set it will accept, which
+    // `Config.groups` is exactly. Until this was wired the flag was
+    // recorded and thrown away: the server accepted every group it holds
+    // whatever the case named, so a case narrowing it to P-256 was run
+    // against a server that would still have taken x25519.
+    const groups = configuredGroups(connection) orelse return unimplemented("-curves");
     const cert_path = connection.cert_path orelse return unimplemented("-cert-file");
     const key_path = connection.key_path orelse return unimplemented("-key-file");
     const cert_pem = try readFile(io, arena, cert_path);
@@ -572,6 +571,7 @@ fn runServer(
         .server_random = entropy[0..32].*,
         .key_share_private = entropy[32..80].*,
         .alpn = connection.select_alpn,
+        .groups = groups,
         .reassembly = &handshake_reassembly,
         .flight = &flight_storage,
         // A real clock, which an embedder may read and `src/` may not
@@ -596,7 +596,7 @@ fn runServer(
     // the same store the next issuance overwrites.
     const offered = !connection.no_ticket and connection.index >= 1 and store.psk_bytes >= 1;
     pump.handshakeServer(&server) catch |err| return pump.abort(&server, err);
-    try checkNegotiated(connection, server.resumed, offered, null);
+    try checkNegotiated(connection, server.resumed, offered, null, server.key_share_group);
     // Checked, not reported. BoGo asks whether early data was accepted,
     // and a shim that answered "yes" without the library having accepted
     // any would pass the case while proving nothing. It is a coarse
@@ -640,12 +640,15 @@ fn runClient(
     store: *TicketStore,
     pump: *Pump,
 ) !void {
-    // `ClientHandshake` offers x25519 and holds one scalar, so a case
-    // naming any other group would be run against a ClientHello it did
-    // not ask for. Declined until the client can choose its group.
-    for (connection.curves[0..connection.curve_count]) |group| {
-        if (group != group_x25519) return unimplemented("-curves");
-    }
+    // `-curves` on a client run is what to advertise, and
+    // `Config.groups` takes it. The one set we cannot honour is one
+    // without x25519: this client always shares x25519, and §4.2.8 wants
+    // every key_share entry to appear in supported_groups, so advertising
+    // a list that excludes it would put an illegal hello on the wire.
+    const groups = configuredGroups(connection) orelse return unimplemented("-curves");
+    for (groups) |group| {
+        if (group == group_x25519) break;
+    } else return unimplemented("-curves:no-x25519");
     var protocols: [alpn_protocols_max][]const u8 = undefined;
     const offered = try splitAlpn(connection.advertise_alpn, &protocols);
 
@@ -673,6 +676,7 @@ fn runClient(
         .retry_key_share_private = entropy[96..144].*,
         .session_id = entropy[64..96],
         .server_name = connection.host_name,
+        .groups = groups,
         .alpn_protocols = offered,
         // Possession, not identity: the leaf's own key must have signed
         // the CertificateVerify. Chain building and RFC 9525 names stay
@@ -686,12 +690,33 @@ fn runClient(
 
     try pump.write(client.start(&pump.out));
     pump.handshakeClient(&client) catch |err| return pump.abort(&client, err);
-    try checkNegotiated(connection, client.resumed, resumption != null, client.alpnSelected());
+    try checkNegotiated(
+        connection,
+        client.resumed,
+        resumption != null,
+        client.alpnSelected(),
+        zssl.backend.Group.fromWire(client.share_group),
+    );
 
     try pump.exchange(&client, connection, store);
     if (connection.expect_no_session and store.tickets_this_exchange >= 1) {
         return error.UnexpectedTicket;
     }
+}
+
+/// The group list `-curves` asked for, or the library's default when the
+/// case named none. Null means "we cannot be configured that way": a
+/// group neither machine can complete, or more entries than
+/// `groups_supported` holds — both of which `init` asserts against, and
+/// an assert is not how a shim declines a case.
+fn configuredGroups(connection: *const Connection) ?[]const u16 {
+    if (connection.curve_count == 0) return &zssl.client_hello.groups_supported;
+    if (connection.curve_count > zssl.client_hello.groups_supported.len) return null;
+    const named = connection.curves[0..connection.curve_count];
+    for (named) |group| {
+        if (zssl.client_hello.groupShareBytes(group) == null) return null;
+    }
+    return named;
 }
 
 /// The `-expect-*` assertions both roles share. A mismatch is the shim's
@@ -703,12 +728,18 @@ fn checkNegotiated(
     resumed: bool,
     offered: bool,
     alpn: ?[]const u8,
+    group: ?zssl.backend.Group,
 ) !void {
     if (connection.expect_version) |version| {
         if (version != version_tls13) return error.UnexpectedVersion;
     }
-    if (connection.expect_curve_id) |group| {
-        if (zssl.client_hello.groupShareBytes(group) == null) return error.UnexpectedCurve;
+    if (connection.expect_curve_id) |wanted| {
+        // This asked only whether the named group was one we hold, which
+        // every case naming a group we hold passed whatever the handshake
+        // actually negotiated. Now that `-curves` can narrow the set, the
+        // difference is the whole point of the case.
+        const expected = zssl.backend.Group.fromWire(wanted) orelse return error.UnexpectedCurve;
+        if (group != expected) return error.UnexpectedCurve;
     }
     if (connection.expect_alpn) |expected| {
         const selected = alpn orelse return error.NoAlpnSelected;
