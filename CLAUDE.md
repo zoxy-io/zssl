@@ -3,9 +3,10 @@
 Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
 (`zoxy-io/openssl`). Prototype engine for zoxy. Read before writing code:
 
-- [docs/DESIGN.md](docs/DESIGN.md) — scope, the trust split, the slice
-  ladder and what each slice's oracle proved. Bare § references point
-  here or to RFC 8446 (context makes it obvious which).
+- [docs/DESIGN.md](docs/DESIGN.md) — §1 is what is built, not built,
+  and never; §2–§5 are the decisions everything follows from; §6 is
+  what proved it. Bare § references point here or to RFC 8446 (context
+  makes it obvious which).
 - [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) — the enforced style
   contract, a verbatim copy of zoxy's; zoxy's copy is the source of
   truth when they drift.

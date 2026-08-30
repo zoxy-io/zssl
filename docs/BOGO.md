@@ -25,7 +25,7 @@ and the rest of this file is what they mean.
   than in the library, on purpose: the **error → alert table**, because
   zssl returns errors and leaves the decision to alert with the embedder,
   and the **ticket store**, because sealing and age policy are the
-  embedder's by design (slice 3).
+  embedder's by design (DESIGN.md §1).
 - **`bogo/run.zig`** — the gate. Fetches the pinned BoringSSL commit into
   `zig-out/bogo/` (blobless, by SHA, so a run is reproducible), builds
   `ssl/test/runner` once with `go test -c`, runs the corpus, and holds
@@ -268,7 +268,7 @@ name.
 3. **FIXED — no §5.4 cap on the inner plaintext *before* padding is
    stripped.** `Protector.open` bounded the content it handed back —
    `content_bytes > plaintext_bytes_max` has been a `record_overflow`
-   since slice 1 — but never checked the inner plaintext it was *handed*
+   from the start — but never checked the inner plaintext it was *handed*
    against `record.inner_plaintext_bytes_max` (§5.4's 2^14+1), which is
    why that constant sat defined and unused. So
    `LargePlaintext-TLS13-Padded-16384-1` and `-8193-8192`, both 16386

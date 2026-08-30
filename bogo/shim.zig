@@ -15,8 +15,8 @@
 //!     decision to alert with the embedder; `alertFor` is one embedder's
 //!     table, and BoGo's `expectedLocalError` cases are what pin it.
 //!   - **The ticket store.** Sealing, lifetime and age policy are the
-//!     embedder's by design (slice 3), so a shim that resumes keeps its
-//!     own — one identity and its PSK, which is all `-resume-count`
+//!     embedder's by design (DESIGN.md §1), so a shim that resumes keeps
+//!     its own — one identity and its PSK, which is all `-resume-count`
 //!     needs.
 //!
 //! What we decline, we decline by *exit code*, never by pretending: an
@@ -211,9 +211,11 @@ fn parseFlags(init: std.process.Init, arena: std.mem.Allocator) ParseError!Optio
             std.mem.startsWith(u8, name, "-on-shim-") or
             std.mem.startsWith(u8, name, "-on-handshaker-"))
         {
-            // Retry-scoped flags belong to HelloRetryRequest paths the
-            // client refuses structurally (DESIGN.md §6, slice 4); the
-            // handshaker split is BoringSSL's own process model.
+            // `-on-retry-*` scopes a flag to the second ClientHello,
+            // and this shim carries only the two scopes above — the
+            // client answers a HelloRetryRequest (DESIGN.md §1), it is
+            // the per-attempt flag split that is unmodelled. The
+            // handshaker one is BoringSSL's own process model.
             return unimplemented(name);
         }
 
@@ -604,8 +606,8 @@ fn runServer(
         if (server.early_data_accepted != wanted) return error.EarlyDataMismatch;
     }
 
-    // Slice 3's ordering, and §4.6.1's: derive the PSK, then seal the
-    // ticket that stands for it, and only after `connected`.
+    // DESIGN.md §1's ordering, and §4.6.1's: derive the PSK, then seal
+    // the ticket that stands for it, and only after `connected`.
     // §4.6.1 is the library's to enforce and the embedder's to respect:
     // a client that never advertised psk_dhe_ke cannot use a ticket, and
     // `sendNewSessionTicket` refuses to mint one. Asking first is what
@@ -1024,8 +1026,8 @@ const Pump = struct {
     }
 };
 
-/// Slice 3's client side: the ticket is the identity, and the PSK behind
-/// it is derived here from our own resumption master.
+/// Resumption's client side: the ticket is the identity, and the PSK
+/// behind it is derived here from our own resumption master.
 fn captureTicket(machine: anytype, event: anytype, store: *TicketStore) void {
     const ticket = event.ticket;
     store.tickets_this_exchange += 1;

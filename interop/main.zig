@@ -1,6 +1,6 @@
-//! The real-OpenSSL interop gate (slice 5).
+//! The real-OpenSSL interop gate.
 //!
-//! Four legs, all against the `openssl` binary — genuine libssl, a TLS
+//! Five legs, all against the `openssl` binary — genuine libssl, a TLS
 //! stack sharing no line of code with this one, written by different
 //! people over thirty years:
 //!
@@ -17,10 +17,16 @@
 //!      not also produce the signature. The leg asserts the negotiated
 //!      scheme too, because one that quietly settled on P-256 would
 //!      pass while proving nothing.
-//!   3. Our `ClientHandshake` handshakes with `openssl s_server -rev`,
+//!   3. The same leg again through a **HelloRetryRequest**: our server
+//!      refuses x25519, `s_client` is told to offer it first, and
+//!      openssl sends a key_share only for the first group it names, so
+//!      the handshake cannot complete without a §4.1.4 retry. The leg
+//!      asserts the retry happened rather than inferring it from the
+//!      group the handshake landed on.
+//!   4. Our `ClientHandshake` handshakes with `openssl s_server -rev`,
 //!      our certificate policy checking *their* CertificateVerify, and
 //!      our record layer opening the reversed echo they seal back.
-//!   4. The same leg again against an **RSA** server certificate,
+//!   5. The same leg again against an **RSA** server certificate,
 //!      generated here by openssl itself. ECDSA and RSA are different
 //!      code paths in `ClientHandshake.verifyCertificate`, and the RSA
 //!      one exists precisely for upstreams we do not control — so it is
@@ -81,7 +87,7 @@ const rsa_key_path = "zig-out/interop/rsa-key.pem";
 const s_server_rsa_log_path = "zig-out/interop/s_server_rsa.log";
 const work_dir = "zig-out/interop";
 
-/// The whole gate, both legs, generously bounded. A hang here is a bug
+/// The whole gate, every leg, generously bounded. A hang here is a bug
 /// report, not a CI that never returns.
 const watchdog_budget_ns: u64 = 90 * std.time.ns_per_s;
 
@@ -311,8 +317,8 @@ fn listenLoopback(io: Io) !struct { server: Io.net.Server, port: u16 } {
     return error.NoFreePort;
 }
 
-/// What one server leg presents. Two legs differ only in the leaf, and
-/// the leaf is the whole point of the second one: openssl verifying our
+/// What one server leg presents. The first two differ only in the leaf,
+/// and the leaf is the whole point of the second: openssl verifying our
 /// CertificateVerify is the only oracle here that did not also produce
 /// the signature.
 const ServerLeg = struct {

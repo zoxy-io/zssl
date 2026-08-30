@@ -2,8 +2,8 @@
 //!
 //! Pure data from `include/uapi/linux/tls.h`: no syscalls and no Linux
 //! dependency, so the packing compiles and is testable everywhere; only
-//! `setsockopt(SOL_TLS, TLS_TX/RX, ...)` is Linux's. This seam existing in
-//! slice 1 is the point of zssl: record offload needs the traffic keys
+//! `setsockopt(SOL_TLS, TLS_TX/RX, ...)` is Linux's. This seam existing
+//! at all is the point of zssl: record offload needs the traffic keys
 //! *handed out* in kernel layout, and a TLS library designed around
 //! opaque sessions has to be pried open to do it.
 //!
