@@ -58,12 +58,31 @@ pub fn SessionKeys(comptime suite: CipherSuite) type {
 
         const Self = @This();
 
+        /// `transmit_sequence` is how many records were already sealed
+        /// under `transmit_secret` before this session existed — §2's
+        /// 0.5-RTT data, which a server may write after its own Finished
+        /// and before the peer's.
+        ///
+        /// It has to be carried rather than reset. The secret is the
+        /// same one those records used, so restarting the count would
+        /// reuse a nonce under a key that had already seen it, and nonce
+        /// reuse is the one thing an AEAD does not survive. Zero for a
+        /// connection that wrote nothing early, which is every
+        /// connection that does not use the window.
         pub fn init(
             transmit_secret: *const [hash_bytes]u8,
             receive_secret: *const [hash_bytes]u8,
+            transmit_sequence: u64,
         ) Error!Self {
             assert(!std.mem.allEqual(u8, transmit_secret, 0));
             assert(!std.mem.allEqual(u8, receive_secret, 0));
+            // Inclusive, matching `Protector`'s own bound: `seal`
+            // refuses at `>= records_per_key_max`, so the last
+            // successful one leaves the count *at* the maximum, and
+            // `nonceFor` and `deinit` both admit exactly that. A
+            // half-RTT window that spent the whole key is due for a
+            // rotation, not an abort.
+            assert(transmit_sequence <= protect.records_per_key_max);
             var keys: Self = .{
                 .transmit_secret = transmit_secret.*,
                 .receive_secret = receive_secret.*,
@@ -75,6 +94,7 @@ pub fn SessionKeys(comptime suite: CipherSuite) type {
                 .answered_update_request = false,
             };
             keys.send = try protect.Protector.init(suite, &keys.transmit_keys.key, &keys.transmit_keys.iv);
+            keys.send.sequence = transmit_sequence;
             errdefer keys.send.deinit();
             keys.recv = try protect.Protector.init(suite, &keys.receive_keys.key, &keys.receive_keys.iv);
             return keys;
@@ -210,7 +230,11 @@ pub fn SessionKeys(comptime suite: CipherSuite) type {
                 .transmit => &self.send,
                 .receive => &self.recv,
             };
-            assert(protector.sequence < protect.records_per_key_max);
+            // Inclusive for the reason above, and fixed here rather
+            // than left alone: this is the same off-by-one one function
+            // away, found while adding the one above it, and a known
+            // wrong bound is not made right by predating the commit.
+            assert(protector.sequence <= protect.records_per_key_max);
             var material: ktls.KeyMaterial = .{
                 .suite = suite,
                 .key = undefined,
@@ -229,9 +253,9 @@ test "rotation changes both key material and generation, deterministically" {
     const Keys = SessionKeys(.aes_128_gcm_sha256);
     const transmit_secret = [_]u8{0x42} ** 32;
     const receive_secret = [_]u8{0x24} ** 32;
-    var ours = try Keys.init(&transmit_secret, &receive_secret);
+    var ours = try Keys.init(&transmit_secret, &receive_secret, 0);
     defer ours.deinit();
-    var theirs = try Keys.init(&receive_secret, &transmit_secret);
+    var theirs = try Keys.init(&receive_secret, &transmit_secret, 0);
     defer theirs.deinit();
 
     const before = ours.exportMaterial(.transmit);
@@ -256,7 +280,7 @@ test "rotation changes both key material and generation, deterministically" {
 test "the rotation ceiling is an error, not a spin" {
     const Keys = SessionKeys(.aes_128_gcm_sha256);
     const secret = [_]u8{0x11} ** 32;
-    var keys = try Keys.init(&secret, &secret);
+    var keys = try Keys.init(&secret, &secret, 0);
     defer keys.deinit();
     keys.rotations = rotations_max;
     try std.testing.expectError(error.RotationsExhausted, keys.rotateTransmit());
@@ -265,7 +289,7 @@ test "the rotation ceiling is an error, not a spin" {
 test "§4.6.3: a run of update requests is answered once, until application data" {
     const Keys = SessionKeys(.aes_128_gcm_sha256);
     const secret = [_]u8{0x22} ** 32;
-    var keys = try Keys.init(&secret, &secret);
+    var keys = try Keys.init(&secret, &secret, 0);
     defer keys.deinit();
     var out: [record.wire_record_bytes_max]u8 = undefined;
 
@@ -302,7 +326,7 @@ test "§4.6.3: a run of update requests is answered once, until application data
 test "§4.6.3: update_not_requested is never answered, and clears nothing" {
     const Keys = SessionKeys(.aes_128_gcm_sha256);
     const secret = [_]u8{0x33} ** 32;
-    var keys = try Keys.init(&secret, &secret);
+    var keys = try Keys.init(&secret, &secret, 0);
     defer keys.deinit();
     var out: [record.wire_record_bytes_max]u8 = undefined;
 

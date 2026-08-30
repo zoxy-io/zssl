@@ -32,6 +32,7 @@ const ClientHandshake = zssl.ClientHandshake;
 const Credentials = zssl.Credentials;
 const ServerHandshake = zssl.ServerHandshake;
 const alert = zssl.alert;
+const anti_replay = zssl.anti_replay;
 const cipher_suite = zssl.cipher_suite;
 const record = zssl.record;
 
@@ -164,6 +165,15 @@ const Connection = struct {
     expect_no_session: bool = false,
 
     no_ticket: bool = false,
+    /// `-enable-early-data`: the embedder's opt-in, which for this shim
+    /// means minting tickets that advertise 0-RTT and answering
+    /// `psk_lookup` with terms that permit it. The library needs a clock
+    /// and a strike register besides, and both are supplied in
+    /// `runServer`.
+    enable_early_data: bool = false,
+    /// `-on-resume-expect-accept-early-data` / `-reject-early-data`.
+    /// Null where the case does not say.
+    expect_early_data: ?bool = null,
     shim_writes_first: bool = false,
     shim_shuts_down: bool = false,
     check_close_notify: bool = false,
@@ -268,11 +278,12 @@ fn flagArity(name: []const u8) ?Arity {
         "-read-size",   "-expect-early-data-reason",
     };
     const without_value = [_][]const u8{
-        "-ipv6",                "-server",             "-shim-writes-first",
-        "-shim-shuts-down",     "-check-close-notify", "-no-ticket",
-        "-expect-session-miss", "-expect-no-session",  "-decline-alpn",
-        "-no-tls1",             "-no-tls11",           "-no-tls12",
-        "-expect-no-hrr",
+        "-ipv6",                     "-server",             "-shim-writes-first",
+        "-shim-shuts-down",          "-check-close-notify", "-no-ticket",
+        "-expect-session-miss",      "-expect-no-session",  "-decline-alpn",
+        "-no-tls1",                  "-no-tls11",           "-no-tls12",
+        "-expect-no-hrr",            "-enable-early-data",  "-expect-accept-early-data",
+        "-expect-reject-early-data",
     };
     for (with_value) |candidate| if (std.mem.eql(u8, name, candidate)) return .one;
     for (without_value) |candidate| if (std.mem.eql(u8, name, candidate)) return .none;
@@ -337,11 +348,29 @@ fn applyFlag(connection: *Connection, name: []const u8, value: ?[]const u8) Pars
         // The client refuses every HelloRetryRequest and the server only
         // sends one when the offer is unusable, so "no HRR" holds by
         // construction; there is nothing to arm.
+    } else if (std.mem.eql(u8, name, "-enable-early-data")) {
+        connection.enable_early_data = true;
+    } else if (std.mem.eql(u8, name, "-on-resume-expect-accept-early-data") or
+        std.mem.eql(u8, name, "-expect-accept-early-data"))
+    {
+        connection.expect_early_data = true;
+    } else if (std.mem.eql(u8, name, "-on-resume-expect-reject-early-data") or
+        std.mem.eql(u8, name, "-expect-reject-early-data"))
+    {
+        connection.expect_early_data = false;
     } else if (std.mem.eql(u8, name, "-expect-early-data-reason")) {
-        // Accepting 0-RTT is out permanently (DESIGN.md §1), so the only
-        // reason we can honestly report is the one that says it was never
-        // on. Any other expectation belongs to a feature we do not have.
-        if (!std.mem.eql(u8, value.?, "disabled")) return unimplemented(name);
+        // The reasons this shim can honestly report. "disabled" is a
+        // server that was never asked to accept; "no_session_offered" is
+        // a first connection, which has no ticket to attach 0-RTT to;
+        // "accept" is the one the accept path earns. Anything else names
+        // a decision zssl does not model — an ALPS mismatch, a QUIC
+        // parameter — and declining is more honest than reporting a
+        // reason we did not reach.
+        const reason = value.?;
+        const known = std.mem.eql(u8, reason, "disabled") or
+            std.mem.eql(u8, reason, "no_session_offered") or
+            std.mem.eql(u8, reason, "accept");
+        if (!known) return unimplemented(name);
     } else if (std.mem.eql(u8, name, "-read-size")) {
         // A buffering hint for the C shim's `SSL_read`; our record pump
         // reads whole records regardless.
@@ -366,6 +395,18 @@ const TicketStore = struct {
     psk: [cipher_suite.hash_bytes_max]u8 = undefined,
     psk_bytes: u8 = 0,
     age_add: u32 = 0,
+    /// When the ticket was minted, on the same clock `runServer` hands
+    /// the library. §8.3 compares the age a client claims against this,
+    /// and BoGo's runner claims a real elapsed time — so this is a real
+    /// clock read, which an embedder may do and `src/` may not.
+    issued_at_ms: u64 = 0,
+    /// What the ticket advertised, or null when 0-RTT was never enabled.
+    /// The same number goes into the ticket and comes back out of the
+    /// lookup, which is the agreement zssl cannot check for an embedder.
+    early_data_bytes_max: ?u32 = null,
+    /// The suite the ticket was issued under. §4.2.10 wants the resumed
+    /// connection to negotiate the same one before early data is read.
+    suite: cipher_suite.CipherSuite = .aes_128_gcm_sha256,
     /// Tickets seen on the exchange in progress, which is what
     /// `-expect-no-session` asks about — not what an earlier one left.
     tickets_this_exchange: u32 = 0,
@@ -385,9 +426,58 @@ const TicketStore = struct {
         // moment ago, so the binder label is "res binder". BoGo drives no
         // external-PSK case at this pin; if it ever does, this is the
         // line that has to learn the difference.
-        return .{ .psk_bytes = self.psk_bytes, .kind = .resumption };
+        return .{
+            .psk_bytes = self.psk_bytes,
+            .kind = .resumption,
+            .issued = .{
+                .at_ms = self.issued_at_ms,
+                .age_add = self.age_add,
+                .lifetime_s = ticket_lifetime_s,
+            },
+            .early_data = if (self.early_data_bytes_max) |bytes_max|
+                .{ .bytes_max = bytes_max, .suite = self.suite }
+            else
+                null,
+        };
     }
 };
+
+/// §4.6.1's lifetime for the one ticket this shim mints, and the number
+/// `psk_lookup` answers with so the library's expiry check agrees with
+/// what the ticket said.
+const ticket_lifetime_s: u32 = 3600;
+
+/// What a ticket advertises when `-enable-early-data` is on.
+///
+/// BoringSSL's `kMaxEarlyDataAccepted` (`ssl/internal.h`), and the
+/// number matters: `TLS13-MaxEarlyData-Server` sends exactly one byte
+/// more and expects the connection to end. Their comment explains the
+/// gap to `kMaxEarlyDataSkipped` — 14336 accepted in plaintext sits
+/// "slightly below" 16384 skipped in ciphertext, so a server that
+/// declines never counts less than one that accepts.
+const early_data_bytes_max: u32 = 14336;
+
+/// The shim's clock. `src/` may not read one — CLAUDE.md makes that an
+/// invariant, so a seeded replay of the library replays its time too —
+/// but an embedder must, and this is the embedder.
+///
+/// `.awake` rather than `.real`, and the two are not interchangeable
+/// here. What §8.3 compares is an *elapsed* time: the shim mints a
+/// ticket and redeems it within one process seconds later, so what the
+/// comparison needs is a clock that only moves forward, not one that
+/// agrees with the world. A wall clock an NTP step moved backwards
+/// between those two reads would make a legitimate resumption look
+/// like a replayed one.
+fn nowMs(io: Io) u64 {
+    const nanoseconds = Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+    // A monotonic clock that has not started is a broken `Io`, not an
+    // edge case to absorb: mapping it to zero would silently make every
+    // ticket look freshly issued.
+    assert(nanoseconds > 0);
+    const millis = Io.Timestamp.toMilliseconds(.{ .nanoseconds = nanoseconds });
+    assert(millis > 0);
+    return @intCast(millis);
+}
 
 /// The one ticket identity this shim issues. Opaque to the protocol —
 /// sealing is the embedder's job, and a test binary needs no seal.
@@ -469,6 +559,12 @@ fn runServer(
 
     var entropy: [80]u8 = undefined;
     io.random(&entropy);
+    // §8.2's register, one connection's worth. Sized to the smallest
+    // legal table: this shim serves one client at a time, so a wider one
+    // would only make the probe window emptier.
+    var strike_entries: [anti_replay.StrikeRegister.probe_max]anti_replay.StrikeRegister.Entry =
+        @splat(.free);
+    var strike_register: anti_replay.StrikeRegister = .{ .entries = &strike_entries };
     var server = ServerHandshake.init(&.{
         .credentials = &credentials,
         .server_random = entropy[0..32].*,
@@ -476,6 +572,12 @@ fn runServer(
         .alpn = connection.select_alpn,
         .reassembly = &handshake_reassembly,
         .flight = &flight_storage,
+        // A real clock, which an embedder may read and `src/` may not
+        // (CLAUDE.md). BoGo's client claims a real elapsed age, so
+        // §8.3's comparison only means anything against the same kind of
+        // number.
+        .now_ms = nowMs(io),
+        .strike_register = if (connection.enable_early_data) &strike_register else null,
         // `SSL_OP_NO_TICKET` means the server must not *accept* a ticket
         // either, not merely decline to mint one — BoGo's
         // `TLS13-NoTicket-NoAccept` sets it only on the resumed
@@ -493,6 +595,14 @@ fn runServer(
     const offered = !connection.no_ticket and connection.index >= 1 and store.psk_bytes >= 1;
     pump.handshakeServer(&server) catch |err| return pump.abort(&server, err);
     try checkNegotiated(connection, server.resumed, offered, null);
+    // Checked, not reported. BoGo asks whether early data was accepted,
+    // and a shim that answered "yes" without the library having accepted
+    // any would pass the case while proving nothing. It is a coarse
+    // check — accepted or not, never *why* — and the runner reading the
+    // half-RTT bytes back is what actually proves data flowed.
+    if (connection.expect_early_data) |wanted| {
+        if (server.early_data_accepted != wanted) return error.EarlyDataMismatch;
+    }
 
     // Slice 3's ordering, and §4.6.1's: derive the PSK, then seal the
     // ticket that stands for it, and only after `connected`.
@@ -505,11 +615,16 @@ fn runServer(
         store.psk_bytes = @intCast(psk.len);
         @memcpy(store.identity[0..ticket_identity.len], ticket_identity);
         store.identity_bytes = ticket_identity.len;
+        store.issued_at_ms = nowMs(io);
+        store.suite = server.cipherSuite();
+        store.early_data_bytes_max =
+            if (connection.enable_early_data) early_data_bytes_max else null;
         const sealed = server.sendNewSessionTicket(&.{
-            .lifetime_s = 3600,
+            .lifetime_s = ticket_lifetime_s,
             .age_add = 0,
             .ticket_nonce = &ticket_nonce,
             .ticket = ticket_identity,
+            .early_data_bytes_max = store.early_data_bytes_max,
         }, &pump.out) catch |err| return pump.abort(&server, err);
         try pump.write(sealed);
     }
@@ -689,7 +804,23 @@ const Pump = struct {
                 .send => |bytes| try pump.write(bytes),
                 .connected => {},
                 .closed => return error.PeerClosedDuringHandshake,
-                .application_data => return error.UnexpectedEvent,
+                // §4.2.10's early data, arriving before the handshake is
+                // finished — and the answer is §2's 0.5-RTT, which is
+                // what BoGo's `ExpectHalfRTTData` blocks waiting for.
+                // Complemented, which is the same reply `exchange` gives
+                // ordinary application data and what `bssl_shim` sends.
+                .application_data => |bytes| {
+                    if (bytes.len == 0) continue;
+                    assert(bytes.len <= pump.scratch.len);
+                    // Copied out first: `bytes` points into `pump.out`,
+                    // which is where the reply gets sealed.
+                    for (bytes, 0..) |byte, index| pump.scratch[index] = byte ^ 0xff;
+                    const sealed = server.sendApplicationData(
+                        pump.scratch[0..bytes.len],
+                        &pump.out,
+                    ) catch |err| return pump.abort(server, err);
+                    try pump.write(sealed);
+                },
             };
         }
     }
@@ -942,9 +1073,13 @@ fn alertFor(err: anyerror) ?alert.Description {
         error.TooManyEmptyRecords,
         error.TooManyKeyUpdates,
         error.TooManyWarningAlerts,
-        // §4.2.10's ceiling on rejected early data, which is the same
-        // shape of refusal and gets the same alert from BoringSSL.
+        // §4.2.10's two early-data ceilings answer the same way, and
+        // BoringSSL sends this for both (`SSL_R_TOO_MUCH_SKIPPED_EARLY_DATA`
+        // in `ssl/tls_record.cc`, `SSL_R_TOO_MUCH_READ_EARLY_DATA` in
+        // `ssl/s3_pkt.cc`): one bounds data we declined and never keyed,
+        // the other data we did.
         error.TooMuchSkippedEarlyData,
+        error.TooMuchEarlyData,
         => .unexpected_message,
         // Not a TLS record at all — the same answer BoringSSL gives an
         // HTTP request that arrived on the TLS port.

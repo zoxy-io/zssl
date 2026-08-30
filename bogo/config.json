@@ -1,4 +1,5 @@
 {
+  "HalfRTTTickets": 0,
   "ErrorMap": {
     ":BAD_SIGNATURE:": [
       "zssl:BadSignature"
@@ -213,6 +214,9 @@
     ],
     ":SSLV3_ALERT_HANDSHAKE_FAILURE:": [
       "zssl:PeerAlert:handshake_failure"
+    ],
+    ":TOO_MUCH_READ_EARLY_DATA:": [
+      "zssl:TooMuchEarlyData"
     ]
   },
   "DisabledTests": {

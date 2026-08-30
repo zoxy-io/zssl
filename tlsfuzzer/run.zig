@@ -159,6 +159,18 @@ pub fn main(init: std.process.Init) !u8 {
 
     watchdog_stage.store(3, .release);
     const scripts = try loadScripts(io, arena, options.config_path);
+    const unnamed = countUnnamedScripts(io, arena, scripts) catch |err| {
+        std.debug.print("tlsfuzzer: could not read the checkout's scripts ({t})\n", .{err});
+        return 2;
+    };
+    if (unnamed > 0) {
+        std.debug.print(
+            "tlsfuzzer: {d} `test-tls13-*` script(s) in the checkout that scripts.json does " ++
+                "not name. A pin bump adds cases; each needs a Run entry or a Disabled reason.\n",
+            .{unnamed},
+        );
+        return 1;
+    }
     std.debug.print(
         "tlsfuzzer: {d} scripts to run, {d} disabled ({d} of those untriaged)\n",
         .{ scripts.run.len, scripts.disabled, scripts.untriaged },
@@ -308,6 +320,9 @@ const Script = struct {
 
 const Scripts = struct {
     run: []const Script,
+    /// Every name the ledger mentions, run or disabled — what
+    /// `countUnnamedScripts` holds the checkout against.
+    names: std.StringHashMapUnmanaged(void),
     disabled: u32,
     /// Disabled entries whose reason says nobody has worked out *why*
     /// yet. Counted separately and printed on every run, because a
@@ -316,12 +331,50 @@ const Scripts = struct {
     untriaged: u32,
 };
 
+/// Every `test-tls13-*.py` the checkout holds must be named in
+/// `scripts.json`, in one list or the other.
+///
+/// The ledger used to be trusted to know its own corpus, and it did not:
+/// the gate ran what the file named and counted what the file disabled,
+/// so a script present on disk and absent from both lists was invisible.
+/// A pin bump that adds cases is exactly when that matters — new tests
+/// arrive and nothing says so, which is the quiet suppression the
+/// passing floor exists to prevent, arriving by a door the floor does
+/// not watch. BoGo's runner enumerates its own corpus and ours did not.
+///
+/// The prefix is the corpus definition and it is imperfect: five scripts
+/// drive TLS 1.3 without carrying it in their name, and they are named
+/// in the ledger individually because a convention is not a decision.
+/// What this catches is the class that would otherwise be silent.
+fn countUnnamedScripts(io: Io, arena: std.mem.Allocator, scripts: Scripts) !u32 {
+    const checkout = try absolutePath(io, arena, checkout_dir);
+    const path = try std.fmt.allocPrint(arena, "{s}/scripts", .{checkout});
+    var dir = try Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    var unnamed: u32 = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        // No `entry.kind` filter, and that is not laziness: every script
+        // in this checkout is a symlink to a shared `_stub.py`, so all
+        // but one entry answers `.sym_link` and a filter on `.file`
+        // silently matches nothing. The name is the whole test, which is
+        // what a directory of dispatch stubs leaves us.
+        if (!std.mem.startsWith(u8, entry.name, "test-tls13-")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".py")) continue;
+        if (scripts.names.contains(entry.name)) continue;
+        std.debug.print("tlsfuzzer: unnamed script: {s}\n", .{entry.name});
+        unnamed += 1;
+    }
+    return unnamed;
+}
+
 /// `scripts.json`: a `Run` list of `{name, arguments?, leaf?}` and a
 /// `Disabled` map from script name to the one-line reason it is not run.
 /// The shape follows tlsfuzzer's own `tests/tlslite-ng.json` closely
 /// enough that a reader of one can read the other; `leaf` is ours, and
 /// names an entry in `leaves` above.
 fn loadScripts(io: Io, arena: std.mem.Allocator, path: []const u8) !Scripts {
+    var names: std.StringHashMapUnmanaged(void) = .empty;
     const contents = try readFile(io, arena, path);
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, contents, .{});
     if (parsed.value != .object) return error.MalformedConfig;
@@ -344,6 +397,7 @@ fn loadScripts(io: Io, arena: std.mem.Allocator, path: []const u8) !Scripts {
             if (value != .string) return error.MalformedConfig;
             break :blk value.string;
         } else default_leaf;
+        try names.put(arena, name.string, {});
         try scripts.append(arena, .{
             .name = name.string,
             .arguments = arguments.items,
@@ -360,6 +414,7 @@ fn loadScripts(io: Io, arena: std.mem.Allocator, path: []const u8) !Scripts {
         while (it.next()) |kv| {
             if (kv.value_ptr.* != .string) return error.MalformedConfig;
             if (kv.value_ptr.string.len == 0) return error.MalformedConfig;
+            try names.put(arena, kv.key_ptr.*, {});
             disabled += 1;
             if (std.mem.indexOf(u8, kv.value_ptr.string, "not yet triaged") != null) {
                 untriaged += 1;
@@ -367,7 +422,12 @@ fn loadScripts(io: Io, arena: std.mem.Allocator, path: []const u8) !Scripts {
         }
     }
     assert(scripts.items.len >= 1);
-    return .{ .run = scripts.items, .disabled = disabled, .untriaged = untriaged };
+    return .{
+        .run = scripts.items,
+        .names = names,
+        .disabled = disabled,
+        .untriaged = untriaged,
+    };
 }
 
 /// A `leaf` naming no harness is a typo in the ledger, not a default to

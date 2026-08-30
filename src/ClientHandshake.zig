@@ -105,6 +105,27 @@ key_share: ?backend.KeyShare,
 /// the alert that follows is *ours*, and recording the peer's byte
 /// there would describe a refusal it did not make.
 peer_alert_description: ?u8,
+/// §7.1's `c e traffic` protector, built at `start` when 0-RTT is
+/// offered and retired when EndOfEarlyData goes out — or when the
+/// server declines, which it does by saying nothing.
+///
+/// Send-only: 0-RTT is one direction by construction. Built without a
+/// ladder because there is no ladder yet — the suite is the server's to
+/// pick, and §4.2.11.2 settles the hash from the PSK instead.
+early_send: ?protect.Protector,
+/// Bytes handed to `sendEarlyData`, against the ticket's own limit.
+early_data_bytes: u32,
+/// §4.2.10: the hello on the wire carries `early_data`.
+///
+/// Not the same question as `early_send != null`, and the difference is
+/// an alert: the extension is written before the protector is built, so
+/// a protector that failed to build leaves an offer standing that we
+/// would otherwise call unsolicited when the server accepted it. The
+/// server keeps the same distinction for the same reason.
+early_data_offered: bool,
+/// §4.2.10: the server answered `early_data` in EncryptedExtensions.
+/// Until then an offer is only an offer.
+early_data_accepted: bool,
 /// Whether the hello now on the wire carries a `pre_shared_key`.
 ///
 /// Not the same question as `config.resume_session != null`, and the
@@ -147,6 +168,9 @@ const LeafKeyKind = enum { none, ecdsa, rsa };
 /// draft-ietf-tls-tlsflags. Not a flag zssl acts on — the extension is
 /// validated and dropped — but §4.6.1's block is checked rather than
 /// skipped, so its grammar has to be known.
+/// §4.2.10, and its shape is the message's: empty in a ClientHello, a
+/// `uint32 max_early_data_size` in a NewSessionTicket.
+const extension_early_data: u16 = 42;
 const extension_tls_flags: u16 = 62;
 
 /// A NewSessionTicket's extension block is short by nature: early data,
@@ -232,6 +256,26 @@ pub const Resumption = struct {
     obfuscated_age: u32,
     psk: [cipher_suite.hash_bytes_max]u8,
     psk_bytes: u8,
+    /// §4.2.10: offer 0-RTT on this session, or null — the default —
+    /// to offer none.
+    early_data: ?EarlyData = null,
+};
+
+/// The terms a ticket named, handed back to offer 0-RTT against it.
+///
+/// The two fields travel together because neither is enough alone. The
+/// limit is what the server advertised in `Ticket.early_data_bytes_max`,
+/// and offering past it is offering against terms nobody agreed to. The
+/// suite is `Ticket.suite`, and it is what the early keys are actually
+/// derived under: a PSK's length settles only the hash, and
+/// `chacha20_poly1305_sha256` shares SHA-256 with `aes_128_gcm_sha256`
+/// while using a different AEAD and a different key length. Guessing
+/// from the length seals 0-RTT under keys the server will not have, and
+/// the server has no way to tell that from a forgery — it answers
+/// bad_record_mac and the connection dies.
+pub const EarlyData = struct {
+    bytes_max: u32,
+    suite: CipherSuite,
 };
 
 pub const Config = struct {
@@ -287,6 +331,22 @@ pub const Ticket = struct {
     age_add: u32,
     nonce: []const u8,
     ticket: []const u8,
+    /// The suite this session negotiated, which is the suite the ticket
+    /// was issued under. §4.2.10 requires a resumption offering 0-RTT to
+    /// negotiate it again, and — the part that bites — the *client* needs
+    /// it to key the early data at all. A PSK's length gives only the
+    /// hash, and two of the three suites share one.
+    suite: CipherSuite,
+    /// §4.6.1's `max_early_data_size`, or null where the ticket
+    /// advertised none — which is every ticket from a server that does
+    /// not accept 0-RTT.
+    ///
+    /// Surfaced rather than acted on: what a client may offer next time
+    /// is a fact about the ticket, and the ticket is the embedder's to
+    /// store. §4.2.10 lets a client offer early data only against a
+    /// ticket that named a limit, so an embedder that drops this number
+    /// has decided against 0-RTT whether it meant to or not.
+    early_data_bytes_max: ?u32 = null,
 };
 
 /// One thing that happened, as `handleRecord` and `drain` hand it back.
@@ -325,6 +385,11 @@ pub const Error = backend.Error || protect.Error || session_keys.Error ||
     IllegalRetry,
     /// HelloRetryRequest — see the file comment for why this is final.
     HandshakeFailure,
+    /// More early data offered than the ticket advertised room for.
+    /// Ours, not the peer's: a server sizes its own ceiling against the
+    /// number it put in the ticket, so going past it is this embedder
+    /// writing a cheque the ticket did not sign.
+    TooMuchEarlyData,
     /// §4.2: the peer sent an extension we did not offer, or one that
     /// does not belong in the message carrying it. Distinct from
     /// `MalformedExtension`, which is a body we could not read.
@@ -388,6 +453,10 @@ pub fn init(config: *const Config) ClientHandshake {
         .share_group = client_hello.group_x25519,
         .key_share = null,
         .peer_alert_description = null,
+        .early_send = null,
+        .early_data_bytes = 0,
+        .early_data_offered = false,
+        .early_data_accepted = false,
         .psk_offered = false,
         .resumed = false,
         .certificate_verified = false,
@@ -411,6 +480,7 @@ pub fn alpnSelected(self: *const ClientHandshake) ?[]const u8 {
 
 pub fn deinit(self: *ClientHandshake) void {
     assert(self.ccs_seen <= ccs_seen_max);
+    if (self.early_send) |*protector| protector.deinit();
     if (self.ladder) |*ladder| switch (ladder.*) {
         inline else => |*arm| arm.deinit(),
     };
@@ -442,6 +512,10 @@ pub fn start(self: *ClientHandshake, out: []u8) []const u8 {
         .identity = resumption.identity,
         .obfuscated_age = resumption.obfuscated_age,
         .binder_bytes = resumption.psk_bytes,
+        // §4.2.10 offers 0-RTT by the extension's presence. A limit of
+        // zero is a server that advertised none, so there is nothing to
+        // offer against.
+        .early_data = if (resumption.early_data) |terms| terms.bytes_max > 0 else false,
     } else null;
     const message = client_messages.clientHello(&self.hello_storage, &.{
         .random = &self.config.client_random,
@@ -463,6 +537,24 @@ pub fn start(self: *ClientHandshake, out: []u8) []const u8 {
             resumption.psk[0..resumption.psk_bytes],
             null,
         );
+    }
+    // §7.1's `c e traffic`, over the ClientHello alone — which is the
+    // whole reason 0-RTT can put data on the wire before a ServerHello
+    // answers. Derived here because here is the only moment the
+    // transcript *is* that hello, and keyed off the PSK's own hash: the
+    // suite is the server's to pick and has not been picked.
+    if (psk) |offer| {
+        // Set from the wire, not from what follows: the extension is
+        // already written, so this is true even if the protector below
+        // cannot be built.
+        self.early_data_offered = offer.early_data;
+        if (offer.early_data) self.startEarlyKeys() catch {
+            // A protector we could not build is not a handshake we must
+            // fail: the offer stands on the wire, nothing has been sent
+            // under it, and the server accepting costs us one round trip
+            // when `sendEarlyData` answers null.
+            self.early_send = null;
+        };
     }
     var builder = wire.Builder.init(out);
     appendPlaintextRecord(&builder, .handshake, self.hello_storage[0..self.hello_bytes]);
@@ -585,6 +677,68 @@ fn handleAlertPayload(self: *ClientHandshake, payload: []const u8) Error!?Event 
             return error.PeerAlert;
         },
     }
+}
+
+/// §7.1's other child of the early secret, on the client's side of it.
+///
+/// The suite comes from the *ticket*, not from anything negotiated —
+/// there is no negotiated suite yet — and not from the PSK's length
+/// either, which is the trap `patchBinder` two functions away can afford
+/// to fall into and this cannot. A binder needs only the hash, so a
+/// 32-byte PSK settles it; early *records* need the AEAD as well, and
+/// `chacha20_poly1305_sha256` shares SHA-256 with `aes_128_gcm_sha256`.
+/// Sealing under the wrong one produces records the server cannot open
+/// and cannot tell from a forgery, so it answers bad_record_mac and the
+/// connection dies rather than falling back.
+///
+/// The transcript is the ClientHello alone, which `start` has just
+/// written and not yet absorbed anywhere.
+fn startEarlyKeys(self: *ClientHandshake) protect.Error!void {
+    assert(self.early_send == null);
+    assert(self.state == .idle);
+    const resumption = self.config.resume_session.?;
+    const psk = resumption.psk[0..resumption.psk_bytes];
+    const named = resumption.early_data.?.suite;
+    // The PSK is bound to its hash by §4.6.1's derivation, so a ticket
+    // naming a suite that hashes to another length is an embedder that
+    // paired the wrong two things.
+    assert(named.hashBytes() == psk.len);
+    switch (named) {
+        inline else => |suite| {
+            const Hash = CipherSuite.HashType(suite);
+            const Schedule = key_schedule.KeySchedule(suite);
+            var hello_hash: [Hash.digest_length]u8 = undefined;
+            Hash.hash(self.hello_storage[0..self.hello_bytes], &hello_hash, .{});
+            var schedule = Schedule.initEarly(psk);
+            defer schedule.wipe();
+            const early_traffic = schedule.deriveAt(.early, "c e traffic", &hello_hash);
+            const keys = Schedule.trafficKeys(&early_traffic);
+            self.early_send = try protect.Protector.init(suite, &keys.key, &keys.iv);
+        },
+    }
+}
+
+/// Seal one 0-RTT record (§4.2.10), or answer null when there is no
+/// offer to send it under.
+///
+/// Null rather than an error, because "this connection is not doing
+/// 0-RTT" is an ordinary answer: the embedder offered, the ticket may
+/// not have permitted it, and the data belongs on the 1-RTT stream
+/// instead. What *is* an error is going past the limit the ticket named
+/// — that is a promise the server sized its own ceiling against.
+///
+/// Callable only before the ServerHello. The keys are derived over the
+/// hello alone and the transcript stops being that the moment a
+/// ServerHello lands in it.
+pub fn sendEarlyData(self: *ClientHandshake, bytes: []const u8, out: []u8) Error!?[]const u8 {
+    assert(self.state == .awaiting_server_hello);
+    assert(bytes.len <= record.plaintext_bytes_max);
+    const protector = &(self.early_send orelse return null);
+    const bytes_max = self.config.resume_session.?.early_data.?.bytes_max;
+    errdefer self.state = .failed;
+    self.early_data_bytes +|= @intCast(bytes.len);
+    if (self.early_data_bytes > bytes_max) return error.TooMuchEarlyData;
+    return try protector.seal(.application_data, bytes, out);
 }
 
 /// §4.1.4. The retry names a group we advertised but did not share, and
@@ -720,6 +874,17 @@ fn handleHelloRetryRequest(
     self.hello_bytes = @intCast(second.len);
     self.share_group = selected;
     self.retried = true;
+    // §4.1.2's exception list removes `early_data` from a second
+    // ClientHello, and CH2 above does not carry it. Withdrawing it on
+    // the wire is only half: the keys were derived over CH1, whose
+    // transcript this retry has just replaced, so anything still holding
+    // them would seal against a hello the server never saw.
+    if (self.early_send) |*protector| {
+        protector.deinit();
+        self.early_send = null;
+    }
+    self.early_data_offered = false;
+    self.early_data_bytes = 0;
     self.psk_offered = carried != null;
     self.resumed = false;
     // §4.2.11.2's binder over §4.4.1's transcript, which is the whole of
@@ -1101,6 +1266,19 @@ fn checkEncryptedExtensions(self: *ClientHandshake, body: []const u8) Error!void
             },
             10 => {}, // supported_groups: legal here, always offered, advisory.
             16 => try self.selectAlpn(data), // application_layer_protocol_negotiation
+            42 => { // early_data — §4.2.10's acceptance, and the only one
+                // §4.2.10 gives it no body here, as in a ClientHello.
+                if (data.len != 0) return error.MalformedExtension;
+                // §4.2: an extension we did not offer is unsolicited,
+                // and this one is worse than merely unasked — a server
+                // "accepting" 0-RTT we never sent would have us send an
+                // EndOfEarlyData under keys that do not exist.
+                if (!self.early_data_offered) return error.UnsupportedExtension;
+                // A retry withdraws the offer (§4.1.2), so an
+                // acceptance after one answers a hello that never asked.
+                if (self.retried) return error.UnsupportedExtension;
+                self.early_data_accepted = true;
+            },
             else => return error.UnsupportedExtension,
         }
     }
@@ -1321,7 +1499,15 @@ fn completeHandshake(self: *ClientHandshake, arm: anytype, message: handshake.Me
     }
     if (!self.assembler.empty()) return error.UnexpectedMessage;
     const send_ccs = self.config.send_change_cipher_spec and !self.ccs_sent;
-    const flight = try arm.finishHandshake(message, send_ccs, out);
+    // The offer's keys travel only if the server took it. A declined
+    // offer leaves them unused, which is the whole cost of 0-RTT going
+    // unanswered — the data was sent and nobody read it.
+    const early: ?*protect.Protector = if (self.early_data_accepted) &self.early_send.? else null;
+    const flight = try arm.finishHandshake(message, send_ccs, early, out);
+    if (self.early_send) |*protector| {
+        protector.deinit();
+        self.early_send = null;
+    }
     if (send_ccs) self.ccs_sent = true;
     self.state = .connected;
     // The invariant this function exists to enforce, stated where a
@@ -1399,7 +1585,11 @@ fn dispatchPostHandshake(
     out: []u8,
 ) Error!?Event {
     switch (message.messageType() orelse return error.UnexpectedMessage) {
-        .new_session_ticket => return .{ .ticket = try parseTicket(message.body()) },
+        .new_session_ticket => {
+            var ticket = try parseTicket(message.body());
+            ticket.suite = self.ladder.?;
+            return .{ .ticket = ticket };
+        },
         .key_update => {
             // Counted before the rotation, because deriving the next
             // generation is the work a flood is buying (flood.zig).
@@ -1426,9 +1616,10 @@ fn dispatchPostHandshake(
 ///
 /// §4.2's duplicate rule applies to this block like any other, so the
 /// same pre-pass finding 9 added runs here first.
-fn checkTicketExtensions(block: []const u8) Error!void {
+fn checkTicketExtensions(block: []const u8) Error!?u32 {
     try wire.refuseDuplicateExtensions(ticket_extensions_max, block);
     var cursor = wire.Cursor.init(block);
+    var early_data_bytes_max: ?u32 = null;
     var seen: u16 = 0;
     while (cursor.remaining() > 0) : (seen += 1) {
         if (seen == ticket_extensions_max) return error.ExtensionOverflow;
@@ -1439,8 +1630,18 @@ fn checkTicketExtensions(block: []const u8) Error!void {
         // extension's body is opaque by definition and there is nothing
         // to check it against.
         if (extension_type == extension_tls_flags) try checkTlsFlags(data);
+        if (extension_type == extension_early_data) {
+            // §4.6.1 gives it `uint32 max_early_data_size` here, where a
+            // ClientHello gives it nothing at all — the one extension in
+            // this library whose shape depends on the message carrying
+            // it, and the reason reading the block is not optional.
+            var body = wire.Cursor.init(data);
+            early_data_bytes_max = try body.takeU32();
+            if (body.remaining() != 0) return error.MalformedMessage;
+        }
     }
     assert(cursor.remaining() == 0);
+    return early_data_bytes_max;
 }
 
 /// The `tls_flags` extension: `flags<1..255>`, one bit per flag, and the
@@ -1485,7 +1686,7 @@ fn parseTicket(body: []const u8) Error!Ticket {
     const extensions_bytes = try cursor.takeU16();
     const extensions = try cursor.takeSlice(extensions_bytes);
     if (cursor.remaining() != 0) return error.MalformedMessage;
-    try checkTicketExtensions(extensions);
+    ticket.early_data_bytes_max = try checkTicketExtensions(extensions);
     assert(ticket.nonce.len >= 1);
     assert(ticket.ticket.len >= 1);
     return ticket;
@@ -1729,7 +1930,17 @@ fn ArmOf(comptime suite: CipherSuite) type {
 
         /// Verify the server Finished, answer with ours, move to the
         /// application keys — the whole §4.4.4 tail in transcript order.
-        fn finishHandshake(self: *Self, message: handshake.Message, send_ccs: bool, out: []u8) Error![]const u8 {
+        /// `early` is the 0-RTT protector when the server accepted, and
+        /// null otherwise — §4.5's EndOfEarlyData is the last thing it
+        /// protects, and it goes out ahead of the Finished that switches
+        /// back to the handshake keys.
+        fn finishHandshake(
+            self: *Self,
+            message: handshake.Message,
+            send_ccs: bool,
+            early: ?*protect.Protector,
+            out: []u8,
+        ) Error![]const u8 {
             assert(self.schedule != null);
             assert(self.schedule.?.stage == .handshake);
             // §4.4.4 gives one verdict to both ways a Finished can be
@@ -1752,19 +1963,49 @@ fn ArmOf(comptime suite: CipherSuite) type {
             defer std.crypto.secureZero(u8, &client_application);
             defer std.crypto.secureZero(u8, &server_application);
 
+            var builder = wire.Builder.init(out);
+            if (send_ccs) builder.putSlice(&server_messages.change_cipher_spec_record);
+            // §4.5, under the *early* keys — the last thing they protect
+            // — and into the transcript, which is why `verify_data`
+            // below reads the current hash rather than `finished_hash`.
+            // §4.4 puts EndOfEarlyData in the client's handshake context
+            // and §7.1 leaves it out of the application secrets derived
+            // above, so the two diverge here and nowhere else. With no
+            // early data the hashes are equal and this is a no-op.
+            if (early) |protector| {
+                const end_of_early_data = [_]u8{
+                    @intFromEnum(handshake.MessageType.end_of_early_data),
+                    0,
+                    0,
+                    0,
+                };
+                self.transcript.update(&end_of_early_data);
+                const sealed_end = try protector.seal(
+                    .handshake,
+                    &end_of_early_data,
+                    builder.bytes[builder.index..],
+                );
+                builder.index += sealed_end.len;
+            }
             const client_key = Schedule.finishedKey(&self.client_handshake_traffic);
-            const verify_data = Schedule.verifyData(&client_key, &finished_hash);
+            const verify_data = Schedule.verifyData(&client_key, &self.transcriptHash());
             var message_buffer: [handshake.header_bytes + cipher_suite.hash_bytes_max]u8 = undefined;
             const finished_message = server_messages.finished(&message_buffer, &verify_data);
             self.transcript.update(finished_message);
             self.resumption_master = self.schedule.?.deriveAt(.master, "res master", &self.transcriptHash());
 
-            var builder = wire.Builder.init(out);
-            if (send_ccs) builder.putSlice(&server_messages.change_cipher_spec_record);
             const sealed = try self.send.?.seal(.handshake, finished_message, builder.bytes[builder.index..]);
             builder.index += sealed.len;
 
-            self.session = try session_keys.SessionKeys(suite).init(&client_application, &server_application);
+            // Zero: a client has no 0.5-RTT window. Its own Finished
+            // is the last thing it writes under the handshake keys, and
+            // nothing goes out on the application ones until the
+            // session exists.
+            self.session = try session_keys.SessionKeys(suite).init(
+                &client_application,
+                &server_application,
+                0,
+            );
             self.recv.?.deinit();
             self.send.?.deinit();
             self.recv = null;

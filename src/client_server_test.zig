@@ -282,10 +282,21 @@ fn issueTicket(
         .age_add = 0x5eed,
         .ticket_nonce = &.{0x0a},
         .ticket = "sealed-by-us!",
+        // Advertised so the *production* client's `checkTicketExtensions`
+        // meets §4.6.1's `early_data` — an extension it acts on nothing
+        // about and must still parse, which is finding 7's rule. The
+        // client cannot offer 0-RTT yet, so tolerating it is the whole
+        // of what this proves, and every resumption test downstream of
+        // this helper now carries it.
+        .early_data_bytes_max = 16384,
     }, &buffers.server_out);
     const ticket_event = (try harness.client.handleRecord(sealed, &buffers.scratch)).?;
     try testing.expectEqual(std.meta.activeTag(ticket_event), .ticket);
     try testing.expectEqual(@as(u32, 3600), ticket_event.ticket.lifetime_s);
+    // §4.6.1's limit reaches the embedder, which is the only way it can
+    // ever decide to offer 0-RTT next time: what a client may send is a
+    // fact about the ticket, and the ticket is the embedder's to store.
+    try testing.expectEqual(@as(?u32, 16384), ticket_event.ticket.early_data_bytes_max);
     var resumption: ClientHandshake.Resumption = .{
         .identity = "sealed-by-us!",
         .obfuscated_age = ticket_event.ticket.age_add,
@@ -455,7 +466,7 @@ test "a hostile server flight errors rather than panicking" {
         defer forger.deinit();
         var plaintext: [4096]u8 = undefined;
         var used: usize = 0;
-        const extensions = server_messages.encryptedExtensions(plaintext[used..], "http/1.1");
+        const extensions = server_messages.encryptedExtensions(plaintext[used..], "http/1.1", false);
         used += extensions.len;
         switch (shape.kind) {
             .verify_without_certificate => {
@@ -944,7 +955,7 @@ test "ALPN: a protocol the client never offered is refused" {
     defer forger.deinit();
     var plaintext: [4096]u8 = undefined;
     // "http/1.1" was never in the offer — only "h2" was.
-    const extensions = server_messages.encryptedExtensions(&plaintext, "http/1.1");
+    const extensions = server_messages.encryptedExtensions(&plaintext, "http/1.1", false);
     var forged_record: [record.wire_record_bytes_max]u8 = undefined;
     const sealed = try forger.seal(.handshake, extensions, &forged_record);
 
@@ -2016,4 +2027,157 @@ test "§6: an alert description this library does not name survives as its byte"
         },
     }
     try testing.expectEqual(@as(?u8, decompression_failure), harness.server.peer_alert_description);
+}
+
+test "§2: 0.5-RTT data, and the nonce sequence that survives the handoff" {
+    // The server may answer after its own Finished and before the
+    // client's. `finishFlight` already moved the send side onto
+    // application keys, so these records are protected exactly as
+    // post-handshake ones are — same key, one continuous sequence.
+    //
+    // That continuity is the whole hazard. The session's send protector
+    // is built from the same secret, so a count that restarted would
+    // reuse a nonce under a key that had already seen it. There was an
+    // assertion demanding `sequence == 0` at the handoff precisely
+    // because nothing wrote in this window before; this walks the case
+    // that assertion was guarding against.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+
+    const hello = harness.client.start(&buffers.client_out);
+    const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
+    try testing.expectEqual(std.meta.activeTag(flight), .send);
+    try testing.expect(harness.server.halfRttWritable());
+    try testing.expect(!harness.server.writable());
+
+    // Two records written before the client has said anything at all.
+    var flight_storage: [2 * record.wire_record_bytes_max]u8 = undefined;
+    @memcpy(flight_storage[0..flight.send.len], flight.send);
+    const flight_bytes = flight_storage[0..flight.send.len];
+    var half_rtt: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var half_rtt_bytes: usize = 0;
+    for ([_][]const u8{ "half-rtt one", "half-rtt two" }) |payload| {
+        const sealed = try harness.server.sendApplicationData(payload, &buffers.server_out);
+        @memcpy(half_rtt[half_rtt_bytes..][0..sealed.len], sealed);
+        half_rtt_bytes += sealed.len;
+    }
+
+    // Now finish the handshake. The session inherits the sequence.
+    var reply_storage: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var reply_bytes: usize = 0;
+    var index: usize = 0;
+    var count: u8 = 0;
+    while (index < flight_bytes.len) : (count += 1) {
+        try testing.expect(count < 8);
+        const one = recordAt(flight_bytes, index);
+        if (try harness.client.handleRecord(one, &buffers.scratch)) |event| switch (event) {
+            .connected => |bytes| {
+                @memcpy(reply_storage[0..bytes.len], bytes);
+                reply_bytes = bytes.len;
+            },
+            else => return error.TestUnexpectedResult,
+        };
+        index += one.len;
+    }
+    const reply = reply_storage[0..reply_bytes];
+    var final: ?ServerHandshake.Event = null;
+    index = 0;
+    count = 0;
+    while (index < reply.len) : (count += 1) {
+        try testing.expect(count < 8);
+        const one = recordAt(reply, index);
+        if (try harness.server.handleRecord(one, &buffers.server_out)) |event| final = event;
+        index += one.len;
+    }
+    try testing.expectEqual(std.meta.activeTag(final.?), .connected);
+    // Two records went out early, so the session starts at two.
+    const transmit = harness.server.exportKeyMaterial(.transmit);
+    try testing.expectEqual(@as(u64, 2), transmit.next_sequence);
+
+    // And the client reads all three in order, which it can only do if
+    // every nonce was distinct and consecutive.
+    index = 0;
+    var seen: usize = 0;
+    const expected = [_][]const u8{ "half-rtt one", "half-rtt two", "after" };
+    const after = try harness.server.sendApplicationData("after", &buffers.server_out);
+    @memcpy(half_rtt[half_rtt_bytes..][0..after.len], after);
+    half_rtt_bytes += after.len;
+    while (index < half_rtt_bytes) : (seen += 1) {
+        try testing.expect(seen < expected.len);
+        const one = recordAt(half_rtt[0..half_rtt_bytes], index);
+        const event = (try harness.client.handleRecord(one, &buffers.scratch)).?;
+        try testing.expectEqualSlices(u8, expected[seen], event.application_data);
+        index += one.len;
+    }
+    try testing.expectEqual(expected.len, seen);
+}
+
+test "§4.6.1: a ticket's early_data limit is read, and its grammar held to" {
+    // The extension is empty in a ClientHello and a u32 here — one code
+    // point, two shapes — so the body has to be read rather than
+    // skipped. A block we ignore is still a block we parse, which is
+    // docs/BOGO.md finding 7's rule; this is that rule applied to a
+    // field we now act on.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+    try harness.connect(&buffers);
+
+    // A ticket with no early_data extension at all: null, not zero.
+    // "Advertised nothing" and "advertised a limit of zero" are
+    // different statements and a client must not confuse them.
+    const plain = try harness.server.sendNewSessionTicket(&.{
+        .lifetime_s = 7200,
+        .age_add = 1,
+        .ticket_nonce = &.{0x11},
+        .ticket = "no-early-data",
+    }, &buffers.server_out);
+    const plain_event = (try harness.client.handleRecord(plain, &buffers.scratch)).?;
+    try testing.expectEqual(@as(?u32, null), plain_event.ticket.early_data_bytes_max);
+
+    // Zero is a real answer and reaches the embedder as one.
+    const zero = try harness.server.sendNewSessionTicket(&.{
+        .lifetime_s = 7200,
+        .age_add = 1,
+        .ticket_nonce = &.{0x12},
+        .ticket = "zero-early-data",
+        .early_data_bytes_max = 0,
+    }, &buffers.server_out);
+    const zero_event = (try harness.client.handleRecord(zero, &buffers.scratch)).?;
+    try testing.expectEqual(@as(?u32, 0), zero_event.ticket.early_data_bytes_max);
+
+    // And a body that is not four bytes is a message that did not
+    // decode, whatever it holds.
+    var storage: [256]u8 = undefined;
+    var builder = wire.Builder.init(&storage);
+    const message = handshake.beginMessage(&builder, .new_session_ticket);
+    builder.putU32(7200);
+    builder.putU32(1);
+    builder.putByte(1);
+    builder.putByte(0x13);
+    builder.putU16(5);
+    builder.putSlice("short");
+    const extensions = builder.markU16();
+    builder.putU16(42); // early_data
+    const body = builder.markU16();
+    builder.putU16(0xbeef); // two bytes where §4.6.1 writes four
+    builder.patchU16(body);
+    builder.patchU16(extensions);
+    handshake.endMessage(&builder, message);
+    switch (harness.server.ladder.?) {
+        inline else => |*arm| {
+            const malformed = try arm.session.?.send.seal(
+                .handshake,
+                builder.written(),
+                &buffers.server_out,
+            );
+            try testing.expectError(
+                error.Truncated,
+                harness.client.handleRecord(malformed, &buffers.scratch),
+            );
+        },
+    }
 }

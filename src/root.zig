@@ -14,6 +14,7 @@ pub const ClientHandshake = @import("ClientHandshake.zig");
 pub const Credentials = @import("Credentials.zig");
 pub const ServerHandshake = @import("ServerHandshake.zig");
 pub const alert = @import("alert.zig");
+pub const anti_replay = @import("anti_replay.zig");
 pub const certificate_list = @import("certificate_list.zig");
 pub const der_bounds = @import("der_bounds.zig");
 pub const flood = @import("flood.zig");

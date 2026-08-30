@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 310 passed, 0 failed, 6918 declined by the shim (89), floor 310
+bogo: 324 passed, 0 failed, 6904 declined by the shim (89), floor 324
 bogo: PASS
 ```
 
@@ -41,7 +41,7 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**310 passed.** Cases the runner ran end to end and we satisfied —
+**324 passed.** Cases the runner ran end to end and we satisfied —
 including the alert we sent, which BoGo checks by name. It was 278 until
 the client could answer a HelloRetryRequest: a single-group client that
 refused every retry structurally kept 26 patterns declined, and
@@ -76,7 +76,7 @@ extension block, and 143 until §4.6.3's update requests were coalesced, and
 either gets fixed or gets an entry in `DisabledTests` with a one-line
 reason. There are no silent skips.
 
-**6918 declined** — 88% of the corpus. The shim exited 89, PORTING.md's
+**6904 declined** — 88% of the corpus. The shim exited 89, PORTING.md's
 "unimplemented", and the runner counted the case without running it.
 That number is large enough to be the first thing anyone asks about, so
 here is what it is made of. Counting each case by the *first* thing the
@@ -96,7 +96,7 @@ shim declined:
 | 167 | `-export-keying-material` — RFC 5705 exporters, which zssl has no API for. |
 | ~1800 | The rest of the flag surface, one flag at a time. |
 
-Roughly 3400 of those — DTLS, QUIC, client certificates, 0-RTT, ECH,
+Roughly 3400 of those — DTLS, QUIC, client certificates, ECH,
 compliance policies, X.509 validation — are scope decisions written down
 in DESIGN.md §1 and will never come back. The rest is headroom: the
 largest single wins available are an RFC 5705 exporter (167 cases),
@@ -838,6 +838,51 @@ name.
     which is what declining a case always does — and this one was never
     testing us in the first place. A number that drops because a
     measurement got honest is worth more than the number it replaced.
+
+18. **The 0-RTT accept path gets an adversarial oracle.** Fourteen more
+    cases, and until this one the whole feature had only tests its own
+    author wrote.
+
+    The shim opts in the way any embedder must: a clock, §8.2's strike
+    register, and tickets that advertise `max_early_data_size` — three
+    positive answers, because the library refuses early data unless it
+    has all three. `-enable-early-data` is what turns them on, and the
+    ticket's terms come back through `psk_lookup` so §4.2.10's suite
+    check and §8.3's freshness check have something to check against.
+
+    Two things had to exist before the shim could opt in at all, and
+    both were found by trying:
+
+    - **§2's 0.5-RTT data.** BoGo's server-side cases set
+      `ExpectHalfRTTData` and the runner *blocks reading* those records,
+      so a shim that cannot answer before the client's Finished hangs
+      every one of them. That was its own slice, and the nonce sequence
+      it had to carry across the session handoff was the delicate part.
+    - **`HalfRTTTickets: 0`** in the shim config. When 0-RTT is
+      accepted the runner first reads that many NewSessionTickets in the
+      half-RTT window — BoringSSL sends two — and ours sends none until
+      after `connected`. Telling the runner so is what the setting is
+      for; the alternative was inventing a ticket schedule to match
+      somebody else's.
+
+    One number came from reading their source rather than guessing.
+    `TLS13-MaxEarlyData-Server` sends exactly 14337 bytes and expects the
+    connection to end, which only happens if the ticket advertised
+    BoringSSL's own `kMaxEarlyDataAccepted` of 14336. Their comment says
+    why it sits "slightly below" `kMaxEarlyDataSkipped`'s 16384: one is
+    plaintext accepted, the other ciphertext discarded, and a server
+    that declines should never count less than one that accepts. Our
+    skip ceiling was already the second number; the shim now advertises
+    the first.
+
+    What the fourteen actually press is worth naming, because it is not
+    the happy path. `EarlyData-Server-BadFinished` is the §4.4 transcript
+    split — a client Finished that MACs the wrong context, which is the
+    bug that would have shipped silently. `SkipEndOfEarlyData`,
+    `Server-NonEmptyEndOfEarlyData`, `TrailingMessageData-EndOfEarlyData`
+    and `WrongMessageType-EndOfEarlyData` are §4.5's grammar from four
+    directions. `PartialEndOfEarlyDataWithClientHello` packs a fragment
+    of it against a hello. `TLS13-MaxEarlyData-Server` walks the ceiling.
 
 None of these are exploitable as far as the runner can show; they are
 laxity, and laxity is what BoGo exists to find.
