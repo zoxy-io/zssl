@@ -32,6 +32,11 @@ pub const PskKind = enum {
     }
 };
 
+/// Re-exported so an embedder bounding its own label buffer has one
+/// name to reach for, and does not have to know the derivation runs on
+/// `hkdf`'s wire limit.
+pub const exporter_label_bytes_max = hkdf.exporter_label_bytes_max;
+
 pub fn KeySchedule(comptime suite: CipherSuite) type {
     const Hash = CipherSuite.HashType(suite);
     const Kdf = hkdf.Hkdf(Hash);
@@ -181,6 +186,39 @@ pub fn KeySchedule(comptime suite: CipherSuite) type {
             var out: [hash_bytes]u8 = undefined;
             Kdf.expandLabel(resumption_master, "resumption", ticket_nonce, &out);
             return out;
+        }
+
+        /// §7.5's TLS-Exporter, in the two steps the RFC writes it as:
+        ///
+        ///     HKDF-Expand-Label(Derive-Secret(Secret, label, ""),
+        ///                       "exporter", Hash(context_value),
+        ///                       key_length)
+        ///
+        /// `Secret` is the exporter_master the caller already derived,
+        /// so this is a pure function of it — no stage to assert,
+        /// because the schedule it came from may be long wiped by the
+        /// time an application asks.
+        ///
+        /// The inner Derive-Secret uses the *empty* transcript, not the
+        /// handshake's: §7.5's context is hashed and goes in the outer
+        /// call, and the two are easy to swap. Only the outer expansion
+        /// may exceed one hash length.
+        pub fn exporter(
+            exporter_master: *const [hash_bytes]u8,
+            label: []const u8,
+            context: []const u8,
+            out: []u8,
+        ) void {
+            // Empty labels admitted; see `hkdf.expandLabelLong`.
+            assert(label.len <= hkdf.exporter_label_bytes_max);
+            assert(out.len >= 1);
+            assert(!std.mem.allEqual(u8, exporter_master, 0));
+            var base: [hash_bytes]u8 = undefined;
+            defer std.crypto.secureZero(u8, &base);
+            Kdf.expandLabelLong(exporter_master, label, &emptyTranscriptHash(), &base);
+            var context_hash: [hash_bytes]u8 = undefined;
+            Hash.hash(context, &context_hash, .{});
+            Kdf.expandLabelLong(&base, "exporter", &context_hash, out);
         }
 
         /// Erase the current secret and move to the terminal stage. Every

@@ -2322,3 +2322,100 @@ test "§4.4.2: the embedder's signing preference is obeyed, and refused when emp
         pinned.server.handleRecord(hello, &pinned_buffers.server_out),
     );
 }
+
+test "§7.5: both machines export the same keying material, and not before" {
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+
+    // Before the handshake there is no exporter_master, and the honest
+    // answer is an error. Zeroes would be worse: they look like keying
+    // material and an embedder would ship them.
+    var early: [32]u8 = undefined;
+    try testing.expectError(
+        error.HandshakeNotComplete,
+        harness.client.exporter("label", "context", &early),
+    );
+    try testing.expectError(
+        error.HandshakeNotComplete,
+        harness.server.exporter("label", "context", &early),
+    );
+
+    try harness.connect(&buffers);
+
+    // The property RFC 5705 exists for: two ends of one connection,
+    // sharing no state but the handshake, agreeing byte for byte — and
+    // at a length that needs more than one HKDF block, because the
+    // single-block case would pass a truncating implementation.
+    var ours: [1024]u8 = undefined;
+    var theirs: [1024]u8 = undefined;
+    try harness.server.exporter("EXPORTER-Channel-Binding", "context", &ours);
+    try harness.client.exporter("EXPORTER-Channel-Binding", "context", &theirs);
+    try testing.expectEqualSlices(u8, &ours, &theirs);
+    // Not zeroes, which is the failure mode a memcmp of two broken
+    // implementations would sail straight past.
+    try testing.expect(!std.mem.allEqual(u8, &ours, 0));
+
+    // Every comparison below is against a baseline of the *same length*.
+    // §7.1 puts the requested length inside HkdfLabel, so two exports of
+    // different sizes differ no matter what else is equal — comparing
+    // 1024 bytes against 32 would pass an implementation that ignored
+    // the label and the context entirely. It did, when this test first
+    // made that mistake.
+    // For the same reason, a 1024-byte export's first 32 bytes are *not*
+    // a 32-byte export, so the baseline is derived rather than sliced.
+    var baseline: [32]u8 = undefined;
+    try harness.server.exporter("EXPORTER-Channel-Binding", "context", &baseline);
+    try testing.expect(!std.mem.eql(u8, ours[0..32], &baseline));
+
+    // §7.5 hashes the context into the derivation, so a different one is
+    // a different secret. An implementation that dropped it would agree
+    // with itself while binding nothing.
+    var other_context: [32]u8 = undefined;
+    try harness.server.exporter("EXPORTER-Channel-Binding", "different", &other_context);
+    try testing.expect(!std.mem.eql(u8, &baseline, &other_context));
+
+    // As does a different label.
+    var other_label: [32]u8 = undefined;
+    try harness.server.exporter("EXPORTER-Other", "context", &other_label);
+    try testing.expect(!std.mem.eql(u8, &baseline, &other_label));
+
+    // An empty context is a request §7.5 has a shape for, and is not the
+    // same request as any non-empty one.
+    var empty_context: [32]u8 = undefined;
+    try harness.server.exporter("EXPORTER-Channel-Binding", "", &empty_context);
+    try testing.expect(!std.mem.eql(u8, &baseline, &empty_context));
+
+    // An empty *label* too. §7.1's `opaque label<7..255>` cannot encode
+    // one — "tls13 " is only six bytes — but HkdfLabel is hashed and
+    // never transmitted, and every implementation BoGo drives accepts
+    // it. This asserted `label.len >= 1` until BoGo panicked the shim on
+    // its own configuration.
+    var empty_label: [32]u8 = undefined;
+    var empty_label_peer: [32]u8 = undefined;
+    try harness.server.exporter("", "context", &empty_label);
+    try harness.client.exporter("", "context", &empty_label_peer);
+    try testing.expectEqualSlices(u8, &empty_label, &empty_label_peer);
+    try testing.expect(!std.mem.eql(u8, &baseline, &empty_label));
+}
+
+test "§7.5: a server can export inside the 0.5-RTT window" {
+    // The half-RTT case BoGo drives: the server's flight is out, the
+    // client's Finished has not arrived, and §7.1 says exporter_master
+    // is already derivable because its transcript ends at the *server*
+    // Finished. A server answering early data is exactly who asks.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+
+    const hello = harness.client.start(&buffers.client_out);
+    _ = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
+    try testing.expect(harness.server.halfRttWritable());
+    try testing.expectEqual(ServerHandshake.State.awaiting_finished, harness.server.state);
+
+    var half_rtt: [32]u8 = undefined;
+    try harness.server.exporter("EXPORTER-Channel-Binding", "context", &half_rtt);
+    try testing.expect(!std.mem.allEqual(u8, &half_rtt, 0));
+}

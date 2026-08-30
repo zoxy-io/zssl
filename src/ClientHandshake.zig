@@ -431,6 +431,12 @@ pub const Error = backend.Error || protect.Error || session_keys.Error ||
     UnofferedSignatureScheme,
     /// The server's Finished MAC did not verify.
     DecryptError,
+    /// `exporter` was called before §7.5's secret exists — before the
+    /// server Finished that its transcript names. Not the peer's fault
+    /// and not a protocol error: the connection is intact and the answer
+    /// is "ask again once you are connected". Zeroes would be worse:
+    /// they look like keying material.
+    HandshakeNotComplete,
     /// The server selected an ALPN protocol we did not offer (RFC 7301).
     BadAlpn,
     /// A field that parses but is not minimally encoded, where its
@@ -1876,6 +1882,32 @@ pub fn exportKeyMaterial(self: *const ClientHandshake, direction: Direction) ktl
     }
 }
 
+/// RFC 5705 keying material, through RFC 8446 §7.5's construction. See
+/// `ServerHandshake.exporter` for what it is and why the name is close
+/// to `exportKeyMaterial`'s without being related to it.
+///
+/// Available from `connected` and no earlier. A client that is still
+/// sending 0-RTT has no exporter: §7.5's secret comes from a transcript
+/// that includes the server's Finished, which it has not seen — and the
+/// early_exporter_master that *would* answer is a different secret with
+/// weaker properties, which this library does not derive.
+pub fn exporter(
+    self: *const ClientHandshake,
+    label: []const u8,
+    context: []const u8,
+    out: []u8,
+) Error!void {
+    assert(label.len <= key_schedule.exporter_label_bytes_max);
+    assert(out.len >= 1);
+    if (self.state != .connected and self.state != .close_sent) return error.HandshakeNotComplete;
+    switch (self.ladder.?) {
+        inline else => |*arm, tag| {
+            const Schedule = key_schedule.KeySchedule(tag);
+            Schedule.exporter(&arm.exporter_master, label, context, out);
+        },
+    }
+}
+
 fn appendPlaintextRecord(builder: *wire.Builder, content_type: record.ContentType, payload: []const u8) void {
     assert(payload.len >= 1);
     assert(payload.len <= record.plaintext_bytes_max);
@@ -1914,6 +1946,11 @@ fn ArmOf(comptime suite: CipherSuite) type {
         schedule: ?Schedule,
         client_handshake_traffic: [hash_bytes]u8,
         server_handshake_traffic: [hash_bytes]u8,
+        /// §7.5's exporter base, `Derive-Secret(Master, "exp master",
+        /// ClientHello..server Finished)`. Derived with the application
+        /// secrets, because that is where the transcript it names is
+        /// complete.
+        exporter_master: [hash_bytes]u8,
         resumption_master: [hash_bytes]u8,
         recv: ?protect.Protector,
         send: ?protect.Protector,
@@ -1926,6 +1963,7 @@ fn ArmOf(comptime suite: CipherSuite) type {
             .schedule = null,
             .client_handshake_traffic = undefined,
             .server_handshake_traffic = undefined,
+            .exporter_master = undefined,
             .resumption_master = undefined,
             .recv = null,
             .send = null,
@@ -2024,6 +2062,7 @@ fn ArmOf(comptime suite: CipherSuite) type {
             self.transcript.update(message.bytes);
             const finished_hash = self.transcriptHash();
             self.schedule.?.advanceToMaster();
+            self.exporter_master = self.schedule.?.deriveAt(.master, "exp master", &finished_hash);
             var client_application = self.schedule.?.deriveAt(.master, "c ap traffic", &finished_hash);
             var server_application = self.schedule.?.deriveAt(.master, "s ap traffic", &finished_hash);
             // `SessionKeys` takes its own copies and owns rotation from

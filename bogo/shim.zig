@@ -47,6 +47,11 @@ const group_x25519: u16 = 29;
 /// A session that needs more records than this is wedged, not slow.
 const records_per_phase_max: u32 = 4096;
 
+/// The most keying material one case asks for. BoGo's largest request is
+/// 1024 bytes; the headroom is so a corpus bump does not turn a bigger
+/// ask into a wrong answer rather than a decline.
+const export_bytes_max: u32 = 4096;
+
 /// The library's own caps, not a guess at them: a value the runner picks
 /// must be measured against what `ClientHandshake.init` will assert on,
 /// or the shim panics where its whole contract is to exit 89.
@@ -174,6 +179,13 @@ const Connection = struct {
     /// of being declined for a type that could not hold it.
     signing_prefs: [16]u16 = undefined,
     signing_pref_count: u8 = 0,
+    /// §7.5's exporter, as BoGo asks for it: how many bytes to export,
+    /// under what label and context. The runner derives the same secret
+    /// itself and expects the shim to write ours first thing, so this is
+    /// checked against a second implementation rather than a vector.
+    export_bytes: ?u32 = null,
+    export_label: []const u8 = "",
+    export_context: []const u8 = "",
 
     expect_version: ?u16 = null,
     expect_curve_id: ?u16 = null,
@@ -294,7 +306,8 @@ fn flagArity(name: []const u8) ?Arity {
         "-curves",                          "-advertise-alpn",           "-select-alpn",
         "-expect-alpn",                     "-host-name",                "-expect-curve-id",
         "-read-size",                       "-expect-early-data-reason", "-verify-prefs",
-        "-expect-peer-signature-algorithm", "-signing-prefs",
+        "-expect-peer-signature-algorithm", "-signing-prefs",            "-export-keying-material",
+        "-export-label",                    "-export-context",
     };
     const without_value = [_][]const u8{
         "-ipv6",                     "-server",             "-shim-writes-first",
@@ -302,7 +315,7 @@ fn flagArity(name: []const u8) ?Arity {
         "-expect-session-miss",      "-expect-no-session",  "-decline-alpn",
         "-no-tls1",                  "-no-tls11",           "-no-tls12",
         "-expect-no-hrr",            "-enable-early-data",  "-expect-accept-early-data",
-        "-expect-reject-early-data",
+        "-expect-reject-early-data", "-use-export-context",
     };
     for (with_value) |candidate| if (std.mem.eql(u8, name, candidate)) return .one;
     for (without_value) |candidate| if (std.mem.eql(u8, name, candidate)) return .none;
@@ -349,6 +362,21 @@ fn applyFlag(connection: *Connection, name: []const u8, value: ?[]const u8) Pars
     } else if (std.mem.eql(u8, name, "-expect-peer-signature-algorithm")) {
         connection.expect_peer_signature_algorithm =
             std.fmt.parseInt(u16, value.?, 10) catch return error.BadFlagValue;
+    } else if (std.mem.eql(u8, name, "-export-keying-material")) {
+        const bytes = std.fmt.parseInt(u32, value.?, 10) catch return error.BadFlagValue;
+        if (bytes == 0 or bytes > export_bytes_max) return unimplemented(name);
+        connection.export_bytes = bytes;
+    } else if (std.mem.eql(u8, name, "-export-label")) {
+        if (value.?.len > zssl.key_schedule.exporter_label_bytes_max) return unimplemented(name);
+        connection.export_label = value.?;
+    } else if (std.mem.eql(u8, name, "-export-context")) {
+        connection.export_context = value.?;
+    } else if (std.mem.eql(u8, name, "-use-export-context")) {
+        // Accepted and ignored, deliberately. It is TLS 1.2's distinction
+        // between "no context" and "an empty one"; §7.5 has a single
+        // shape and always hashes what it is given, so both requests are
+        // the same one here — and the runner's own TLS 1.3 exporter
+        // ignores the flag for exactly that reason (`conn.go`).
     } else if (std.mem.eql(u8, name, "-expect-curve-id")) {
         connection.expect_curve_id = std.fmt.parseInt(u16, value.?, 10) catch return error.BadFlagValue;
     } else if (std.mem.eql(u8, name, "-advertise-alpn")) {
@@ -649,6 +677,7 @@ fn runServer(
     const offered = !connection.no_ticket and connection.index >= 1 and store.psk_bytes >= 1;
     pump.handshakeServer(&server) catch |err| return pump.abort(&server, err);
     try checkNegotiated(connection, server.resumed, offered, null, server.key_share_group, null);
+    try writeExportedMaterial(pump, &server, connection);
     // Checked, not reported. BoGo asks whether early data was accepted,
     // and a shim that answered "yes" without the library having accepted
     // any would pass the case while proving nothing. It is a coarse
@@ -761,6 +790,7 @@ fn runClient(
         zssl.backend.Group.fromWire(client.share_group),
         store.peer_signature_scheme,
     );
+    try writeExportedMaterial(pump, &client, connection);
 
     try pump.exchange(&client, connection, store);
     if (connection.expect_no_session and store.tickets_this_exchange >= 1) {
@@ -802,6 +832,29 @@ fn configuredVerifySchemes(
         out[i] = zssl.backend.SignatureScheme.fromWire(wire) orelse return null;
     }
     return out[0..connection.verify_pref_count];
+}
+
+/// §7.5's material, written to the peer before anything else. BoGo's
+/// runner derives the same bytes from its own handshake and reads
+/// exactly this many, so a shim that exported the wrong secret fails
+/// against a second implementation rather than against a stored vector.
+fn writeExportedMaterial(
+    pump: *Pump,
+    machine: anytype,
+    connection: *const Connection,
+) !void {
+    const bytes = connection.export_bytes orelse return;
+    var material: [export_bytes_max]u8 = undefined;
+    machine.exporter(
+        connection.export_label,
+        connection.export_context,
+        material[0..bytes],
+    ) catch |err| return pump.abort(machine, err);
+    const sealed = machine.sendApplicationData(
+        material[0..bytes],
+        &pump.out,
+    ) catch |err| return pump.abort(machine, err);
+    try pump.write(sealed);
 }
 
 /// The `-expect-*` assertions both roles share. A mismatch is the shim's
