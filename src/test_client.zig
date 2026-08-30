@@ -137,6 +137,8 @@ pub fn TestClient(comptime suite: CipherSuite) type {
         /// Facts the tests assert on afterwards.
         saw_retry: bool,
         certificate_verified: bool,
+        /// §4.3.2 arrived and we owe an answer at the client flight.
+        certificate_requested: bool,
         alpn_selected: bool,
         psk_accepted: bool,
 
@@ -197,6 +199,7 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                 .ticket_count = 0,
                 .saw_retry = false,
                 .certificate_verified = false,
+                .certificate_requested = false,
                 .alpn_selected = false,
                 .psk_accepted = false,
             };
@@ -642,6 +645,16 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                         try self.leafFromCertificate(message.body());
                         self.transcript.update(message.bytes);
                     },
+                    // §4.3.2. This client never holds a certificate, so
+                    // the answer is always §4.4.2's empty list — which is
+                    // the case worth having an independent oracle for:
+                    // whether the server then aborts is §4.4.2.1's
+                    // `require`, and getting that wrong in *either*
+                    // direction is a silent authentication failure.
+                    .certificate_request => {
+                        self.certificate_requested = true;
+                        self.transcript.update(message.bytes);
+                    },
                     .certificate_verify => try self.verifyServerSignature(message),
                     .finished => return self.finishHandshake(message, out),
                     else => return error.UnexpectedMessage,
@@ -784,6 +797,24 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                 builder.index += sealed_end.len;
                 early.deinit();
                 self.early_send = null;
+            }
+            // §4.4.2: a client that was asked answers, even to decline —
+            // an empty certificate_list rather than silence, and in the
+            // transcript its own Finished MACs.
+            if (self.certificate_requested) {
+                const empty_certificate = [_]u8{
+                    @intFromEnum(handshake.MessageType.certificate),
+                    0, 0, 4, // u24 body length
+                    0, // certificate_request_context: empty, echoing §4.3.2
+                    0, 0, 0, // certificate_list: u24 zero
+                };
+                self.transcript.update(&empty_certificate);
+                const sealed_certificate = try self.send.?.seal(
+                    .handshake,
+                    &empty_certificate,
+                    builder.bytes[builder.index..],
+                );
+                builder.index += sealed_certificate.len;
             }
             const client_key = Schedule.finishedKey(&self.client_handshake_traffic);
             const verify_data = Schedule.verifyData(&client_key, &self.transcript.currentHash());

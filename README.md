@@ -251,9 +251,11 @@ refused, not downgraded.
 TLS 1.3 (RFC 8446) and nothing older, both handshake halves, the three
 standard suites, x25519/secp256r1/secp384r1, ECDSA P-256/P-384 and
 RSA-PSS, SNI, ALPN, HelloRetryRequest in both directions, PSK
-resumption, 0-RTT, KeyUpdate, and kTLS key export.
+resumption, 0-RTT, mutual authentication in both directions, RFC 5705
+exporters, KeyUpdate, and kTLS key export.
 
-Not built: client certificates. Never:
+Not built: nothing, bar the coverage-guided fuzz *search*, which is
+blocked on a compiler bug rather than on this library. Never:
 TLS 1.2 and earlier, renegotiation, compression, RSA and DSA key
 exchange, post-handshake client auth, QUIC and DTLS. X.509 chain
 building and RFC 9525 name matching are yours, through
@@ -270,7 +272,7 @@ its own CI workflow, so they run in parallel and fail separately.
 
 | Oracle | Status | Details |
 | --- | --- | --- |
-| [**BoGo**](docs/BOGO.md) | [![bogo](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml)<br>[![bogo passing](https://img.shields.io/badge/bogo-401%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6664%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | Hostile-peer corpus; checks *which* alert we send |
+| [**BoGo**](docs/BOGO.md) | [![bogo](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml)<br>[![bogo passing](https://img.shields.io/badge/bogo-424%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6596%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | Hostile-peer corpus; checks *which* alert we send |
 | [**tlsfuzzer**](docs/TLSFUZZER.md) | [![tlsfuzzer](https://github.com/zoxy-io/zssl/actions/workflows/tlsfuzzer.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/tlsfuzzer.yml)<br>[![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-22%2F62%20scripts-yellow)](docs/TLSFUZZER.md) | A third implementation, driving our *server* |
 | [**TLS-Anvil**](docs/TLSANVIL.md) | [![tlsanvil](https://github.com/zoxy-io/zssl/actions/workflows/tlsanvil.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/tlsanvil.yml)<br>[![tlsanvil passing](https://img.shields.io/badge/tls--anvil-115%20passing-brightgreen)](docs/TLSANVIL.md)<br>[![tlsanvil declined](https://img.shields.io/badge/tls--anvil-321%20declined-lightgrey)](docs/TLSANVIL.md#it-scopes-itself) | A corpus derived from the RFCs, not an implementation |
 | [**RFC 8448**](src/rfc8448_test.zig) | [![rfc8448](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml) | The RFC's traced bytes, reproduced exactly |
@@ -283,7 +285,7 @@ ClientHellos, tampered Finished messages, corrupted binders, inverted
 flights, sequence exhaustion.
 
 The gaps, stated plainly. All three adversarial gates decline far more
-than they run: BoGo never ran 6664 of its cases, tlsfuzzer runs 22
+than they run: BoGo never ran 6596 of its cases, tlsfuzzer runs 22
 scripts of 62, and 321 of TLS-Anvil's 437 tests opt out against a
 TLS 1.3-only server. That is why each carries a second, counted badge
 rather than a bare pass mark, and why each holds its passing count

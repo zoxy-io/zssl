@@ -40,6 +40,10 @@ pub const Description = enum(u8) {
     missing_extension = 109,
     unsupported_extension = 110,
     user_canceled = 90,
+    /// §4.4.2.1: we asked for a client certificate and the client
+    /// answered with an empty one. Distinct from `bad_certificate`,
+    /// which is a certificate we could not use — here there was none.
+    certificate_required = 116,
     no_application_protocol = 120,
 };
 
@@ -150,7 +154,12 @@ test "close_notify round-trips and unknown descriptions stay readable" {
 
     // An alert code this library never names still parses; it reads as
     // null description and the caller treats it as fatal.
-    const exotic = try parse(&.{ 2, 116 });
+    //
+    // 200 rather than 116: this was 116 until §4.4.2.1's
+    // `certificate_required` became a description we do name, at which
+    // point the test was asserting the opposite of what it says. 200 is
+    // unassigned in IANA's registry and has no §6.2 meaning.
+    const exotic = try parse(&.{ 2, 200 });
     try std.testing.expectEqual(@as(?Description, null), exotic.description());
     try std.testing.expect(!exotic.isCloseNotify());
 

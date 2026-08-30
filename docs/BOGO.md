@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 401 passed, 0 failed, 6664 declined by the shim (89), floor 401
+bogo: 424 passed, 0 failed, 6596 declined by the shim (89), floor 424
 bogo: PASS
 ```
 
@@ -41,9 +41,10 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**401 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. It was 367
-until §7.5's exporter landed (finding 21), 348 until the server's
+**424 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. It was 401
+until client certificates landed (finding 23), 367 until §7.5's exporter
+did (finding 21), 348 until the server's
 signing preference could be narrowed (finding 20),
 324 until the client could report and restrict its signature algorithms
 (finding 19), and 278 until
@@ -80,7 +81,7 @@ extension block, and 143 until §4.6.3's update requests were coalesced, and
 either gets fixed or gets an entry in `DisabledTests` with a one-line
 reason. There are no silent skips.
 
-**6664 declined** — 84% of the corpus. The shim exited 89, PORTING.md's
+**6596 declined** — 84% of the corpus. The shim exited 89, PORTING.md's
 "unimplemented", and the runner counted the case without running it.
 That number is large enough to be the first thing anyone asks about, so
 here is what it is made of. Counting each case by the *first* thing the
@@ -195,9 +196,10 @@ Three bugs, fixed in this slice:
    falsifies. The floor is now the encoded chain's own size.
 
 Twelve more were open, and every one that was a defect is now fixed: 1,
-2, 3, 4, 5, 6, 7, 9, 10 and 12. Four findings still carry ledger
-entries, 13 suppressed cases between them — 5 under finding 10, 5 under
-19, 2 under 8, 1 under 11 — and **none of them is an OPEN GAP**.
+2, 3, 4, 5, 6, 7, 9, 10 and 12. Five findings still carry ledger
+entries, 22 suppressed cases between them — 9 under finding 23, 5 under
+10, 5 under 19, 2 under 8, 1 under 11 — and **none of them is an OPEN
+GAP**.
 Finding 8 is two divergences we intend to keep and 19 is five more, 11 is
 a documented non-defect, and finding 10's remaining 5 are a scope
 decision filed under its number, which is why findings marked fixed still
@@ -943,7 +945,7 @@ laxity, and laxity is what BoGo exists to find.
     because §4.4.3 makes those the same promise.
     `-expect-peer-signature-algorithm` asks what the server actually
     signed with, which the client had been checking and throwing away; it
-    is `peer_signature_scheme` now, the mirror of the server's
+    is `peer.scheme` now, the mirror of the server's
     `signature_scheme` that `interop` has always asserted on.
 
     The library defect underneath: every unrecognised code point in a
@@ -1063,6 +1065,86 @@ laxity, and laxity is what BoGo exists to find.
     the requested length *inside* HkdfLabel, so those differ no matter
     what else is equal. It passed with the context dropped entirely.
     Every comparison now derives its baseline at the same length.
+
+22. **Client certificates, and a remote panic on the way in.**
+    §4.3.2 in both directions: a server asks through
+    `Config.client_auth`, a client answers through
+    `client_credentials`, and §4.4.2.1's `require` decides what a refusal
+    costs.
+
+    The corpus found a reachable assertion before it found anything else.
+    A client that never configured mTLS has no `client_auth_flight` —
+    the buffer defaults to empty — and that is exactly the client a
+    server can hand an unsolicited CertificateRequest to. Building
+    §4.4.2's empty refusal into that buffer asserted and died:
+    `CertificateRequestInResumption` panicked the shim. Declining needs
+    no chain-sized buffer at all, and now uses a nine-byte local; the
+    bound in `certificateChain` is exact rather than `total + 64`, so
+    the next caller that gets it wrong is told which number was short.
+
+    One divergence kept. A CertificateRequest without
+    `signature_algorithms` earns `missing_extension` here, where
+    BoringSSL calls it a decode error. §6.2 defines that alert for
+    "receiving a handshake message not containing an extension that is
+    mandatory to send for the offered TLS version", and §4.3.2 makes
+    this extension exactly that — so ours is the more specific answer.
+    The case does not check which alert we send, only the error name, so
+    `zssl:MissingExtension` joins `:DECODE_ERROR:` in the map rather than
+    the ledger: we refuse identically and name it better.
+
+23. **Client certificates, and four defects on the way in.** §4.3.2 in
+    both directions, 401 to 424. The corpus earned its keep before it
+    counted anything: wiring the shim found four bugs the in-tree tests
+    had not, and two of them were remote crashes.
+
+    **A panic on an unsolicited request.** A client that never configured
+    mTLS has no flight buffer — it defaults to empty — and that is
+    exactly the client a server can hand a CertificateRequest to.
+    Building §4.4.2's empty refusal into that buffer asserted and died.
+    Declining needs nine bytes, not a chain buffer.
+
+    **A panic on a large ticket.** `helloPreSharedKey` bounded the PSK
+    identity by `ticket_bytes_max`, which is the size *we* issue.
+    §4.2.11 writes `opaque identity<1..2^16-1>` and the size is the
+    issuing server's choice: BoGo's runner mints 829 bytes once a client
+    certificate is in the session, and offering one back panicked our
+    client. Any conforming server could have crashed us by issuing a
+    large ticket, and nothing about client auth was required to do it —
+    that path simply made the tickets bigger. The hello buffer is 4096
+    now and the bound is named for what it is.
+
+    **An unexpected success.** §4.4.2: "The client MUST send a
+    Certificate message if and only if the server has requested client
+    authentication." Sending *no* Certificate and sending an *empty* one
+    are different events, and treating them alike accepted a client that
+    skipped the message under `require = false`. That is the worst shape
+    a client-auth bug can take, and `SkipClientCertificate` found it.
+
+    **Two flight-order faults, one per side.** A non-empty Certificate
+    with no CertificateVerify behind it is a mandatory message missing —
+    `unexpected_message` — not a certificate we disliked. Both machines
+    said `bad_certificate`.
+
+    Two shim limits moved with them, and both had been silent. The
+    ticket store dropped anything over 256 bytes *without saying so*,
+    which is why the failure presented as "didResume is false" with no
+    error to trace; it is a hard error now, because a shim limit
+    reported as library behaviour is worse than a crash. And
+    `records_per_phase_max` was sized for a flight with two fewer
+    messages in it, so a mutual handshake split one byte to a record ran
+    out of budget.
+
+    Nine cases stay declined and marked SCOPE: they want X.509
+    `keyUsage` enforced, and DESIGN.md §1 delegates certificate policy to
+    the embedder's `chain_verifier`. We prove possession of the key a
+    leaf presents and take no view on what the leaf says it is for.
+
+    Thirty-six more are pre-1.3, and thirteen of those carry no version
+    in their name at all — `ClientAuth-Enforced`,
+    `TrailingMessageData-CertificateVerify-TLS` and the rest, where the
+    trailing `-TLS` is the *protocol* and not the version. Each was
+    checked against its generator rather than assumed, which is finding
+    17's lesson applied a third time.
 
 ## Running it
 
