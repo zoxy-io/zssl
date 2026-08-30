@@ -10,8 +10,8 @@ itself.
 It runs: `zig build tlsfuzzer`.
 
 ```
-tlsfuzzer: 22 scripts to run, 35 disabled (0 of those untriaged)
-tlsfuzzer: 22 scripts passed, 0 failed, 35 disabled, floor 22
+tlsfuzzer: 22 scripts to run, 40 disabled (0 of those untriaged)
+tlsfuzzer: 22 scripts passed, 0 failed, 40 disabled, floor 22
 tlsfuzzer: PASS
 ```
 
@@ -76,7 +76,13 @@ is reporting on the fixture.
 
 ## The numbers, and the debt
 
-**22 of 57** `test-tls13-*` scripts run, 1428 conversations between them.
+**22 of 62** scripts run, 1428 conversations between them. Sixty-two,
+not the fifty-seven this said before: the ledger enumerated the corpus by
+the `test-tls13-` prefix, and five scripts drive TLS 1.3 without carrying
+it in their name. They are declined — every one is a version downgrade,
+a TLS 1.2 handshake shape, or renegotiation — but they are declined *by
+name* now rather than by never having been looked at. See
+[the corpus it did not know it had](#the-corpus-it-did-not-know-it-had).
 `test-tls13-lengths` is 1002 of those on its own: every plaintext length
 from 1 to 2^14, each echoed back and checked for size.
 `test-tls13-connection-abort` is another 150, aborting the connection at
@@ -89,7 +95,7 @@ RSA signature scripts, the 68 conversations of `record-layer-limits`
 walking §5.1's and §5.2's caps from both sides since finding 7 closed,
 and `ccs` since finding 8 did.
 
-**35 disabled, none of them untriaged.** 23 carry scope reasons that were
+**40 disabled, none of them untriaged.** 28 carry scope reasons that were
 always plain — client certificates, FFDHE, brainpool curves, EdDSA,
 ML-DSA, ML-KEM, compressed certificates, `psk_ke` without (EC)DHE,
 TLS 1.2 fallback, AES-CCM — each pointing at a written decision. 0-RTT
@@ -99,6 +105,45 @@ scope and was the whole of docs/BOGO.md finding 14. The
 other 18 said "not yet triaged" for as long as this file has existed;
 they now say what they are, and the sweep that got them there is
 [the triage](#the-triage-of-the-eighteen) below.
+
+## The corpus it did not know it had
+
+The ledger ran what `scripts.json` named and counted what it disabled,
+and nothing checked either against the checkout. A script present on
+disk and absent from both lists was invisible — not declined, not
+counted, not anywhere. The gate reported "0 untriaged" and meant it, of
+a corpus it had defined by assumption.
+
+The assumption was the `test-tls13-` prefix, and it holds for fifty-seven
+scripts. Five more drive TLS 1.3 without saying so in their name:
+
+| Script | Why it is declined |
+| --- | --- |
+| `test-downgrade-protection` | §4.1.3's sentinel is what a server writes when it *supports* 1.3 and negotiates lower. This one never does. |
+| `test-fallback-scsv` | RFC 7507 means something only to a server that would otherwise accept the version a client fell back to. |
+| `test-message-skipping` | The messages it skips are 1.2's — its own sanity conversation sends a ClientKeyExchange. |
+| `test-record-size-limit` | RFC 8449, which zssl does not implement; §5.1's cap is the only ceiling it negotiates. |
+| `test-renegotiation-changed-clienthello` | Renegotiation, out permanently. |
+
+Every one is a scope decline, which is the least interesting possible
+outcome and not the point. The point is that they were declined *by
+never having been looked at*, and a pin bump is when that costs
+something: tlsfuzzer adds scripts, the ledger does not notice, and the
+floor — which exists to make a suppression loud — never sees them
+because they never entered the count.
+
+`run.zig` enumerates now. Every `test-tls13-*.py` in the checkout must be
+named in one list or the other, and the gate fails by name when one is
+not. BoGo's runner has always enumerated its own corpus; ours was
+trusting a file to know what was on disk beside it.
+
+One detail cost a debugging round and is worth writing down: the first
+version of the check filtered directory entries on `kind == .file` and
+matched nothing, because tlsfuzzer's `scripts/` are all symlinks to a
+shared `_stub.py`. It passed a deliberately-broken ledger without
+complaint. A gate that cannot fail is worse than no gate, and the only
+reason this one does fail is that it was tested by breaking the thing it
+watches.
 
 The method that settled the arguable ones is worth naming, because
 reading the RFC did not settle them: every disputed script was also run

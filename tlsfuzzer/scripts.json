@@ -106,6 +106,11 @@
     }
   ],
   "Disabled": {
+    "test-downgrade-protection.py": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71). \u00a74.1.3's downgrade sentinel is what a server writes when it *supports* 1.3 and negotiates lower; this one never does, so the premise cannot arise. Named without the `test-tls13-` prefix, which is why the ledger did not see it until the corpus was enumerated rather than assumed.",
+    "test-fallback-scsv.py": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71). RFC 7507's SCSV means something only to a server that would otherwise accept the lower version a client fell back to.",
+    "test-message-skipping.py": "TLS 1.0/1.1/1.2: 1.3-only by design (DESIGN.md \u00a71). The messages it skips are 1.2's \u2014 its own sanity conversation sends a ClientKeyExchange \u2014 and the four 1.3 conversations it carries already pass, which is why this is a version decline and not a gap.",
+    "test-record-size-limit.py": "SCOPE: RFC 8449's `record_size_limit`, which zssl does not implement \u2014 \u00a75.1's cap is the only ceiling it negotiates. The script also wants a `--reply-AD-size` harness that answers with a chosen number of bytes, which `tlsfuzzer/server.zig` has no mode for.",
+    "test-renegotiation-changed-clienthello.py": "Renegotiation: out of scope permanently (DESIGN.md \u00a71). Every conversation renegotiates.",
     "test-tls13-certificate-compression.py": "Compressed certificates: not implemented.",
     "test-tls13-certificate-request.py": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",
     "test-tls13-certificate-verify.py": "Client certificates: out of scope permanently (DESIGN.md \u00a71).",
