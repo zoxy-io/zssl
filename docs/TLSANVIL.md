@@ -81,6 +81,23 @@ reason, in `tlsanvil/tests.json`:
   version field once already and it refused real clients sending 0x0300
   — docs/BOGO.md, finding 4. So this one is declined, not fixed.
 
+Those four numbers add up, and the gate now insists on it:
+`115 + 0 + 1 + 321 = 437`, the total the report itself states. It is
+checked *before* the counts are printed, for the same reason the
+dead-harness check is — a set of numbers that does not reconcile must
+not be read as numbers, and printing "115 passed" first invites the eye
+to take it and skim the line saying three hundred tests went missing.
+
+What that guards is a bucket that does not exist yet. TLS-Anvil is
+pinned by image digest, and a bump that added a result category —
+skipped, inconclusive, whatever it is called next — would quietly take
+tests out of every counter here at once. The floor would not notice,
+because a test that has stopped being counted never fails. This is the
+same hole `tlsfuzzer/run.zig` had from the other direction, where the
+ledger was trusted to know a corpus nobody had enumerated
+(docs/TLSFUZZER.md), and it is worth stating that neither was found by a
+gate going red. Both were found by asking what the green meant.
+
 The ledger keys on `<class>.<method>`, not on TLS-Anvil's test ids. Those
 ids look stable and are not: the same failures carried different ids
 across runs once the tree changed underneath them. An early draft of this

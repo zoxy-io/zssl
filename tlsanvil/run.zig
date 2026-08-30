@@ -177,6 +177,20 @@ pub fn main(init: std.process.Init) !u8 {
 /// `main` to keep it under TIGER_STYLE's 70-line limit, which the other
 /// two gates' `main` functions also sit beneath.
 fn verdict(outcome: Outcome, status: u8) u8 {
+    // Before the counts, and for the same reason the dead-harness check
+    // is: a number that does not add up must not be read as a number.
+    // Printing the totals first and the discrepancy second invites the
+    // eye to take "115 passed" at face value and skim the line that says
+    // three hundred tests went missing.
+    if (outcome.total != 0 and outcome.accounted != outcome.total) {
+        std.debug.print(
+            "tlsanvil: FAIL — {d} tests accounted for of {d} the report holds. A result " ++
+                "bucket this gate does not read is a test that cannot fail, so no count " ++
+                "below is trustworthy; check report.json's counters against `parseOutcome`.\n",
+            .{ outcome.accounted, outcome.total },
+        );
+        return 1;
+    }
     std.debug.print(
         "tlsanvil: {d} passed, {d} failed, {d} suppressed, {d} disabled of {d} tests ({d} cases), floor {d}\n",
         .{ outcome.passed, outcome.failed, outcome.suppressed, outcome.disabled, outcome.total, outcome.cases, passing_floor },
@@ -387,6 +401,10 @@ const Outcome = struct {
     failed: u32,
     disabled: u32,
     total: u32,
+    /// Every test the report put in a bucket this gate counts. Held
+    /// against `total`, because a bucket we do not know about is a test
+    /// that vanishes from the arithmetic without failing anything.
+    accounted: u32,
     cases: u32,
     /// Failures with no entry in the ledger. These are the ones that
     /// stop the build.
@@ -407,6 +425,7 @@ fn readOutcome(io: Io, arena: std.mem.Allocator, config_path: []const u8) !Outco
         .failed = 0,
         .disabled = 0,
         .total = 0,
+        .accounted = 0,
         .cases = 0,
         .failures = .empty,
         .suppressed = 0,
@@ -421,6 +440,14 @@ fn readOutcome(io: Io, arena: std.mem.Allocator, config_path: []const u8) !Outco
     outcome.disabled = countOf(object, "DisabledTests");
     outcome.total = countOf(object, "TotalTests");
     outcome.cases = countOf(object, "TestCaseCount");
+    // Summed from the same counters, before the ledger carves
+    // suppressions out of `failed` below. What this is for is the bucket
+    // that does not exist yet: TLS-Anvil is pinned by image digest, and
+    // a bump that adds a result category — skipped, inconclusive,
+    // whatever they call it next — would take tests out of every count
+    // here at once. The floor would not notice, because a test that
+    // stopped being counted never fails.
+    outcome.accounted = outcome.passed + outcome.failed + outcome.disabled;
 
     const map = readFile(io, arena, results_dir ++ "/result_map.json") catch return outcome;
     const map_parsed = std.json.parseFromSlice(std.json.Value, arena, map, .{}) catch return outcome;
