@@ -101,12 +101,32 @@ compliance policies, X.509 validation — are scope decisions written down
 in DESIGN.md §1 and will never come back. The rest is headroom: the
 largest rows left are an RFC 5705 exporter (167 cases), exposing the
 peer's negotiated signature algorithm (128), and honouring
-`-signing-prefs` (122) — *rows*, deliberately, not wins. The exporter
-row was sampled after the `-curves` lesson below and is worth **six**
-cases to us: `cipher_suite_tests.go` sets the flag on every
-`-server`/`-client` case but generates none at TLS 1.3, so all of those
-are pre-1.3, and the dedicated `export_tests.go` family is mostly DTLS
-and QUIC. The other two rows have not been sampled.
+`-signing-prefs` (122) — *rows*, deliberately, not wins. All three have
+now been sampled, and they came out very differently:
+
+| Row | Cases | Would run | What is in the way |
+| --- | ---: | ---: | --- |
+| `-export-keying-material` | 167 | **6** | the rest are DTLS, QUIC or pre-1.3 |
+| `-expect-peer-signature-algorithm` | 128 | **~32** | half are pre-1.3; half of the rest verify a *client* certificate |
+| `-signing-prefs` | 122 | **~31** | `Client-Sign-*` is client certificates |
+
+The exporter row is small because `cipher_suite_tests.go` sets the flag
+on every `-server`/`-client` case but generates none at TLS 1.3, and the
+dedicated `export_tests.go` family is mostly DTLS and QUIC.
+
+The two signature-algorithm rows are the real headroom, and cheaper than
+they look because each has a precedent in the tree. The client never
+records the peer's scheme — it is a local in `verifyCertificate`,
+checked and dropped — while the server already keeps `signature_scheme`
+and `interop` asserts on it; that is one field. Restricting which
+schemes the server will sign with is `Config.groups` one type over.
+Between them the shim needs three flags it does not have:
+`-expect-peer-signature-algorithm`, `-verify-prefs`, `-signing-prefs`.
+
+Read those two figures as cases that would *run*, not cases that would
+pass. Roughly two thirds of them are algorithms we do not hold, so they
+expect a refusal, and BoGo grades refusals by alert name — finding 8 is
+what that costs when we disagree.
 
 **Read this table as "first thing declined", not "cases a fix would
 buy".** `-curves` is the worked example, and it cost a slice to learn.
