@@ -81,6 +81,7 @@ test "README: terminating TLS" {
                 .send => |bytes| try socket.writeAll(bytes),
                 .connected => {},
                 .application_data => |plaintext| try onRequest(plaintext),
+                .early_data => return error.NoEarlyDataProfile,
                 .closed => break :stream,
             }
         }
