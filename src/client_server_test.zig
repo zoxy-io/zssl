@@ -2518,3 +2518,128 @@ test "§4.3.2: an unsolicited CertificateRequest declines rather than panicking"
     try testing.expect(harness.server.peer.empty);
     try testing.expect(!harness.server.peer.verified);
 }
+
+test "§4.3.2: a resumed session refuses an unsolicited client certificate" {
+    // The authentication gap the review found. §4.3.2 forbids a
+    // CertificateRequest under a PSK, so a resumed handshake never asks
+    // — and `checkClientAuth` returns early for exactly that reason. The
+    // message arms gated on the *config* rather than on `resumed`, so a
+    // client holding any ticket could volunteer a self-signed
+    // certificate and have `peer.verified` come out true for an identity
+    // nobody requested and `require` never judged.
+    //
+    // Worse than silent: the field's own documentation tells an embedder
+    // it may read `peer.verified` on a resumed connection precisely
+    // because client auth is skipped there.
+    var store: TicketStore = undefined;
+    var buffers: Buffers = .{};
+
+    var first: Harness = undefined;
+    try first.init(.{ .store = &store, .client_auth = .{ .require = false } });
+    defer first.deinit();
+    try first.connect(&buffers);
+    const resumption = try issueTicket(&first, &buffers, &store);
+
+    var second: Harness = undefined;
+    try second.init(.{
+        .store = &store,
+        .resume_session = resumption,
+        .client_auth = .{ .require = false },
+    });
+    defer second.deinit();
+    try second.connect(&buffers);
+
+    try testing.expect(second.server.resumed);
+    // Nothing was asked for, so nothing may have been proven.
+    try testing.expect(!second.server.peer.verified);
+    try testing.expect(!second.server.peer.seen);
+    // And the client knows it was never asked.
+    try testing.expect(!second.client.certificate_requested);
+}
+
+test "§4.4: the client bounds its flight's message count, not the server" {
+    // `assert(messages_seen < 8)` assumed EncryptedExtensions,
+    // Certificate, CertificateVerify, Finished. Neither the first nor
+    // the third was single-shot, so a server could repeat either until
+    // the count walked into the assertion — a remote panic by two
+    // separate routes. Both forged here under genuine handshake keys,
+    // because our own server sends each exactly once.
+    const Shape = enum { extensions, verify };
+    for ([_]Shape{ .extensions, .verify }) |shape| {
+        var buffers: Buffers = .{};
+        var harness: Harness = undefined;
+        // `.insecure_no_verification` for the CertificateVerify case,
+        // and for the same reason the server-side test uses it: the
+        // checker records each message without looking at it, so the
+        // *first* copy succeeds and the second reaches the guard. Under
+        // the ordinary policy the first fails on its signature and the
+        // machine is dead before the count can matter.
+        try harness.init(.{
+            .certificate_policy = if (shape == .verify)
+                .insecure_no_verification
+            else
+                .leaf_signature,
+        });
+        defer harness.deinit();
+
+        const hello = harness.client.start(&buffers.client_out);
+        const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
+        const server_hello_record = recordAt(flight.send, 0);
+        _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
+
+        var forger = try serverFlightProtector(
+            &client_x25519_private,
+            hello,
+            server_hello_record,
+        );
+        defer forger.deinit();
+        var plaintext: [4096]u8 = undefined;
+        var forged: [record.wire_record_bytes_max]u8 = undefined;
+
+        const extensions = server_messages.encryptedExtensions(&plaintext, "http/1.1", false);
+        _ = try harness.client.handleRecord(
+            try forger.seal(.handshake, extensions, &forged),
+            &buffers.scratch,
+        );
+
+        switch (shape) {
+            // A second EncryptedExtensions, which §4.4 does not have.
+            .extensions => {
+                const again = server_messages.encryptedExtensions(&plaintext, "http/1.1", false);
+                try testing.expectError(
+                    error.UnexpectedMessage,
+                    harness.client.handleRecord(
+                        try forger.seal(.handshake, again, &forged),
+                        &buffers.scratch,
+                    ),
+                );
+            },
+            // A Certificate, then two CertificateVerifies. The first is
+            // refused on its signature long before the count matters —
+            // which is the point: the guard has to come *before* the
+            // verification for the second one to be unreachable.
+            .verify => {
+                const chain = server_messages.certificateChain(&plaintext, harness.credentials.chain());
+                _ = try harness.client.handleRecord(
+                    try forger.seal(.handshake, chain, &forged),
+                    &buffers.scratch,
+                );
+                var body: [128]u8 = undefined;
+                const verify = server_messages.certificateVerify(&body, 0x0403, &(.{0xa5} ** 64));
+                // The first is accepted — the policy declines to check
+                // it — which is what leaves a second one to refuse.
+                _ = try harness.client.handleRecord(
+                    try forger.seal(.handshake, verify, &forged),
+                    &buffers.scratch,
+                );
+                try testing.expectError(
+                    error.UnexpectedMessage,
+                    harness.client.handleRecord(
+                        try forger.seal(.handshake, verify, &forged),
+                        &buffers.scratch,
+                    ),
+                );
+            },
+        }
+    }
+}

@@ -1502,6 +1502,13 @@ fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []c
                 // in answer to a CertificateRequest, so this is a client
                 // answering a question we did not put.
                 const auth = self.config.client_auth orelse return error.UnexpectedMessage;
+                // §4.3.2 forbids the request under a PSK, so we never
+                // sent one on a resumed handshake and this answers
+                // nothing. Without this, `checkClientAuth` — which
+                // returns early for a resumed session precisely because
+                // it did not ask — leaves `peer.verified` set from a
+                // certificate nobody requested and `require` never saw.
+                if (self.resumed) return error.UnexpectedMessage;
                 if (self.peer.seen) return error.UnexpectedMessage;
                 try self.peer.capture(message.body(), .{
                     .policy = auth.policy,
@@ -1515,10 +1522,17 @@ fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []c
             },
             .certificate_verify => {
                 const auth = self.config.client_auth orelse return error.UnexpectedMessage;
+                if (self.resumed) return error.UnexpectedMessage;
                 // §4.4.3 signs what §4.4.2 presented, so the order is
                 // fixed — and a client that sent an empty list has
                 // nothing to sign with.
                 if (!self.peer.seen or self.peer.empty) return error.UnexpectedMessage;
+                // §4.4 sends one per flight. A second was accepted — each
+                // signs the transcript the one before it moved, so a
+                // client holding its own key can produce any number — and
+                // the fourth message then reached the count assertion
+                // below as a panic.
+                if (self.peer.verify_seen) return error.UnexpectedMessage;
                 try self.peer.verify(message, .{
                     .policy = auth.policy,
                     .side = .client,
@@ -1540,6 +1554,15 @@ fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []c
                 if (!arm.verifyClientFinished(message)) return error.DecryptError;
                 try arm.startApplicationKeys(message);
                 self.state = .connected;
+                // The invariant this loop exists to enforce, stated
+                // where a reader can check it — the mirror of the
+                // client's. Written after the review found a resumed
+                // handshake could reach here with `peer.verified` set
+                // from a certificate nobody requested: an assertion here
+                // would have shown that at the site rather than needing
+                // a code read to find.
+                assert(!self.peer.verified or
+                    (!self.resumed and self.config.client_auth != null));
                 return .connected;
             },
             else => return error.UnexpectedMessage,
@@ -2029,6 +2052,7 @@ fn LadderOf(comptime suite: CipherSuite) type {
             std.crypto.secureZero(u8, &self.server_handshake_traffic);
             std.crypto.secureZero(u8, &self.client_application_traffic);
             std.crypto.secureZero(u8, &self.server_application_traffic);
+            std.crypto.secureZero(u8, &self.exporter_master);
             std.crypto.secureZero(u8, &self.resumption_master);
             self.* = undefined;
         }

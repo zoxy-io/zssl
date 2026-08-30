@@ -147,6 +147,9 @@ peer: peer_certificate.PeerCertificate,
 /// empty one. Distinct from holding credentials: a client with none
 /// still has to answer.
 certificate_requested: bool,
+/// §4.4 sends one EncryptedExtensions; a second is a message count the
+/// peer chose rather than one we bounded.
+encrypted_extensions_seen: bool,
 /// The schemes the request named, narrowed to those our own key can
 /// produce. Empty with no request, and empty when nothing intersects —
 /// which is a refusal to sign rather than a handshake failure, because
@@ -551,6 +554,7 @@ pub fn init(config: *const Config) ClientHandshake {
         .resumed = false,
         .peer = .{},
         .certificate_requested = false,
+        .encrypted_extensions_seen = false,
         .signable = undefined,
         .signable_count = 0,
         .alpn_selected = null,
@@ -1056,6 +1060,13 @@ fn readRetryExtensions(self: *ClientHandshake, body: *wire.Cursor) Error!RetryEx
                 const cookie_bytes = std.mem.readInt(u16, data[0..2], .big);
                 if (cookie_bytes == 0) return error.BadServerHello;
                 if (@as(usize, cookie_bytes) + 2 != data.len) return error.BadServerHello;
+                // §4.2.2 says we echo it verbatim in the second hello, so
+                // its size is a length the *server* picks for a buffer
+                // *we* fixed. Bounded here rather than in the encoder,
+                // where `wire.Builder` would have taken it as an
+                // assertion — the same shape as the oversized ticket, and
+                // reachable from any server generous with retry state.
+                if (cookie_bytes > client_messages.cookie_bytes_max) return error.BadServerHello;
                 result.cookie = data[2..];
             },
             43 => {
@@ -1370,6 +1381,12 @@ fn drainFlight(self: *ClientHandshake, arm: anytype, out: []u8) Error!?Event {
         assert(messages_seen < 8); // EE, Certificate, CertificateVerify, Finished.
         switch (message.messageType() orelse return error.UnexpectedMessage) {
             .encrypted_extensions => {
+                // §4.4 sends one. Unbounded repeats walked the message
+                // count into `assert(messages_seen < 8)` — the same
+                // panic the duplicate CertificateVerify below reached by
+                // its own route.
+                if (self.encrypted_extensions_seen) return error.UnexpectedMessage;
+                self.encrypted_extensions_seen = true;
                 try self.checkEncryptedExtensions(message.body());
                 arm.transcript.update(message.bytes);
             },
@@ -1407,6 +1424,11 @@ fn drainFlight(self: *ClientHandshake, arm: anytype, out: []u8) Error!?Event {
                 // keying this off one rejected every such handshake that
                 // met a server which actually sent a certificate.
                 if (!self.peer.seen) return error.UnexpectedMessage;
+                // One per flight, per §4.4 — and a server that repeats it
+                // can sign each copy over the transcript the last one
+                // moved, so the count is the peer's to choose without
+                // this.
+                if (self.peer.verify_seen) return error.UnexpectedMessage;
                 try self.peer.verify(message, .{
                     .policy = self.config.certificate_policy,
                     .side = .server,
@@ -1524,6 +1546,14 @@ fn completeHandshake(self: *ClientHandshake, arm: anytype, message: handshake.Me
     // The offer's keys travel only if the server took it. A declined
     // offer leaves them unused, which is the whole cost of 0-RTT going
     // unanswered — the data was sent and nobody read it.
+    // A server may accept an offer whose keys we failed to build:
+    // `start` writes the extension before `startEarlyKeys` runs and
+    // deliberately keeps the offer standing if it fails. §4.5's
+    // EndOfEarlyData has to go out under those keys, so there is no
+    // flight we can honestly send — and unwrapping here made a
+    // *compliant* server's acceptance a panic. The comment in `start`
+    // promised this degraded gracefully; it did not.
+    if (self.early_data_accepted and self.early_send == null) return error.LibcryptoFailed;
     const early: ?*protect.Protector = if (self.early_data_accepted) &self.early_send.? else null;
     const flight = try arm.finishHandshake(message, send_ccs, self.clientAuthFlight(), early, out);
     if (self.early_send) |*protector| {
@@ -1704,6 +1734,13 @@ fn parseTicket(body: []const u8) Error!Ticket {
     ticket.nonce = try cursor.takeSlice(nonce_bytes);
     const ticket_bytes = try cursor.takeU16();
     if (ticket_bytes == 0) return error.MalformedMessage;
+    // §4.2.11 lets an identity run to 2^16-1 and the size is the issuing
+    // server's choice, but a ticket we could never fit back into a
+    // ClientHello is one we must not hand the embedder: it stores what
+    // we give it, offers it back, and the encoder's bound would then be
+    // an abort three flights later. Refused here, where the answer is an
+    // alert and the connection simply does not resume.
+    if (ticket_bytes > client_messages.psk_identity_bytes_max) return error.MalformedMessage;
     ticket.ticket = try cursor.takeSlice(ticket_bytes);
     const extensions_bytes = try cursor.takeU16();
     const extensions = try cursor.takeSlice(extensions_bytes);
@@ -1925,6 +1962,7 @@ fn ArmOf(comptime suite: CipherSuite) type {
             if (self.schedule) |*schedule| schedule.wipe();
             std.crypto.secureZero(u8, &self.client_handshake_traffic);
             std.crypto.secureZero(u8, &self.server_handshake_traffic);
+            std.crypto.secureZero(u8, &self.exporter_master);
             std.crypto.secureZero(u8, &self.resumption_master);
             self.* = undefined;
         }
@@ -1988,6 +2026,70 @@ fn ArmOf(comptime suite: CipherSuite) type {
         /// null otherwise — §4.5's EndOfEarlyData is the last thing it
         /// protects, and it goes out ahead of the Finished that switches
         /// back to the handshake keys.
+        /// §4.4.2's Certificate and §4.4.3's CertificateVerify, sealed
+        /// into the client flight before its Finished and absorbed into
+        /// the transcript that Finished MACs.
+        ///
+        /// A client that was asked answers even to decline: an empty
+        /// certificate_list rather than silence, which is what lets the
+        /// server tell "no certificate" from a broken flight.
+        ///
+        /// Its own function because `finishHandshake` was 96 lines
+        /// against TIGER_STYLE's 70-line limit and this was 46 of them —
+        /// the same split the checking side already has in
+        /// `peer_certificate.zig`.
+        fn sendClientAuth(
+            self: *Self,
+            client_auth: ?ClientAuthFlight,
+            builder: *wire.Builder,
+        ) Error!void {
+            const auth = client_auth orelse return;
+            // Declining needs no chain buffer, and must not need one:
+            // `client_auth_flight` is empty on every client that
+            // never configured mTLS, and those are exactly the
+            // clients a server can hand an unsolicited
+            // CertificateRequest to. Building the refusal into
+            // `auth.flight` panicked them — a remote assertion,
+            // found by BoGo's `CertificateRequestInResumption`.
+            var empty_storage: [handshake.header_bytes + 4]u8 = undefined;
+            const certificate_message = if (auth.credentials) |credentials|
+                server_messages.certificateChain(auth.flight, credentials.chain())
+            else
+                server_messages.certificateChain(&empty_storage, &.{});
+            self.transcript.update(certificate_message);
+            const sealed_certificate = try self.send.?.seal(
+                .handshake,
+                certificate_message,
+                builder.bytes[builder.index..],
+            );
+            builder.index += sealed_certificate.len;
+
+            // Only if we sent one. §4.4.3 signs the certificate that
+            // was presented, and an empty list presented nothing.
+            if (auth.credentials) |credentials| if (auth.scheme) |scheme| {
+                var content_buffer: [server_messages.certificate_verify_content_bytes_max]u8 = undefined;
+                const to_sign = server_messages.certificateVerifyContent(
+                    .client,
+                    &self.transcriptHash(),
+                    &content_buffer,
+                );
+                var signature_buffer: [backend.signature_bytes_max]u8 = undefined;
+                const signature = try credentials.signer.sign(scheme, to_sign, &signature_buffer);
+                const verify_message = server_messages.certificateVerify(
+                    auth.flight,
+                    @intFromEnum(scheme),
+                    signature,
+                );
+                self.transcript.update(verify_message);
+                const sealed_verify = try self.send.?.seal(
+                    .handshake,
+                    verify_message,
+                    builder.bytes[builder.index..],
+                );
+                builder.index += sealed_verify.len;
+            };
+        }
+
         fn finishHandshake(
             self: *Self,
             message: handshake.Message,
@@ -2043,56 +2145,7 @@ fn ArmOf(comptime suite: CipherSuite) type {
                 );
                 builder.index += sealed_end.len;
             }
-            // §4.4.2, before our Finished and in the transcript it MACs.
-            // A client that was asked answers even to decline: an empty
-            // certificate_list rather than silence, which is what lets
-            // the server tell "no certificate" from a broken flight.
-            if (client_auth) |auth| {
-                // Declining needs no chain buffer, and must not need one:
-                // `client_auth_flight` is empty on every client that
-                // never configured mTLS, and those are exactly the
-                // clients a server can hand an unsolicited
-                // CertificateRequest to. Building the refusal into
-                // `auth.flight` panicked them — a remote assertion,
-                // found by BoGo's `CertificateRequestInResumption`.
-                var empty_storage: [handshake.header_bytes + 4]u8 = undefined;
-                const certificate_message = if (auth.credentials) |credentials|
-                    server_messages.certificateChain(auth.flight, credentials.chain())
-                else
-                    server_messages.certificateChain(&empty_storage, &.{});
-                self.transcript.update(certificate_message);
-                const sealed_certificate = try self.send.?.seal(
-                    .handshake,
-                    certificate_message,
-                    builder.bytes[builder.index..],
-                );
-                builder.index += sealed_certificate.len;
-
-                // Only if we sent one. §4.4.3 signs the certificate that
-                // was presented, and an empty list presented nothing.
-                if (auth.credentials) |credentials| if (auth.scheme) |scheme| {
-                    var content_buffer: [server_messages.certificate_verify_content_bytes_max]u8 = undefined;
-                    const to_sign = server_messages.certificateVerifyContent(
-                        .client,
-                        &self.transcriptHash(),
-                        &content_buffer,
-                    );
-                    var signature_buffer: [backend.signature_bytes_max]u8 = undefined;
-                    const signature = try credentials.signer.sign(scheme, to_sign, &signature_buffer);
-                    const verify_message = server_messages.certificateVerify(
-                        auth.flight,
-                        @intFromEnum(scheme),
-                        signature,
-                    );
-                    self.transcript.update(verify_message);
-                    const sealed_verify = try self.send.?.seal(
-                        .handshake,
-                        verify_message,
-                        builder.bytes[builder.index..],
-                    );
-                    builder.index += sealed_verify.len;
-                };
-            }
+            try self.sendClientAuth(client_auth, &builder);
             const client_key = Schedule.finishedKey(&self.client_handshake_traffic);
             const verify_data = Schedule.verifyData(&client_key, &self.transcriptHash());
             var message_buffer: [handshake.header_bytes + cipher_suite.hash_bytes_max]u8 = undefined;

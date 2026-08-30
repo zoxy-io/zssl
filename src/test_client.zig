@@ -70,6 +70,20 @@ pub const Options = struct {
     /// this is the shape that tests it: the resumption still succeeds,
     /// because a server walks past an identity it does not know.
     psk_decoy_first: bool = false,
+    /// Volunteer a Certificate the server never asked for, in the client
+    /// flight. §4.4.2 sends one "if and only if the server has requested
+    /// client authentication", so this is a hostile client — and on a
+    /// *resumed* handshake §4.3.2 forbids the server to have asked at
+    /// all, which is the case where accepting one silently sets
+    /// `peer.verified` for an identity nobody requested.
+    volunteer_certificate: bool = false,
+    /// Send a *non-empty* Certificate and this many CertificateVerify
+    /// messages after it. §4.4 allows exactly one; more than one is a
+    /// message count the peer chooses, which reached the server's
+    /// `assert(messages_seen < 3)` as a panic. Meaningful only against a
+    /// server whose `client_auth.policy` is `.insecure_no_verification`,
+    /// which is what lets this client skip signing anything.
+    certificate_verifies: u8 = 0,
     /// §4.2.10: offer 0-RTT. zssl never accepts it, so this is here to
     /// open the server's skip window and nothing else — no early data
     /// is actually sent, because the records a real client would send
@@ -801,20 +815,55 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             // §4.4.2: a client that was asked answers, even to decline —
             // an empty certificate_list rather than silence, and in the
             // transcript its own Finished MACs.
-            if (self.certificate_requested) {
+            if (self.certificate_requested or self.options.volunteer_certificate) {
+                // One entry of three bytes, or none at all. The
+                // non-empty shape exists so a `certificate_verifies`
+                // count above zero has something legal to follow: §4.4.3
+                // is refused outright after an empty list.
                 const empty_certificate = [_]u8{
                     @intFromEnum(handshake.MessageType.certificate),
                     0, 0, 4, // u24 body length
                     0, // certificate_request_context: empty, echoing §4.3.2
                     0, 0, 0, // certificate_list: u24 zero
                 };
-                self.transcript.update(&empty_certificate);
+                const filled_certificate = [_]u8{
+                    @intFromEnum(handshake.MessageType.certificate),
+                    0, 0, 12, // u24 body length
+                    0, // certificate_request_context
+                    0, 0, 8, // certificate_list length
+                    0,    0,    3, // one entry, three bytes
+                    0xaa, 0xbb, 0xcc,
+                    0, 0, // its extensions
+                };
+                const certificate_message: []const u8 = if (self.options.certificate_verifies > 0)
+                    &filled_certificate
+                else
+                    &empty_certificate;
+                self.transcript.update(certificate_message);
                 const sealed_certificate = try self.send.?.seal(
                     .handshake,
-                    &empty_certificate,
+                    certificate_message,
                     builder.bytes[builder.index..],
                 );
                 builder.index += sealed_certificate.len;
+
+                // §4.4.3, as many times as the case asks for.
+                var sent: u8 = 0;
+                while (sent < self.options.certificate_verifies) : (sent += 1) {
+                    var verify_buffer: [96]u8 = undefined;
+                    const verify_message = server_messages.certificateVerify(
+                        &verify_buffer,
+                        0x0403,
+                        &(.{0xa5} ** 64),
+                    );
+                    self.transcript.update(verify_message);
+                    const sealed_verify = try self.send.?.seal(
+                        .handshake,
+                        verify_message,
+                        builder.bytes[builder.index..],
+                    );
+                    builder.index += sealed_verify.len;
+                }
             }
             const client_key = Schedule.finishedKey(&self.client_handshake_traffic);
             const verify_data = Schedule.verifyData(&client_key, &self.transcript.currentHash());

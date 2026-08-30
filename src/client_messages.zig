@@ -48,13 +48,26 @@ pub const signature_schemes_default = [_]backend.SignatureScheme{
 /// certificate is in the session, and offering one panicked
 /// `helloPreSharedKey` on an assertion — a crash any conforming server
 /// could trigger by issuing a large ticket.
-pub const hello_bytes_max: u16 = 4096;
+pub const hello_bytes_max: u16 = 5120;
+
+/// §4.2.2's cookie, echoed verbatim into the second ClientHello. Its
+/// size is the *server's* choice for a buffer that is ours, so it needs
+/// a bound of ours.
+pub const cookie_bytes_max: u16 = 512;
+
+/// Everything a maximal hello carries except the PSK identity and the
+/// cookie: the two variable fields whose size a peer picks. 768 is
+/// conservative against the ~700 the encoder actually writes, and
+/// `"a maximal ClientHello fits its own buffer"` below is the check
+/// rather than this comment.
+const fixed_bytes_max: u16 = 768;
 
 /// The largest PSK identity a hello can carry, which is what bounds a
-/// ticket an embedder may offer back. Derived from the buffer rather
-/// than from `ticket_bytes_max`: the identity is opaque and its size is
-/// the issuing server's business, not ours.
-pub const psk_identity_bytes_max: u16 = hello_bytes_max - 768;
+/// ticket an embedder may offer back. Derived from what is left of the
+/// buffer once the fixed part and a maximal cookie are spoken for —
+/// a *retried resumption* carries both at once, which is the case that
+/// makes this a subtraction rather than two independent bounds.
+pub const psk_identity_bytes_max: u16 = hello_bytes_max - fixed_bytes_max - cookie_bytes_max;
 
 /// ALPN offer caps. Four is what a client that speaks HTTP needs — `h2`
 /// and `http/1.1` with room to spare — and each name is bounded so the
@@ -119,6 +132,7 @@ pub fn clientHello(out: []u8, params: *const HelloParams) []const u8 {
     assert(params.signature_schemes.len >= 1);
     assert(params.share_public.len >= 1);
     if (params.cookie) |cookie| assert(cookie.len >= 1);
+    if (params.cookie) |cookie| assert(cookie.len <= cookie_bytes_max);
     var builder = wire.Builder.init(out);
     const message = handshake.beginMessage(&builder, .client_hello);
     builder.putU16(0x0303);
@@ -365,4 +379,45 @@ test "a PSK hello carries a well-formed offer and a patchable binder" {
     try std.testing.expectEqual(@as(u16, 35), offer.binders_section_bytes);
     // The patched binder is not the placeholder.
     try std.testing.expect(!std.mem.allEqual(u8, offer.binders[0], 0));
+}
+
+test "a maximal ClientHello fits its own buffer" {
+    // `hello_bytes_max` is the only thing between a peer-chosen length
+    // and an out-of-bounds write: `wire.Builder` bounds-checks nothing,
+    // so every `put` past the end is an assertion at best. The number
+    // was derived by hand twice and was wrong the second time — it
+    // omitted §4.2.2's cookie, which a server sizes and we must echo —
+    // so it is derived by *construction* here instead.
+    //
+    // Every field at its documented maximum, and both peer-chosen ones
+    // at once: a retried resumption is the flight that carries a cookie
+    // and a PSK identity in the same hello.
+    var out: [hello_bytes_max]u8 = undefined;
+    const identity = [_]u8{0xa5} ** psk_identity_bytes_max;
+    const cookie = [_]u8{0xc0} ** cookie_bytes_max;
+    const name = [_]u8{'n'} ** 255;
+    const public = [_]u8{0x0b} ** 97; // Uncompressed P-384, the widest share.
+    const encoded = clientHello(&out, &.{
+        .random = &(.{0x07} ** 32),
+        .session_id = &(.{0xee} ** 32),
+        .share_group = client_hello.group_secp384r1,
+        .share_public = &public,
+        .signature_schemes = &signature_schemes_default,
+        .groups = &client_hello.groups_supported,
+        .cookie = &cookie,
+        .server_name = &name,
+        .alpn_protocols = &.{
+            &(.{'a'} ** alpn_protocol_bytes_max),
+            &(.{'b'} ** alpn_protocol_bytes_max),
+            &(.{'c'} ** alpn_protocol_bytes_max),
+            &(.{'d'} ** alpn_protocol_bytes_max),
+        },
+        .psk = .{ .identity = &identity, .obfuscated_age = 7, .binder_bytes = 48 },
+    });
+    // The assertion inside `clientHello` would already have fired; this
+    // says by how much, so a future field has a number to spend rather
+    // than a cliff to discover.
+    try std.testing.expect(encoded.len <= hello_bytes_max);
+    const headroom = hello_bytes_max - encoded.len;
+    try std.testing.expect(headroom < 1024); // Not wildly oversized either.
 }

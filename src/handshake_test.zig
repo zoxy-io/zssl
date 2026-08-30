@@ -697,3 +697,41 @@ test "§4.3.2: no CertificateRequest unless the embedder asked for one" {
     _ = try client.absorb(flight.send, &client_out);
     try testing.expect(!client.certificate_requested);
 }
+
+test "§4.4: one CertificateVerify per flight, and the count is not the peer's" {
+    // `assert(messages_seen < 3)` in the server's flight loop assumed
+    // Certificate, CertificateVerify, Finished. Nothing enforced the
+    // middle one's uniqueness: each copy signs the transcript the last
+    // one moved, so a client holding its own key can send any number,
+    // and the fourth message reached the assertion as a panic.
+    //
+    // `.insecure_no_verification` is what makes this cheap to drive —
+    // the checker records each message without looking at it — but the
+    // count is peer-controlled under every policy.
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+
+    var harness: Harness = undefined;
+    try harness.initWith("http/1.1", .{
+        .require = false,
+        .policy = .insecure_no_verification,
+    });
+    defer harness.deinit();
+
+    var client = Client.init(&client_x25519_private, &.{
+        .alpn = "http/1.1",
+        .certificate_verifies = 2,
+    });
+    defer client.deinit();
+
+    const hello = client.helloRecord(&client_out);
+    const flight = try feedRecords(&harness.server, hello, &server_out);
+    const reply = try client.absorb(flight.send, &client_out);
+    try testing.expectEqual(std.meta.activeTag(reply), .connected);
+
+    // An error, not a panic — which is the whole distinction.
+    try testing.expectError(
+        error.UnexpectedMessage,
+        feedRecords(&harness.server, reply.connected, &server_out),
+    );
+}

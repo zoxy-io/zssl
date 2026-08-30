@@ -7,6 +7,7 @@ const assert = std.debug.assert;
 
 const cipher_suite = @import("cipher_suite.zig");
 const client_hello = @import("client_hello.zig");
+const Credentials = @import("Credentials.zig");
 const backend = @import("crypto/backend_openssl.zig");
 const handshake = @import("handshake.zig");
 const wire = @import("wire.zig");
@@ -194,7 +195,7 @@ pub fn certificateRequest(out: []u8, schemes: []const backend.SignatureScheme) [
 /// would be a server with no certificate, which `Credentials.load`
 /// already refuses.
 pub fn certificateChain(out: []u8, certificates: []const []const u8) []const u8 {
-    assert(certificates.len <= 8);
+    assert(certificates.len <= Credentials.certificates_max);
     var total: usize = 0;
     for (certificates) |der| total += der.len;
     // Per entry: 3 length bytes and 2 of empty extensions. Plus the
@@ -268,7 +269,7 @@ pub const new_session_ticket_bytes_max: u16 =
 /// schemes is every code point `SignatureScheme` has, so 32 is generous
 /// and fixed — `wire.Builder` bounds nothing, and this is the number
 /// that keeps it from having to.
-pub const certificate_request_bytes_max: usize = 32;
+pub const certificate_request_bytes_max: u16 = 32;
 
 /// §4.6.1, and the other half of accepting 0-RTT: a client offers early
 /// data only against a ticket that told it how much it may send, so a
