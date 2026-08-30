@@ -26,6 +26,7 @@ pub const hkdf = @import("hkdf.zig");
 pub const key_schedule = @import("key_schedule.zig");
 pub const ktls = @import("ktls.zig");
 pub const mem_hooks = @import("crypto/mem_hooks.zig");
+pub const peer_certificate = @import("peer_certificate.zig");
 pub const pem = @import("pem.zig");
 pub const protect = @import("protect.zig");
 pub const record = @import("record.zig");

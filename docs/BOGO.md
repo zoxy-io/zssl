@@ -943,7 +943,7 @@ laxity, and laxity is what BoGo exists to find.
     because §4.4.3 makes those the same promise.
     `-expect-peer-signature-algorithm` asks what the server actually
     signed with, which the client had been checking and throwing away; it
-    is `peer_signature_scheme` now, the mirror of the server's
+    is `peer.scheme` now, the mirror of the server's
     `signature_scheme` that `interop` has always asserted on.
 
     The library defect underneath: every unrecognised code point in a

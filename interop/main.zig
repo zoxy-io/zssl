@@ -630,7 +630,7 @@ fn runClientLeg(
     var pump: Pump = undefined;
     pump.init(io, stream);
     try pump.handshakeClient(&client);
-    if (!client.certificate_verified) return error.CertificateNotVerified;
+    if (!client.peer.verified) return error.CertificateNotVerified;
     // The seam ran, and ran on real bytes: a verifier that is never
     // called would leave an embedder believing it had validated a chain
     // it never saw.

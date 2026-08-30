@@ -781,7 +781,7 @@ fn runClient(
     // This handshake's scheme when there was a CertificateVerify to
     // read, the session's when there was not. See `peer_signature_scheme`
     // on the store for why the second half is the embedder's to keep.
-    if (client.peer_signature_scheme) |scheme| store.peer_signature_scheme = scheme;
+    if (client.peer.scheme) |scheme| store.peer_signature_scheme = scheme;
     try checkNegotiated(
         connection,
         client.resumed,

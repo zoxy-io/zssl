@@ -37,7 +37,7 @@ the four decisions everything else follows from.
   `Config.verify_schemes`, and §4.4.3 makes that list a promise rather
   than a hint: a CertificateVerify under a scheme absent from it is an
   `illegal_parameter` abort with nothing verified, told apart from a
-  signature that simply failed. `ClientHandshake.peer_signature_scheme`
+  signature that simply failed. `ClientHandshake.peer.scheme`
   reports what the server actually used, mirroring the server's own
   `signature_scheme`. The server's signing set narrows through
   `Config.signing_schemes`, whose order wins over the key's — and which

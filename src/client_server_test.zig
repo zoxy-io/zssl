@@ -331,7 +331,7 @@ test "production client ↔ server: handshake, data, ticket capture, resumption"
     try first.init(.{});
     defer first.deinit();
     try first.connect(&buffers);
-    try testing.expect(first.client.certificate_verified);
+    try testing.expect(first.client.peer.verified);
     try testing.expectEqualSlices(u8, "http/1.1", first.client.alpnSelected().?);
     try testing.expect(!first.client.resumed);
     try testing.expect(!first.server.resumed);
@@ -361,7 +361,7 @@ test "production client ↔ server: handshake, data, ticket capture, resumption"
     try second.connect(&buffers);
     try testing.expect(second.server.resumed);
     try testing.expect(second.client.resumed);
-    try testing.expect(!second.client.certificate_verified);
+    try testing.expect(!second.client.peer.verified);
     const echo = try second.client.sendApplicationData("resumed", &buffers.client_out);
     const echo_event = (try second.server.handleRecord(echo, &buffers.server_out)).?;
     try testing.expectEqualSlices(u8, "resumed", echo_event.application_data);
@@ -835,7 +835,7 @@ test "end to end through a HelloRetryRequest: working keys, data, agreeing expor
     try testing.expect(harness.client.retried);
     try testing.expectEqual(backend.Group.secp256r1, harness.server.key_share_group);
     try testing.expectEqual(client_hello_mod.group_secp256r1, harness.client.share_group);
-    try testing.expect(harness.client.certificate_verified);
+    try testing.expect(harness.client.peer.verified);
     try testing.expectEqualSlices(u8, "http/1.1", harness.client.alpnSelected().?);
 
     // Working keys in both directions, and one derivation on each side.
@@ -882,7 +882,7 @@ test "end to end: a resumed session crosses a HelloRetryRequest" {
     try testing.expect(second.client.resumed);
     // Resumed means the PSK authenticated the session: no certificate
     // leg travelled, and none was verified.
-    try testing.expect(!second.client.certificate_verified);
+    try testing.expect(!second.client.peer.verified);
     const echo = try second.client.sendApplicationData("resumed over a retry", &buffers.client_out);
     const echo_event = (try second.server.handleRecord(echo, &buffers.server_out)).?;
     try testing.expectEqualSlices(u8, "resumed over a retry", echo_event.application_data);
@@ -924,7 +924,7 @@ test "a chain the embedder refuses fails the handshake" {
     try testing.expectError(error.BadCertificate, harness.connect(&buffers));
     try testing.expectEqual(@as(u8, 1), spy.calls);
     try testing.expectEqual(ClientHandshake.State.failed, harness.client.state);
-    try testing.expect(!harness.client.certificate_verified);
+    try testing.expect(!harness.client.peer.verified);
 }
 
 test "ALPN: the client reports which of its offers the server took" {
@@ -1003,7 +1003,7 @@ test "insecure_no_verification completes against a server that sends a certifica
     // died on `UnexpectedMessage` at the server's CertificateVerify.
     try harness.connect(&buffers);
     try testing.expectEqual(ClientHandshake.State.connected, harness.client.state);
-    try testing.expect(!harness.client.certificate_verified);
+    try testing.expect(!harness.client.peer.verified);
 }
 
 test "sendAlert: encrypted once keys exist, plaintext before, and the peer reads both" {
@@ -1108,7 +1108,7 @@ test "an RSA leaf signs the server's CertificateVerify and our client accepts it
     try testing.expectEqual(ClientHandshake.State.connected, harness.client.state);
     // The client verified through `std.crypto`'s RSA-PSS, not libcrypto's
     // — the same no-shared-code split the ECDSA path draws.
-    try testing.expect(harness.client.certificate_verified);
+    try testing.expect(harness.client.peer.verified);
 
     const ping = try harness.client.sendApplicationData("rsa", &buffers.client_out);
     const event = (try harness.server.handleRecord(ping, &buffers.server_out)).?;
@@ -1141,7 +1141,7 @@ test "a P-384 leaf signs with ecdsa_secp384r1_sha384 and our client accepts it" 
     // Signed by libcrypto, verified by `std.crypto` — the same
     // no-shared-code split the P-256 and RSA paths draw, and the reason
     // this is worth a fixture rather than a unit test over the signer.
-    try testing.expect(harness.client.certificate_verified);
+    try testing.expect(harness.client.peer.verified);
     try testing.expectEqual(
         backend.SignatureScheme.ecdsa_secp384r1_sha384,
         harness.server.signature_scheme,
@@ -2275,10 +2275,10 @@ test "§4.4.3: a CertificateVerify scheme we never offered is illegal_parameter"
         );
         try testing.expectEqual(ClientHandshake.State.failed, harness.client.state);
         // Nothing was verified, and nothing is claimed to have been.
-        try testing.expect(!harness.client.certificate_verified);
+        try testing.expect(!harness.client.peer.verified);
         try testing.expectEqual(
             @as(?backend.SignatureScheme, null),
-            harness.client.peer_signature_scheme,
+            harness.client.peer.scheme,
         );
     }
 }
@@ -2303,7 +2303,7 @@ test "§4.4.2: the embedder's signing preference is obeyed, and refused when emp
         backend.SignatureScheme.rsa_pss_rsae_sha512,
         harness.server.signature_scheme,
     );
-    try testing.expect(harness.client.certificate_verified);
+    try testing.expect(harness.client.peer.verified);
 
     // And the misconfiguration the field documents: a scheme this key
     // cannot produce is answered on the wire, not asserted away. A P-256
