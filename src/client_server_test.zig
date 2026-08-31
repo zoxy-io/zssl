@@ -479,7 +479,7 @@ test "a hostile server flight errors rather than panicking" {
         const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
         const server_hello_record = recordAt(flight.send, 0);
         _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
-        try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
+        try testing.expectEqual(ClientHandshake.State.awaiting_encrypted_extensions, harness.client.state);
 
         // Forge a flight under the genuine handshake keys.
         var forger = try serverFlightProtector(
@@ -969,7 +969,7 @@ test "ALPN: a protocol the client never offered is refused" {
     const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
     const server_hello_record = recordAt(flight.send, 0);
     _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
-    try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
+    try testing.expectEqual(ClientHandshake.State.awaiting_encrypted_extensions, harness.client.state);
 
     var forger = try serverFlightProtector(
         &client_x25519_private,
@@ -1083,7 +1083,7 @@ test "sendAlert mid-handshake leads with D.4's dummy ChangeCipherSpec" {
     const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
     const server_hello = recordAt(flight.send, 0);
     _ = try harness.client.handleRecord(server_hello, &buffers.scratch);
-    try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
+    try testing.expectEqual(ClientHandshake.State.awaiting_encrypted_extensions, harness.client.state);
 
     const bytes = harness.client.sendAlert(.illegal_parameter, &buffers.client_out);
     const leading = recordAt(bytes, 0);
@@ -1238,7 +1238,7 @@ test "a protected record that is nothing but its content type is refused, not as
         const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
         const server_hello_record = recordAt(flight.send, 0);
         _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
-        try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
+        try testing.expectEqual(ClientHandshake.State.awaiting_encrypted_extensions, harness.client.state);
 
         var forger = try serverFlightProtector(
             &client_x25519_private,

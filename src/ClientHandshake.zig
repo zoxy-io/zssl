@@ -147,9 +147,6 @@ peer: peer_certificate.PeerCertificate,
 /// empty one. Distinct from holding credentials: a client with none
 /// still has to answer.
 certificate_requested: bool,
-/// §4.4 sends one EncryptedExtensions; a second is a message count the
-/// peer chose rather than one we bounded.
-encrypted_extensions_seen: bool,
 /// The schemes the request named, narrowed to those our own key can
 /// produce. Empty with no request, and empty when nothing intersects —
 /// which is a refusal to sign rather than a handshake failure, because
@@ -204,7 +201,30 @@ const ticket_extensions_max: u16 = 16;
 pub const State = enum(u8) {
     idle,
     awaiting_server_hello,
-    awaiting_flight,
+    // §Appendix A.1's client flight, transcribed. These five used to be
+    // one `awaiting_flight` state with the order reconstructed at each
+    // message arm by `encrypted_extensions_seen`, `peer.seen`,
+    // `peer.verify_seen` and `resumed`. That cost three defects in one
+    // review round — a duplicate CertificateVerify and a duplicate
+    // EncryptedExtensions, both remote panics on a compliant peer, and a
+    // resumed handshake that accepted a certificate nobody asked for —
+    // so the order lives in the type now and the guards are gone.
+    /// WAIT_EE.
+    awaiting_encrypted_extensions,
+    /// WAIT_CERT_CR: a full handshake may answer with either, and the
+    /// CertificateRequest is optional. A resumed one never arrives here,
+    /// which is what makes an unrequested certificate unrepresentable
+    /// rather than merely refused.
+    awaiting_certificate_or_request,
+    /// WAIT_CERT: the request came first, so only the Certificate is
+    /// left. A second CertificateRequest has nowhere to land.
+    awaiting_certificate,
+    /// WAIT_CV: §4.4.3 signs what §4.4.2 presented, so this is reachable
+    /// only from a Certificate, and leaving it is the only way to a
+    /// Finished on an authenticated handshake.
+    awaiting_certificate_verify,
+    /// WAIT_FINISHED.
+    awaiting_finished,
     connected,
     /// §6.1 closes one direction at a time, so a close is two states
     /// before it is one. We sent close_notify: our write side is done
@@ -222,6 +242,21 @@ pub const State = enum(u8) {
     closed,
     failed,
 };
+
+/// Whether the server's flight is still being read. Five states answer
+/// yes; the call sites that used to compare against `awaiting_flight`
+/// ask this instead, so adding a flight state cannot silently skip one.
+fn inFlight(self: *const ClientHandshake) bool {
+    return switch (self.state) {
+        .awaiting_encrypted_extensions,
+        .awaiting_certificate_or_request,
+        .awaiting_certificate,
+        .awaiting_certificate_verify,
+        .awaiting_finished,
+        => true,
+        .idle, .awaiting_server_hello, .connected, .close_sent, .close_received, .closed, .failed => false,
+    };
+}
 
 /// §6.1's two halves, asked rather than pattern-matched. Every entry
 /// point below is gated on one of these instead of on `.connected`,
@@ -554,7 +589,6 @@ pub fn init(config: *const Config) ClientHandshake {
         .resumed = false,
         .peer = .{},
         .certificate_requested = false,
-        .encrypted_extensions_seen = false,
         .signable = undefined,
         .signable_count = 0,
         .alpn_selected = null,
@@ -1159,7 +1193,8 @@ fn handleServerHello(self: *ClientHandshake, message: []const u8, out: []u8) Err
             try arm.startHandshakeKeys(shared, psk);
         },
     }
-    self.state = .awaiting_flight;
+    // §Appendix A.1: ServerHello leaves WAIT_SH for WAIT_EE.
+    self.state = .awaiting_encrypted_extensions;
     return null;
 }
 
@@ -1243,15 +1278,15 @@ fn handleProtectedRecord(self: *ClientHandshake, wire_record: []const u8, out: [
     // Readable, not connected: §6.1 leaves the read side open after our
     // own close_notify, and closing it there is what made a truncated
     // shutdown indistinguishable from an orderly one.
-    switch (self.state) {
-        .awaiting_flight, .connected, .close_sent => {},
-        else => return error.UnexpectedMessage,
+    if (!self.inFlight() and self.state != .connected and self.state != .close_sent) {
+        return error.UnexpectedMessage;
     }
     assert(self.ladder != null);
     switch (self.ladder.?) {
         inline else => |*arm| {
-            const opened = switch (self.state) {
-                .awaiting_flight => try arm.recv.?.open(wire_record, out),
+            const opened = if (self.inFlight())
+                try arm.recv.?.open(wire_record, out)
+            else switch (self.state) {
                 .connected, .close_sent => try arm.session.?.recv.open(wire_record, out),
                 else => unreachable,
             };
@@ -1277,7 +1312,7 @@ fn handleProtectedRecord(self: *ClientHandshake, wire_record: []const u8, out: [
                 },
                 .handshake => {
                     try self.assembler.push(plaintext);
-                    if (self.state != .awaiting_flight) return self.nextPostHandshake(arm, out);
+                    if (!self.inFlight()) return self.nextPostHandshake(arm, out);
                     return self.drainFlight(arm, out);
                 },
                 .application_data => {
@@ -1383,60 +1418,55 @@ fn readCertificateRequest(self: *ClientHandshake, body: []const u8) Error!void {
 }
 
 fn drainFlight(self: *ClientHandshake, arm: anytype, out: []u8) Error!?Event {
-    assert(self.state == .awaiting_flight);
+    assert(self.inFlight());
     var messages_seen: u8 = 0;
     while (try self.assembler.next()) |message| : (messages_seen += 1) {
         assert(messages_seen < 8); // EE, Certificate, CertificateVerify, Finished.
         switch (message.messageType() orelse return error.UnexpectedMessage) {
             .encrypted_extensions => {
-                // §4.4 sends one. Unbounded repeats walked the message
-                // count into `assert(messages_seen < 8)` — the same
-                // panic the duplicate CertificateVerify below reached by
-                // its own route.
-                if (self.encrypted_extensions_seen) return error.UnexpectedMessage;
-                self.encrypted_extensions_seen = true;
+                if (self.state != .awaiting_encrypted_extensions) return error.UnexpectedMessage;
                 try self.checkEncryptedExtensions(message.body());
                 arm.transcript.update(message.bytes);
+                // §Appendix A.1's fork. §4.3.2 forbids a
+                // CertificateRequest under a PSK and §4.4.2 the
+                // Certificate with it, so a resumed session leaves WAIT_EE
+                // for WAIT_FINISHED and never passes through a state that
+                // accepts either. That missing edge is the authentication
+                // gap this refactor deletes rather than guards.
+                self.state = if (self.resumed)
+                    .awaiting_finished
+                else
+                    .awaiting_certificate_or_request;
+            },
+            // §4.3.2, and optional: the server may go straight to its
+            // Certificate. Arriving here is the only way to WAIT_CERT,
+            // which is why a second one has nowhere to land.
+            .certificate_request => {
+                if (self.state != .awaiting_certificate_or_request) return error.UnexpectedMessage;
+                try self.readCertificateRequest(message.body());
+                arm.transcript.update(message.bytes);
+                self.state = .awaiting_certificate;
             },
             .certificate => {
-                if (self.resumed) return error.UnexpectedMessage;
-                // §4.4.2 sends exactly one Certificate; a second would
-                // otherwise reach `captureLeaf`'s precondition as a panic.
-                if (self.peer.seen) return error.UnexpectedMessage;
+                switch (self.state) {
+                    .awaiting_certificate_or_request, .awaiting_certificate => {},
+                    else => return error.UnexpectedMessage,
+                }
                 try self.peer.capture(message.body(), .{
                     .policy = self.config.certificate_policy,
                     .chain_verifier = self.config.chain_verifier,
                 });
                 arm.transcript.update(message.bytes);
-            },
-            // §4.3.2. A resumed session must never see one — the PSK
-            // authenticates it and the RFC forbids the request — and a
-            // second is a request we already answered.
-            .certificate_request => {
-                if (self.resumed) return error.UnexpectedMessage;
-                if (self.certificate_requested) return error.UnexpectedMessage;
-                // Before the Certificate, per §4.4's flight order. After
-                // it the server has already signed, and a request
-                // arriving then is out of place rather than merely late.
-                if (self.peer.seen) return error.UnexpectedMessage;
-                try self.readCertificateRequest(message.body());
-                arm.transcript.update(message.bytes);
+                self.state = .awaiting_certificate_verify;
             },
             .certificate_verify => {
-                if (self.resumed) return error.UnexpectedMessage;
-                // §4.4.3 signs what §4.4.2 presented, so the order is
-                // fixed: no Certificate yet means the peer inverted the
-                // flight, which is a protocol error and not our panic.
-                // Tracked by `peer.seen`, not by the captured key:
-                // under `.insecure_no_verification` there is no key, and
-                // keying this off one rejected every such handshake that
-                // met a server which actually sent a certificate.
-                if (!self.peer.seen) return error.UnexpectedMessage;
-                // One per flight, per §4.4 — and a server that repeats it
-                // can sign each copy over the transcript the last one
-                // moved, so the count is the peer's to choose without
-                // this.
-                if (self.peer.verify_seen) return error.UnexpectedMessage;
+                // §4.4.3 signs what §4.4.2 presented. WAIT_CV is
+                // reachable only from a Certificate and is left by this
+                // message, so "no Certificate yet" and "a second copy"
+                // are both simply not this state — the two guards that
+                // used to say so, one of which was a remote panic before
+                // it was written, are the transition.
+                if (self.state != .awaiting_certificate_verify) return error.UnexpectedMessage;
                 try self.peer.verify(message, .{
                     .policy = self.config.certificate_policy,
                     .side = .server,
@@ -1444,7 +1474,16 @@ fn drainFlight(self: *ClientHandshake, arm: anytype, out: []u8) Error!?Event {
                     .accepted = self.config.verify_schemes,
                 });
                 arm.transcript.update(message.bytes);
+                self.state = .awaiting_finished;
             },
+            // Deliberately not restricted to WAIT_FINISHED.
+            // `.insecure_no_verification` lets a server skip the
+            // certificate leg outright, and which fault a Finished
+            // standing in the wrong place earns — `unexpected_message`
+            // for an inverted flight, `bad_certificate` for one that
+            // never authenticated — is a policy question that already
+            // lives in `completeHandshake`. Moving it here would change
+            // the alert, which BoGo grades.
             .finished => return try self.completeHandshake(arm, message, out),
             else => return error.UnexpectedMessage,
         }
@@ -1534,7 +1573,7 @@ fn selectAlpn(self: *ClientHandshake, data: []const u8) Error!void {
 }
 
 fn completeHandshake(self: *ClientHandshake, arm: anytype, message: handshake.Message, out: []u8) Error!Event {
-    assert(self.state == .awaiting_flight);
+    assert(self.inFlight());
     if (!self.resumed) {
         // Policy says who may skip the certificate leg: only a session a
         // PSK already authenticates.
@@ -1599,7 +1638,7 @@ pub fn drain(self: *ClientHandshake, out: []u8) Error!?Event {
     // Only the post-handshake stream is drained. The server's flight is
     // assembled by `drainFlight`, which already reads every message a
     // record carried.
-    if (self.state == .awaiting_flight) return null;
+    if (self.inFlight()) return null;
     if (!self.readable()) return null;
     if (self.ladder == null) return null;
     errdefer self.state = .failed;
