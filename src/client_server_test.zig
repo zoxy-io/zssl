@@ -479,7 +479,7 @@ test "a hostile server flight errors rather than panicking" {
         const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
         const server_hello_record = recordAt(flight.send, 0);
         _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
-        try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
+        try testing.expectEqual(ClientHandshake.State.awaiting_encrypted_extensions, harness.client.state);
 
         // Forge a flight under the genuine handshake keys.
         var forger = try serverFlightProtector(
@@ -524,6 +524,65 @@ test "a hostile server flight errors rather than panicking" {
         );
         try testing.expectEqual(ClientHandshake.State.failed, harness.client.state);
     }
+}
+
+test "§4.3.1: a Finished may not stand in for the EncryptedExtensions" {
+    // Review of the §Appendix A state refactor (#18) found this, and it
+    // predates the refactor. §4.3.1 makes EncryptedExtensions mandatory
+    // in *every* 1.3 handshake, but nothing required its presence — only
+    // that it not arrive twice. `completeHandshake` skips its whole
+    // certificate-policy block for a resumed session, and skips the
+    // `leaf_signature` half of it under `.insecure_no_verification`, so
+    // in both shapes a server could send a bare Finished immediately
+    // after its ServerHello and be believed.
+    //
+    // `.insecure_no_verification` is the half a forged flight can reach
+    // without deriving a resumption schedule; the state that refuses it
+    // — WAIT_EE, where the mandatory message has not arrived — is the
+    // same one in both.
+    //
+    // Not an off-path forgery: the Finished MAC binds the handshake
+    // traffic secret, so without the guard this shape fails as
+    // `DecryptError` — refused by accident of a bad MAC rather than
+    // because a mandatory message was missing. The assertion below is on
+    // `UnexpectedMessage` for that reason. What the guard buys is a
+    // *keyed* peer, one that could produce a valid Finished, being
+    // unable to skip §4.3.1's message and be believed.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{ .certificate_policy = .insecure_no_verification });
+    defer harness.deinit();
+
+    const hello = harness.client.start(&buffers.client_out);
+    const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
+    const server_hello_record = recordAt(flight.send, 0);
+    _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
+    // WAIT_EE: the ServerHello is in and nothing else is.
+    try testing.expectEqual(
+        ClientHandshake.State.awaiting_encrypted_extensions,
+        harness.client.state,
+    );
+
+    var forger = try serverFlightProtector(
+        &client_x25519_private,
+        hello,
+        server_hello_record,
+    );
+    defer forger.deinit();
+
+    // A Finished, under the genuine handshake keys, with no
+    // EncryptedExtensions ahead of it.
+    var plaintext: [record.wire_record_bytes_max]u8 = undefined;
+    const verify_data: [32]u8 = @splat(0x5a);
+    const finished = server_messages.finished(&plaintext, &verify_data);
+    var forged_record: [record.wire_record_bytes_max]u8 = undefined;
+    const sealed = try forger.seal(.handshake, finished, &forged_record);
+
+    try testing.expectError(
+        error.UnexpectedMessage,
+        harness.client.handleRecord(sealed, &buffers.scratch),
+    );
+    try testing.expectEqual(ClientHandshake.State.failed, harness.client.state);
 }
 
 /// Frame a HelloRetryRequest naming `group`, ready to feed to a client.
@@ -969,7 +1028,7 @@ test "ALPN: a protocol the client never offered is refused" {
     const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
     const server_hello_record = recordAt(flight.send, 0);
     _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
-    try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
+    try testing.expectEqual(ClientHandshake.State.awaiting_encrypted_extensions, harness.client.state);
 
     var forger = try serverFlightProtector(
         &client_x25519_private,
@@ -1083,7 +1142,7 @@ test "sendAlert mid-handshake leads with D.4's dummy ChangeCipherSpec" {
     const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
     const server_hello = recordAt(flight.send, 0);
     _ = try harness.client.handleRecord(server_hello, &buffers.scratch);
-    try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
+    try testing.expectEqual(ClientHandshake.State.awaiting_encrypted_extensions, harness.client.state);
 
     const bytes = harness.client.sendAlert(.illegal_parameter, &buffers.client_out);
     const leading = recordAt(bytes, 0);
@@ -1238,7 +1297,7 @@ test "a protected record that is nothing but its content type is refused, not as
         const flight = (try harness.server.handleRecord(hello, &buffers.server_out)).?;
         const server_hello_record = recordAt(flight.send, 0);
         _ = try harness.client.handleRecord(server_hello_record, &buffers.scratch);
-        try testing.expectEqual(ClientHandshake.State.awaiting_flight, harness.client.state);
+        try testing.expectEqual(ClientHandshake.State.awaiting_encrypted_extensions, harness.client.state);
 
         var forger = try serverFlightProtector(
             &client_x25519_private,
