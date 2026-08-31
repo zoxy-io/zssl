@@ -94,24 +94,25 @@ jobs:
             search.log
           if-no-files-found: ignore
 
-      - name: Report
+      - name: Report to Discord
         # This step used to say "no webhook of our own", because
         # `discord.yml` had been dropped for the GitHub->Discord
         # integration the three repositories share and a second poster
         # would double every message. That reasoning does not survive
         # this workflow: the integration reports a run as red or green,
-        # and red is what a clean search looks like right up until the
-        # commit above this one. The two outcomes worth telling apart —
-        # a search that held for its whole box, and a target that
-        # stopped early with the input still in the corpus — are exactly
-        # what a generic run notification cannot say. So the poster is
-        # back, deliberately, and only here.
+        # and red is what a clean search looked like until the commit
+        # that taught the step to forgive exit 124. The distinction worth
+        # notifying on is not red versus green.
         #
-        # A nightly that speaks only on failure is indistinguishable
-        # from a nightly that stopped running, so the clean case posts
-        # too. It is one line a day and it is proof of life.
+        # Shaped after zoxy's `nightly-sim.yml`, deliberately: the two
+        # nightlies land in the same channel, and one that reads
+        # differently from the other is one you have to stop and parse.
+        #
+        # A nightly that speaks only on failure is indistinguishable from
+        # a nightly that stopped running, so the clean case posts too.
         if: always()
         env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           OUTCOME: ${{ steps.search.outcome }}
           # The search's real exit code, which is how a crashing target is
           # told from a build that never got there. Empty means the step
@@ -120,51 +121,76 @@ jobs:
           INPUTS: ${{ steps.search.outputs.inputs }}
           MINUTES: ${{ inputs.minutes || '20' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          # Never interpolated into the script body: `${{ }}` would paste
-          # the secret into the command line. It arrives as an
-          # environment variable and curl reads it from there.
-          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [ "$OUTCOME" = success ]; then
-            summary=$(printf 'Fuzz search clean\n\nSearched %s minutes with every target holding. Corpus: %s inputs.\n' \
-              "$MINUTES" "${INPUTS:-0}")
-            message=$(printf ':green_circle: **fuzz-search clean** — searched %s minutes, every target held. Corpus holds %s inputs.' \
-              "$MINUTES" "${INPUTS:-0}")
+          # Three outcomes, not two. A plain success/failure split would
+          # call a broken runner a discovery, which is how a channel
+          # teaches people to ignore it.
+          if [ "$OUTCOME" = "success" ]; then
+            title="Fuzz search clean"
+            color=3066993
+            detail=$(printf 'Searched %s minutes with every target holding.' "$MINUTES")
           elif [ -n "${STATUS:-}" ]; then
-            # A status was recorded and it was not 0 or 124, so the
-            # fuzzer itself stopped early. That is a finding.
-            summary=$(printf 'Fuzz search FOUND SOMETHING\n\nA target stopped early (exit %s). The input that did it is in the `fuzz-corpus` artifact; `zig build test-fuzz` replays it.\n' "$STATUS")
-            message=$(printf ':red_circle: **fuzz-search FOUND SOMETHING** — a target stopped early (exit %s). The input that did it is in the `fuzz-corpus` artifact; `zig build test-fuzz` replays it.' "$STATUS")
+            # A status was recorded and it was neither 0 nor the time
+            # box's 124, so the fuzzer itself stopped early. The input
+            # that did it is in the corpus, and the corpus is uploaded.
+            title="Fuzz search FOUND SOMETHING"
+            color=15158332
+            detail=$(printf 'A target stopped early (exit %s). The input that did it is in the `fuzz-corpus` artifact. Replay it:\n```\nzig build test-fuzz\n```' \
+              "$STATUS")
           else
-            # No status recorded: the job broke before or during the
-            # search rather than because of it. Calling this a finding is
-            # how a notification channel teaches people to ignore it.
-            summary=$(printf 'Fuzz search did not complete\n\nThe job failed before the search reported a status. This is infrastructure, not a finding.\n')
-            message=':yellow_circle: **fuzz-search did not complete** — the job failed before the search reported a status. Infrastructure, not a finding.'
+            # Distinct from a finding: nothing was proven, but nothing
+            # broke either.
+            title="Fuzz search did not complete"
+            color=9807270
+            detail="The job failed before the search reported a status — no verdict, and not a finding."
           fi
-          printf '%s\n' "$summary" >> "$GITHUB_STEP_SUMMARY"
 
-          # No webhook configured is a valid state — a fork, or a clone
-          # that has not been given one. Say so and stop, rather than
-          # failing a search that was fine.
+          # 124 is the time box firing, which is how a healthy search
+          # ends. Printing the bare number in the channel reads as an
+          # error code to anyone glancing at it, so the field says what
+          # the number means instead.
+          if [ "${STATUS:-}" = "124" ]; then
+            ended="time box"
+          elif [ -z "${STATUS:-}" ]; then
+            ended="no status"
+          else
+            ended=$(printf 'exit %s' "$STATUS")
+          fi
+
           if [ -z "${WEBHOOK:-}" ]; then
-            echo "::notice::DISCORD_WEBHOOK is not set; skipping the post"
+            echo "::warning::DISCORD_WEBHOOK is not set; skipping the report."
+            printf '%s\n\n%s\n' "$title" "$detail" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-
-          # jq builds the JSON so the message cannot break out of it.
-          body=$(jq -nc --arg content "$message"$'\n'"$RUN_URL" '{content: $content}')
-          code=$(curl -sS -o /tmp/discord.out -w '%{http_code}' \
-            -X POST -H 'Content-Type: application/json' \
-            --data-binary @- "$WEBHOOK" <<<"$body")
-
-          # A notification channel that fails quietly is worth nothing:
-          # you cannot tell it apart from a night with nothing to say.
-          # Discord answers 204 with no body on success.
-          if [ "$code" != "204" ] && [ "$code" != "200" ]; then
-            echo "::error::posting to Discord failed with HTTP $code"
-            cat /tmp/discord.out >&2 || true
-            exit 1
-          fi
-          echo "posted to Discord (HTTP $code)"
+          # jq builds the payload so an exit code, a count, or a future
+          # message can never break out of the JSON.
+          jq -n \
+            --arg title "$title" \
+            --arg detail "$detail" \
+            --argjson color "$color" \
+            --arg box "${MINUTES:-?}m time box" \
+            --arg corpus "${INPUTS:-0} inputs" \
+            --arg ended "$ended" \
+            --arg sha "${SHA:0:7}" \
+            --arg url "$RUN_URL" \
+            '{
+              username: "zssl fuzz",
+              embeds: [{
+                title: $title,
+                description: $detail,
+                color: $color,
+                url: $url,
+                fields: [
+                  {name: "Search", value: $box, inline: true},
+                  {name: "Corpus", value: $corpus, inline: true},
+                  {name: "Ended", value: $ended, inline: true},
+                  {name: "Commit", value: $sha, inline: true}
+                ]
+              }]
+            }' > payload.json
+          curl -sS -f -X POST -H "Content-Type: application/json" \
+            -d @payload.json "$WEBHOOK" > /dev/null
+          echo "Reported: $title"
+          printf '%s\n\n%s\n' "$title" "$detail" >> "$GITHUB_STEP_SUMMARY"
