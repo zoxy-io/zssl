@@ -95,23 +95,76 @@ jobs:
           if-no-files-found: ignore
 
       - name: Report
-        # No webhook of our own. `discord.yml` was dropped for the
-        # GitHub→Discord integration the three repositories share, so a
-        # second, hand-rolled poster here would be the only one left and
-        # would double every message the integration already sends. The
-        # run summary is what this step is for; the integration carries
-        # the notification.
+        # This step used to say "no webhook of our own", because
+        # `discord.yml` had been dropped for the GitHub->Discord
+        # integration the three repositories share and a second poster
+        # would double every message. That reasoning does not survive
+        # this workflow: the integration reports a run as red or green,
+        # and red is what a clean search looks like right up until the
+        # commit above this one. The two outcomes worth telling apart —
+        # a search that held for its whole box, and a target that
+        # stopped early with the input still in the corpus — are exactly
+        # what a generic run notification cannot say. So the poster is
+        # back, deliberately, and only here.
+        #
+        # A nightly that speaks only on failure is indistinguishable
+        # from a nightly that stopped running, so the clean case posts
+        # too. It is one line a day and it is proof of life.
         if: always()
         env:
           OUTCOME: ${{ steps.search.outcome }}
+          # The search's real exit code, which is how a crashing target is
+          # told from a build that never got there. Empty means the step
+          # died before it could record one.
+          STATUS: ${{ steps.search.outputs.status }}
           INPUTS: ${{ steps.search.outputs.inputs }}
           MINUTES: ${{ inputs.minutes || '20' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Never interpolated into the script body: `${{ }}` would paste
+          # the secret into the command line. It arrives as an
+          # environment variable and curl reads it from there.
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           set -euo pipefail
           if [ "$OUTCOME" = success ]; then
-            printf 'Fuzz search clean\n\nSearched %s minutes with every target holding. Corpus: %s inputs.\n' \
-              "$MINUTES" "${INPUTS:-0}" >> "$GITHUB_STEP_SUMMARY"
+            summary=$(printf 'Fuzz search clean\n\nSearched %s minutes with every target holding. Corpus: %s inputs.\n' \
+              "$MINUTES" "${INPUTS:-0}")
+            message=$(printf ':green_circle: **fuzz-search clean** — searched %s minutes, every target held. Corpus holds %s inputs.' \
+              "$MINUTES" "${INPUTS:-0}")
+          elif [ -n "${STATUS:-}" ]; then
+            # A status was recorded and it was not 0 or 124, so the
+            # fuzzer itself stopped early. That is a finding.
+            summary=$(printf 'Fuzz search FOUND SOMETHING\n\nA target stopped early (exit %s). The input that did it is in the `fuzz-corpus` artifact; `zig build test-fuzz` replays it.\n' "$STATUS")
+            message=$(printf ':red_circle: **fuzz-search FOUND SOMETHING** — a target stopped early (exit %s). The input that did it is in the `fuzz-corpus` artifact; `zig build test-fuzz` replays it.' "$STATUS")
           else
-            printf 'Fuzz search FOUND SOMETHING\n\nA target stopped early. The input that did it is in the `fuzz-corpus` artifact; `zig build test-fuzz` replays it.\n' \
-              >> "$GITHUB_STEP_SUMMARY"
+            # No status recorded: the job broke before or during the
+            # search rather than because of it. Calling this a finding is
+            # how a notification channel teaches people to ignore it.
+            summary=$(printf 'Fuzz search did not complete\n\nThe job failed before the search reported a status. This is infrastructure, not a finding.\n')
+            message=':yellow_circle: **fuzz-search did not complete** — the job failed before the search reported a status. Infrastructure, not a finding.'
           fi
+          printf '%s\n' "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+          # No webhook configured is a valid state — a fork, or a clone
+          # that has not been given one. Say so and stop, rather than
+          # failing a search that was fine.
+          if [ -z "${WEBHOOK:-}" ]; then
+            echo "::notice::DISCORD_WEBHOOK is not set; skipping the post"
+            exit 0
+          fi
+
+          # jq builds the JSON so the message cannot break out of it.
+          body=$(jq -nc --arg content "$message"$'\n'"$RUN_URL" '{content: $content}')
+          code=$(curl -sS -o /tmp/discord.out -w '%{http_code}' \
+            -X POST -H 'Content-Type: application/json' \
+            --data-binary @- "$WEBHOOK" <<<"$body")
+
+          # A notification channel that fails quietly is worth nothing:
+          # you cannot tell it apart from a night with nothing to say.
+          # Discord answers 204 with no body on success.
+          if [ "$code" != "204" ] && [ "$code" != "200" ]; then
+            echo "::error::posting to Discord failed with HTTP $code"
+            cat /tmp/discord.out >&2 || true
+            exit 1
+          fi
+          echo "posted to Discord (HTTP $code)"
