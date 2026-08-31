@@ -1476,15 +1476,28 @@ fn drainFlight(self: *ClientHandshake, arm: anytype, out: []u8) Error!?Event {
                 arm.transcript.update(message.bytes);
                 self.state = .awaiting_finished;
             },
-            // Deliberately not restricted to WAIT_FINISHED.
-            // `.insecure_no_verification` lets a server skip the
-            // certificate leg outright, and which fault a Finished
-            // standing in the wrong place earns — `unexpected_message`
-            // for an inverted flight, `bad_certificate` for one that
-            // never authenticated — is a policy question that already
-            // lives in `completeHandshake`. Moving it here would change
-            // the alert, which BoGo grades.
-            .finished => return try self.completeHandshake(arm, message, out),
+            // §Appendix A.1 has one edge into CONNECTED and it leaves
+            // WAIT_FINISHED. The other flight states are not uniform in
+            // what they earn, and the difference is observable, so the
+            // choice stays in `completeHandshake`: a flight that reached
+            // the certificate states and skipped the signature inverted
+            // the order (`unexpected_message`), while one that never
+            // authenticated is an authentication failure
+            // (`bad_certificate`), and `.insecure_no_verification` lets
+            // an embedder that verifies elsewhere skip the leg outright.
+            // Moving that here would move the alert, which BoGo grades.
+            //
+            // WAIT_EE is the exception, and review caught that the
+            // comment which used to sit here did not account for it.
+            // §4.3.1 makes EncryptedExtensions mandatory in *every* 1.3
+            // handshake, and on a resumed one `completeHandshake` skips
+            // its whole policy block — so a bare Finished straight after
+            // the ServerHello was accepted, mandatory message and all.
+            // Predates this refactor; closed by it.
+            .finished => {
+                if (self.state == .awaiting_encrypted_extensions) return error.UnexpectedMessage;
+                return try self.completeHandshake(arm, message, out);
+            },
             else => return error.UnexpectedMessage,
         }
     }

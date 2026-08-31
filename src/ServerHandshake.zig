@@ -1648,6 +1648,16 @@ fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []c
 /// chance to change its mind — and because a client that sends no
 /// Certificate at all has to be caught somewhere, which is here.
 fn checkClientAuth(self: *const ServerHandshake, auth: ClientAuth) Error!void {
+    // Since #18 put §Appendix A.2's order in the state type, the two
+    // structural checks here are unreachable by construction: WAIT_CERT
+    // is left only by a Certificate, so `peer.seen` holds, and WAIT_CV is
+    // left only by a successful `peer.verify`, so `peer.verified` holds
+    // under `.leaf_signature`. They stay for the same reason the
+    // `client_auth orelse` branches do — a mistake in a transition should
+    // refuse a handshake, not walk past a check that used to catch it.
+    // The `require` decision on an empty list is *not* dead: §4.4.2.1's
+    // answer reaches WAIT_FINISHED legitimately.
+    //
     // §4.3.2 forbids the request under a PSK, so we never sent one and
     // there is nothing to have answered.
     if (self.resumed) return;
