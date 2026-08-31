@@ -129,6 +129,19 @@ pub const State = enum(u8) {
     /// §4.5's EndOfEarlyData — is the one that moves the transcript the
     /// client's Finished will MAC.
     awaiting_end_of_early_data,
+    // §Appendix A.2's second flight. These two used to be folded into
+    // `awaiting_finished`, with the order rebuilt at each message arm by
+    // `client_auth`, `resumed`, `peer.seen`, `peer.empty` and
+    // `peer.verify_seen`. See #18 and the client half.
+    /// WAIT_CERT: entered only when we actually asked — `client_auth` set
+    /// and the handshake not resumed. A certificate nobody requested has
+    /// no state to arrive in, which is the authentication gap as a
+    /// missing edge rather than a guard.
+    awaiting_client_certificate,
+    /// WAIT_CV: reachable only from a non-empty Certificate. §4.4.2.1's
+    /// empty list has nothing to sign with and skips straight to the
+    /// Finished.
+    awaiting_client_certificate_verify,
     awaiting_finished,
     connected,
     /// §6.1 closes one direction at a time, so a close is two states
@@ -169,8 +182,37 @@ pub fn writable(self: *const ServerHandshake) bool {
 /// (§8 bounds that, it does not remove it). Appendix E.5 is the RFC's
 /// own account. An embedder that answers here is choosing a round trip
 /// over that confirmation, which is exactly the trade 0.5-RTT is.
+/// Whether the client's second flight is still being read. Three states
+/// answer yes; every site that used to compare against `awaiting_finished`
+/// for this meaning asks here instead.
+fn awaitingClientFlight(self: *const ServerHandshake) bool {
+    return switch (self.state) {
+        .awaiting_client_certificate,
+        .awaiting_client_certificate_verify,
+        .awaiting_finished,
+        => true,
+        .awaiting_client_hello,
+        .awaiting_retry_client_hello,
+        .awaiting_end_of_early_data,
+        .connected,
+        .close_sent,
+        .close_received,
+        .closed,
+        .failed,
+        => false,
+    };
+}
+
+/// Where the server goes once its own flight is out. §4.3.2 forbids a
+/// CertificateRequest under a PSK, so a resumed handshake asked for
+/// nothing and expects only the Finished.
+fn afterServerFlight(self: *const ServerHandshake) State {
+    if (self.config.client_auth != null and !self.resumed) return .awaiting_client_certificate;
+    return .awaiting_finished;
+}
+
 pub fn halfRttWritable(self: *const ServerHandshake) bool {
-    return self.state == .awaiting_finished or self.state == .awaiting_end_of_early_data;
+    return self.awaitingClientFlight() or self.state == .awaiting_end_of_early_data;
 }
 
 pub fn readable(self: *const ServerHandshake) bool {
@@ -700,7 +742,7 @@ pub fn handleRecord(self: *ServerHandshake, wire_record: []const u8, out: []u8) 
 fn openFailureIsEarlyData(self: *const ServerHandshake, err: Error) bool {
     assert(self.state != .failed);
     if (!self.early_data_offered) return false;
-    if (self.state != .awaiting_finished) return false;
+    if (!self.awaitingClientFlight()) return false;
     // Only the two ways a record can fail to be *this* key's ciphertext.
     // A sequence number spent, or a header we refused, is our fault or a
     // framing fault, and neither becomes early data by being adjacent to
@@ -1264,7 +1306,7 @@ fn acceptClientHello(
             const sealed = try arm.send.?.seal(.handshake, flight, builder.bytes[builder.index..]);
             builder.index += sealed.len;
             try arm.finishFlight();
-            self.state = if (accept_early) .awaiting_end_of_early_data else .awaiting_finished;
+            self.state = if (accept_early) .awaiting_end_of_early_data else self.afterServerFlight();
             return .{ .send = builder.written() };
         },
     }
@@ -1380,9 +1422,12 @@ fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: [
     // Readable, not connected: §6.1 leaves the read side open after our
     // own close_notify, and closing it there is what made a truncated
     // shutdown indistinguishable from an orderly one.
-    switch (self.state) {
-        .awaiting_end_of_early_data, .awaiting_finished, .connected, .close_sent => {},
-        else => return error.UnexpectedMessage,
+    if (!self.awaitingClientFlight() and
+        self.state != .awaiting_end_of_early_data and
+        self.state != .connected and
+        self.state != .close_sent)
+    {
+        return error.UnexpectedMessage;
     }
     assert(self.ladder != null);
     // No length assertion here. §5.1 lets an application_data record be
@@ -1395,14 +1440,18 @@ fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: [
     // peer deserves. TLS-Anvil found this.
     switch (self.ladder.?) {
         inline else => |*arm| {
-            const opened = (switch (self.state) {
+            const opened = (if (self.awaitingClientFlight())
+                // The client's whole second flight — Certificate,
+                // CertificateVerify and Finished — is under the one
+                // handshake protector.
+                arm.recv.?.open(wire_record, out)
+            else switch (self.state) {
                 // §4.2.10's own keys, and their own sequence space: the
                 // early data and the Finished that follows it are two
                 // different protectors over the same record type.
                 .awaiting_end_of_early_data => arm.early_recv.?.open(wire_record, out),
-                .awaiting_finished => arm.recv.?.open(wire_record, out),
                 .connected, .close_sent => arm.session.?.recv.open(wire_record, out),
-                else => unreachable, // The guard above admits only these three.
+                else => unreachable, // The guard above admits only these.
             }) catch |err| {
                 // §4.2.10's trial decryption. A record that will not open
                 // under the handshake key, on a connection whose hello
@@ -1497,10 +1546,10 @@ fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []c
         if (!self.assembler.empty()) return error.UnexpectedMessage;
         arm.absorbMessage(message.bytes);
         arm.finishEarlyData();
-        self.state = .awaiting_finished;
+        self.state = self.afterServerFlight();
         return null;
     }
-    if (self.state != .awaiting_finished) return self.nextPostHandshake(arm, out);
+    if (!self.awaitingClientFlight()) return self.nextPostHandshake(arm, out);
     // §4.3.2's answer, then §4.4.4's Finished. Without client auth the
     // first two arms are unreachable and this is the single-message
     // shape it has always been.
@@ -1512,15 +1561,15 @@ fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []c
                 // A certificate we never asked for. §4.4.2 sends one only
                 // in answer to a CertificateRequest, so this is a client
                 // answering a question we did not put.
+                if (self.state != .awaiting_client_certificate) return error.UnexpectedMessage;
+                // Reaching WAIT_CERT already means `client_auth` is set
+                // and the handshake is not resumed — `afterServerFlight`
+                // is the only way in. The null branch is therefore
+                // unreachable by construction; it stays an error rather
+                // than an `unreachable` because this is a security path
+                // and a mistake in the transition should refuse a
+                // handshake, not abort the process.
                 const auth = self.config.client_auth orelse return error.UnexpectedMessage;
-                // §4.3.2 forbids the request under a PSK, so we never
-                // sent one on a resumed handshake and this answers
-                // nothing. Without this, `checkClientAuth` — which
-                // returns early for a resumed session precisely because
-                // it did not ask — leaves `peer.verified` set from a
-                // certificate nobody requested and `require` never saw.
-                if (self.resumed) return error.UnexpectedMessage;
-                if (self.peer.seen) return error.UnexpectedMessage;
                 try self.peer.capture(message.body(), .{
                     .policy = auth.policy,
                     .chain_verifier = auth.chain_verifier,
@@ -1530,20 +1579,23 @@ fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []c
                     .allow_empty = true,
                 });
                 arm.absorbClientAuth(message.bytes);
+                // §4.4.2.1: an empty list is the client saying it has
+                // none, and there is nothing for a CertificateVerify to
+                // sign. Whether that ends the handshake is `require`'s
+                // call, at the Finished.
+                self.state = if (self.peer.empty)
+                    .awaiting_finished
+                else
+                    .awaiting_client_certificate_verify;
             },
             .certificate_verify => {
+                // WAIT_CV is reachable only from a non-empty Certificate
+                // and is left by this message, so "no Certificate yet",
+                // "an empty one" and "a second copy" are all simply not
+                // this state. The last of those was a panic before it was
+                // a guard.
+                if (self.state != .awaiting_client_certificate_verify) return error.UnexpectedMessage;
                 const auth = self.config.client_auth orelse return error.UnexpectedMessage;
-                if (self.resumed) return error.UnexpectedMessage;
-                // §4.4.3 signs what §4.4.2 presented, so the order is
-                // fixed — and a client that sent an empty list has
-                // nothing to sign with.
-                if (!self.peer.seen or self.peer.empty) return error.UnexpectedMessage;
-                // §4.4 sends one per flight. A second was accepted — each
-                // signs the transcript the one before it moved, so a
-                // client holding its own key can produce any number — and
-                // the fourth message then reached the count assertion
-                // below as a panic.
-                if (self.peer.verify_seen) return error.UnexpectedMessage;
                 try self.peer.verify(message, .{
                     .policy = auth.policy,
                     .side = .client,
@@ -1555,8 +1607,14 @@ fn handleProtectedHandshake(self: *ServerHandshake, arm: anytype, plaintext: []c
                     .accepted = auth.verify_schemes,
                 });
                 arm.absorbClientAuth(message.bytes);
+                self.state = .awaiting_finished;
             },
             .finished => {
+                // §4.4.4 ends the flight, and only from WAIT_FINISHED. A
+                // Finished standing where the Certificate should be earns
+                // the same `unexpected_message` `checkClientAuth` used to
+                // give it for `!peer.seen`.
+                if (self.state != .awaiting_finished) return error.UnexpectedMessage;
                 if (self.config.client_auth) |auth| try self.checkClientAuth(auth);
                 // The Finished is the last thing in its flight; anything
                 // packed after it is arriving before the keys that would
@@ -1678,7 +1736,7 @@ pub fn drain(self: *ServerHandshake, out: []u8) Error!?Event {
     assert(out.len >= out_bytes_min);
     // Only the post-handshake stream is drained. A flight is assembled
     // by `handleRecord` itself, and a Finished admits nothing after it.
-    if (self.state == .awaiting_finished) return null;
+    if (self.awaitingClientFlight()) return null;
     if (!self.readable()) return null;
     if (self.ladder == null) return null;
     errdefer self.state = .failed;
