@@ -49,8 +49,17 @@ jobs:
         id: search
         env:
           MINUTES: ${{ inputs.minutes || '20' }}
+        # Not the default `bash -e`. This step's whole job is to inspect a
+        # non-zero status and decide what it means, and `-e` denies it the
+        # chance: with `pipefail` on, the timeout's 124 becomes the
+        # pipeline's status and `-e` kills the script on that very line —
+        # before `PIPESTATUS` is read, before the `if` below forgives it.
+        # Every run of this workflow failed that way while the comment
+        # underneath correctly called 124 the expected outcome. `set` in
+        # the body cannot fix it, because the flag arrives on the command
+        # line, so it has to be spelled out here.
+        shell: bash --noprofile --norc -uo pipefail {0}
         run: |
-          set -uo pipefail
           # `--fuzz` runs until interrupted, so the time box is the
           # runner's. 124 is the timeout firing, which is the *expected*
           # end of a search; anything else is the fuzzer stopping early,
