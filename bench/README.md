@@ -390,6 +390,95 @@ of AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 — which is worth
 recording because it means the bulk-data rows are measuring the two
 *libraries*, not the two crypto backends.
 
+### `x25519_public` is 3.9× off aws-lc-rs, and none of the obvious causes is the cause
+
+17.85 µs against 4.57 µs is the widest primitive ratio in the table, and it
+is the one most likely to be re-investigated by whoever reads this next.
+It has been investigated. The answer is upstream OpenSSL's, none of this
+tree's levers reach it, and the three explanations that suggest
+themselves first were each measured and refuted — after which the obvious
+patch measured as a regression.
+
+**Not EVP overhead.** `x25519Public` builds an `EVP_PKEY` from the raw
+scalar, reads the public half out and frees it, so the object lifecycle
+is a plausible suspect — and it is the same suspect `aead_key_init`
+already refuted once, above. Priced directly with a temporary row that
+imports a raw *public* key instead (`EVP_PKEY_new_raw_public_key`: the
+same construction, provider fetch and free, with no multiplication,
+because a public key needs none) it is **0.66 µs**. The other ~17 µs is
+arithmetic.
+
+**Not a build defect.** `config.zig` defines `X25519_ASM` and lists
+`crypto/ec/asm/x25519-x86_64`; the archive carries `x25519_fe64_mul`,
+`_sqr` and `_eligible`; and `x25519_fe64_eligible()` returns `0x80100`
+when called against the linked library, so the ADX gate is open. An
+independent check settles it from outside: the distribution's own
+OpenSSL 3.6.3, `gcc -O3` with full assembly, does X25519 derive at 43,916
+op/s — 22.8 µs, against the ~24 µs of arithmetic in this tree's
+`x25519_shared`. Two unrelated builds land within 8% of each other.
+
+**Not a missing dispatch.** The assembly is present, loaded, gated open —
+and unreachable from this operation.
+`ossl_x25519_public_from_private` (`crypto/ec/curve25519.c`) calls
+`ge_scalarmult_base` unconditionally, with no `X25519_ASM` branch
+anywhere in it. Three field representations live in that file and the
+fast two are wired only to the ladder: `fe64[4]` backs
+`x25519_scalar_mulx` (the shared secret), `fe51[5]` gates
+`x25519_scalar_mult_generic` (the ladder again), and the base-point comb
+runs on `typedef int32_t fe[10]` — reference ref10 arithmetic. The
+BoringSSL family, which aws-lc-rs is built on, reaches the same comb
+shape through fiat-crypto's ADX assembly; that is read from BoringSSL's
+source rather than measured here, and it is the only part of this section
+that is not a number from this harness. It is also, on the evidence
+above, the whole ratio.
+
+Masking ADX off confirms it costs this row nothing:
+
+```
+OPENSSL_ia32cap=0x7ffaf3ffffebffff:0x994007bc2394a7eb   # CPUID7.EBX bit19 cleared
+  x25519_public   17.61 -> 17.65 µs   (unchanged: the row never used ADX)
+  aead_seal_chacha20, with AVX2 cleared instead:
+                   4.98 -> 8.91 µs   (the control — masking does work)
+```
+
+The control matters. Without it the null result reads equally well as a
+mask that never applied, and an earlier attempt at this measurement was
+wrong for exactly that reason: `OPENSSL_ia32cap=""` was used as the
+baseline, and an empty value parses as *zero capabilities*, disabling
+every feature and dropping AES-GCM to 0.19 GB/s.
+
+**And the obvious patch is a regression.** Giving the base point the ADX
+ladder — `x25519_scalar_mulx` against base point 9 — replaces ~17 µs of
+comb with the ~24 µs of arithmetic that `x25519_shared` already prices.
+No patch is needed to know this; the row is in the table.
+
+`std.crypto` does not reach it either, measured on Zig 0.16.0 through the
+same harness: `X25519.recoverPublicKey` (a Montgomery ladder, no
+precomputation) is **28.4 µs**, and the Edwards route BoringSSL takes —
+`Edwards25519.basePoint.clampedMul`, whose `basePointPc` table is
+*comptime* and therefore costs nothing against DESIGN.md §3 — is **32.6
+µs** for the multiplication alone, before `Curve25519.fromEdwards25519`
+adds 3.5 µs more. The precomputed table is real and it does not pay:
+Zig's Edwards point arithmetic costs more per step than the ladder's
+cswap loop by more than the table's ~4× step reduction buys. §3 was never
+the blocker here; speed was.
+
+Upstream is not going to hand this over. `crypto/ec/curve25519.c` on
+OpenSSL master differs from the vendored 3.5.8 by a single seven-line
+*comment* about argument ordering in the ADX ladder, `ge_scalarmult_base`
+is still on `fe[10]`, and the file has seen no arithmetic change since
+2022 — the four most recent commits are that comment, a clang-format
+pass, copyright years, and FIPS EdDSA validation. A pin bump buys
+nothing.
+
+What is left costs more than it returns: rewriting `ge_*` against
+`fe51`, vendoring fiat's ADX base point into the fork, or moving to
+aws-lc and giving up `CRYPTO_set_mem_functions` — which DESIGN.md §3
+spends the zero-allocation budget on. All of that for 13 µs of a 172 µs
+handshake, about 7.5%, in a path that runs once per connection. It is
+left alone deliberately, and this section exists so the next person
+spends ten minutes reading it instead of a day re-deriving it.
+
 ## Caveats
 
 - A laptop is not a benchmarking machine, whatever its governor says. The
