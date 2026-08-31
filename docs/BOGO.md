@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 445 passed, 0 failed, 6541 declined by the shim (89), floor 445
+bogo: 454 passed, 0 failed, 6490 declined by the shim (89), floor 454
 bogo: PASS
 ```
 
@@ -41,7 +41,7 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**445 passed.** Cases the runner ran end to end and we satisfied —
+**454 passed.** Cases the runner ran end to end and we satisfied —
 including the alert we sent, which BoGo checks by name. It was 424
 until a review found the server role still declining two flags it could
 answer (finding 24), 401 until client certificates landed (finding 23), 367 until §7.5's exporter
@@ -82,74 +82,74 @@ extension block, and 143 until §4.6.3's update requests were coalesced, and
 either gets fixed or gets an entry in `DisabledTests` with a one-line
 reason. There are no silent skips.
 
-**6541 declined** — 83% of the corpus. The shim exited 89, PORTING.md's
+**6490 declined** — 82% of the corpus. The shim exited 89, PORTING.md's
 "unimplemented", and the runner counted the case without running it.
 That number is large enough to be the first thing anyone asks about, so
-here is what it is made of. Counting each case by the *first* thing the
-shim declined:
+here is what it is made of — counted two ways, because one of them
+misleads on its own:
 
-| Cases | Declined because |
-| ---: | --- |
-| 2676 | DTLS or QUIC — no datagram record layer, and none planned. |
-| 409 | `-new-x509-credential` — multiple credentials with selection between them. |
-| 378 | `-fips-202205`, `-cnsa1-202603`, `-cnsa2-202603`, `-wpa-202304` — compliance policies. |
-| 324 | `-verify-fail` / `-expect-verify-result` — X.509 validation, the embedder's by design. |
-| 281 | `-enable-ocsp-stapling` / `-ocsp-response`. |
-| 250 | `-signing-prefs` / `-expect-peer-signature-algorithm`. |
-| 248 | `-new-rpk-credential` — raw public keys. |
-| 105 | A group we do not hold, or a `-curves` set we cannot honour — now only a set naming a group neither machine completes, or one without x25519, which is the group our client always shares. |
-| 182 | `-accepted-peer-cert-types`. |
-| 167 | `-export-keying-material` — RFC 5705 exporters, which zssl has no API for. |
-| ~1800 | The rest of the flag surface, one flag at a time. |
+| Cases | Sole blocker | Declined because |
+| ---: | ---: | --- |
+| 2188 | 523 | DTLS or QUIC — no datagram record layer, and none planned |
+| 636 | 45 | `-new-x509-credential` — multiple credentials with selection between them |
+| 392 | 23 | OCSP stapling |
+| 380 | 380 | compliance policies (`-fips-202205`, the two `-cnsa`, `-wpa-202304`) |
+| 311 | 20 | `-new-rpk-credential` — raw public keys |
+| 199 | 85 | `-accepted-peer-cert-types` |
+| 188 | 107 | `-async` — BoringSSL's own callback model |
+| 170 | 0 | `-new-psk-credential` — external PSKs |
+| 168 | 44 | `-expect-verify-result` — X.509 validation, the embedder's by design |
+| 167 | 56 | channel ID |
+| 128 | 0 | a `-curves` set we cannot honour, or one without x25519 |
+| 96 | 16 | ECH |
+| 86 | 25 | a pre-1.3 bound named on the wire |
+| 75 | 0 | `-verify-prefs` naming a scheme we do not hold |
+| 59 | 0 | `-signing-prefs` on the client role |
+| 27 | 0 | an RSA leaf — ECDSA signing only, by embedder policy |
+| 1220 | — | the rest of the flag surface, one flag at a time |
 
-Roughly 3400 of those — DTLS, QUIC, client certificates, ECH,
-compliance policies, X.509 validation — are scope decisions written down
-in DESIGN.md §1 and will never come back. The rest is headroom: the
-largest rows left are an RFC 5705 exporter (167 cases), exposing the
-peer's negotiated signature algorithm (128), and honouring
-`-signing-prefs` (122) — *rows*, deliberately, not wins. All three have
-now been sampled, and they came out very differently:
+Roughly 3700 of those — DTLS, QUIC, ECH, compliance policies, OCSP, raw
+public keys, channel ID and X.509 validation — are scope decisions
+written down in DESIGN.md §1 and will never come back.
 
-| Row | Cases | Would run | What is in the way |
-| --- | ---: | ---: | --- |
-| `-export-keying-material` | 167 | **6** | the rest are DTLS, QUIC or pre-1.3 |
-| `-expect-peer-signature-algorithm` | 128 | **~32** | half are pre-1.3; half of the rest verify a *client* certificate |
-| `-signing-prefs` | 122 | **~31** | `Client-Sign-*` is client certificates |
+**The second column is the one to plan against.** "Cases" counts what
+the shim declined *first*, and that number is an upper bound which is
+usually loose, because a case declined for one reason is very often
+declined for three. "Sole blocker" counts the cases where that flag is
+the only unsupported one in the whole argv — so it is what honouring the
+flag would actually let run. The two columns disagree by a factor of
+four overall (6490 against 1729), and by far more than that in
+individual rows: `-new-psk-credential` heads 170 cases and is the sole
+blocker for none of them.
 
-The exporter row is small because `cipher_suite_tests.go` sets the flag
-on every `-server`/`-client` case but generates none at TLS 1.3, and the
-dedicated `export_tests.go` family is mostly DTLS and QUIC.
+`-curves` is the worked example of why this matters, and it cost a slice
+to learn. This paragraph used to name it as one of the largest available
+wins on the strength of a 105-case row; honouring it un-declined
+**eleven**, every one a TLS 1.0/1.1/1.2 conversation we have to decline
+anyway. The other 94 hit a second unimplemented flag immediately behind
+the first. The sole-blocker column exists so that mistake cannot be made
+from this table again.
 
-The two signature-algorithm rows are the real headroom, and cheaper than
-they look because each has a precedent in the tree. The client never
-records the peer's scheme — it is a local in `verifyCertificate`,
-checked and dropped — while the server already keeps `signature_scheme`
-and `interop` asserts on it; that is one field. Restricting which
-schemes the server will sign with is `Config.groups` one type over.
-Between them the shim needs three flags it does not have:
-`-expect-peer-signature-algorithm`, `-verify-prefs`, `-signing-prefs`.
+Both columns come from the same place and can be re-derived. The runner
+does not surface the shim's stderr, so the reasons are not in
+`bogo.log`; point `-shim-path` at a two-line wrapper that tees stderr to
+a file and re-run the corpus, and every decline comes back with the argv
+that produced it. Finding 25 is what that first produced, and the
+"largest source of 89s" claim it demolished is the reason to prefer a
+measurement here over a plausible sentence.
 
-Read those two figures as cases that would *run*, not cases that would
-pass. Roughly two thirds of them are algorithms we do not hold, so they
-expect a refusal, and BoGo grades refusals by alert name — finding 8 is
-what that costs when we disagree.
+Read either column as cases that would *run*, not cases that would pass.
+Roughly two thirds of them are algorithms or versions we do not hold, so
+they expect a refusal, and BoGo grades refusals by alert name — finding
+8 is what that costs when we disagree, and findings 19 and 25 are what
+it costs when we do not.
 
-**Read this table as "first thing declined", not "cases a fix would
-buy".** `-curves` is the worked example, and it cost a slice to learn.
-This paragraph used to name it as one of the largest wins, on the
-strength of its 105-case row; both machines now take a configured group
-list, and honouring it un-declined **11** cases, every one of them a
-TLS 1.0/1.1/1.2 conversation we have to decline anyway. The other 94 hit
-a second unimplemented flag immediately behind the first. A row's number
-is an upper bound that is usually loose, because a case declined for one
-reason is very often declined for three.
-
-The 11 are worth keeping in mind for a different reason: `-curves` was
-the *only* thing declining them. The runner sets its `MaxVersion` on its
-own `Config` rather than passing the shim a `-max-version` flag, so
-nothing on the wire tells the shim those cases are pre-1.3 — they were
-being excluded by accident, and their RSA twins had been on the ledger
-by name all along.
+The eleven `-curves` cases are worth keeping in mind for a second
+reason: `-curves` was the *only* thing declining them. The runner sets
+its `MaxVersion` on its own `Config` rather than passing the shim a
+`-max-version` flag, so nothing on the wire tells the shim those cases
+are pre-1.3 — they were being excluded by accident, and their RSA twins
+had been on the ledger by name all along.
 
 Each decline names its flag on stderr, so a case that later turns into a
 failure says which flag it stumbled on rather than leaving it to
@@ -1186,6 +1186,55 @@ laxity, and laxity is what BoGo exists to find.
     the three ML-DSA sizes pair an unsupported key type with an
     unsupported scheme, and we notice the key first. Twenty-nine more are
     pre-1.3.
+
+25. **A stale assertion, which is worse than a stale decline.** Nine more
+    cases, 445 to 454, and again not one line of library code — but the
+    reason to write this one down is not the nine.
+
+    Findings 18 and 24 were declines that outlived their reasons. This
+    audit went looking for more of them deliberately, by wrapping the
+    shim in a script that tees stderr and re-running the whole corpus, so
+    that every one of the 6541 declines could be read back with the flag
+    that caused it. Two of the three things it found were declines. The
+    third was not, and it is the dangerous one.
+
+    `-expect-no-hrr` was accepted and then thrown away, under the comment
+    "the client refuses every HelloRetryRequest, so no HRR holds by
+    construction; there is nothing to arm". The line that supplies
+    `retry_key_share_private` — forty lines into `runClient`, added when
+    the client learned to answer a retry — is what stopped that being
+    true. The comment was never revisited.
+
+    A stale decline narrows the corpus in a place the ledger can
+    eventually see. A stale *assertion* reports a pass. Nothing was
+    actually being mis-reported, because all 33 cases carrying the flag
+    declined for other reasons first — but that is luck, not design, and
+    it would have evaporated the moment one of those other declines was
+    fixed. Armed now against `ClientHandshake.retried`, along with its
+    positive twin `-expect-hrr`, which is where three of the nine come
+    from. On the server role the retry is a state passed through rather
+    than kept, so there is nothing to read at the end and the case is
+    declined rather than assumed.
+
+    The other six come from `-verify-fail`, which was declined as an
+    unknown flag while `chain_verifier` — the hook it needs, exercised by
+    the README's own example — sat unused in the same config literal the
+    shim fills in. Wiring a verifier that says no is four lines per role.
+
+    Forty-two cases went from declined to *failing* on the way, which is
+    the honest cost of un-declining something: thirty-six are pre-1.3 and
+    now run far enough to end at `protocol_version`, and six are TLS 1.3
+    cases we refuse exactly as asked while sending §6.2's
+    `bad_certificate` where BoringSSL sends the generic
+    `handshake_failure`. All forty-two are in the ledger with reasons;
+    the six are KEEP.
+
+    One more thing this audit produced is a number worth distrusting. The
+    comment on the RSA-leaf decline claimed it was "the single largest
+    source of 89s". It is 27 of 6490, outside the top thirty — `-dtls`
+    leads at 1617. It was plausible when written and nobody could have
+    checked it, because the runner swallows the shim's stderr and the
+    reasons were not recoverable until this audit made them so.
 
 ## Running it
 

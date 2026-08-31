@@ -199,6 +199,14 @@ const Connection = struct {
     expect_curve_id: ?u16 = null,
     expect_session_miss: bool = false,
     expect_no_session: bool = false,
+    /// `-expect-hrr` / `-expect-no-hrr`: whether §4.1.4's retry must have
+    /// happened. Null where the case does not say. This is an assertion
+    /// and not a switch — nothing here changes what we offer.
+    expect_hrr: ?bool = null,
+    /// `-verify-fail`: the embedder's chain check rejects the peer. The
+    /// hook is `chain_verifier` and it has always been there; what was
+    /// missing is the shim handing it a verifier that says no.
+    verify_fail: bool = false,
 
     /// §4.3.2, as BoGo asks for it. `-require-any-client-certificate`
     /// asks and refuses an empty answer; `-verify-peer` asks and accepts
@@ -299,6 +307,41 @@ fn parseFlags(init: std.process.Init, arena: std.mem.Allocator) ParseError!Optio
     return options;
 }
 
+/// `-verify-fail`: the embedder's chain check says no, which is the one
+/// answer BoGo asks this hook for. `PeerCertificate.capture` turns false
+/// into `error.BadCertificate` — the bad_certificate alert the runner
+/// expects, reached by the same path a real embedder's failed path
+/// building would take. The chain is borrowed and we look at none of it:
+/// the case is about what the machine does with a rejection, not about
+/// how the rejection was reached.
+fn rejectChain(context: *anyopaque, chain: zssl.certificate_list.CertificateList) bool {
+    _ = context;
+    _ = chain;
+    return false;
+}
+
+/// The address `rejectChain` carries. `ChainVerifier.context` is not
+/// optional and the callback reads none of it, so this is a placeholder
+/// rather than state — nothing writes it and nothing reads it.
+var reject_context: u8 = 0;
+
+/// `-verify-fail` in the shape both roles want it. A helper rather than
+/// the same four-line ternary twice: repeated inline, it put `runServer`
+/// and `runClient` at 74 and 72 code lines against TIGER_STYLE's 70-line
+/// hard limit — the same pressure that split `applyFlag` in two.
+fn configuredChainVerifier(connection: *const Connection) ?zssl.peer_certificate.ChainVerifier {
+    if (!connection.verify_fail) return null;
+    return .{ .context = &reject_context, .verify = &rejectChain };
+}
+
+/// `-signing-prefs` as `Config.signing_schemes` takes it: wire code
+/// points, or null where the case named none. Wire values deliberately —
+/// see the field comment on `Connection.signing_prefs`.
+fn configuredSigningSchemes(connection: *const Connection) ?[]const u16 {
+    if (connection.signing_pref_count == 0) return null;
+    return connection.signing_prefs[0..connection.signing_pref_count];
+}
+
 /// Name what we declined on the way out. The runner shows a shim's
 /// stderr whenever a case fails, so a 89 that later turns into a FAILED
 /// says which flag it stumbled on instead of leaving it to bisection.
@@ -330,7 +373,7 @@ fn flagArity(name: []const u8) ?Arity {
         "-no-tls1",                  "-no-tls11",           "-no-tls12",
         "-expect-no-hrr",            "-enable-early-data",  "-expect-accept-early-data",
         "-expect-reject-early-data", "-use-export-context", "-require-any-client-certificate",
-        "-verify-peer",
+        "-verify-peer",              "-expect-hrr",         "-verify-fail",
     };
     for (with_value) |candidate| if (std.mem.eql(u8, name, candidate)) return .one;
     for (without_value) |candidate| if (std.mem.eql(u8, name, candidate)) return .none;
@@ -437,9 +480,19 @@ fn applyFlagB(connection: *Connection, name: []const u8, value: ?[]const u8) Par
     } else if (std.mem.eql(u8, name, "-check-close-notify")) {
         connection.check_close_notify = true;
     } else if (std.mem.eql(u8, name, "-expect-no-hrr")) {
-        // The client refuses every HelloRetryRequest and the server only
-        // sends one when the offer is unusable, so "no HRR" holds by
-        // construction; there is nothing to arm.
+        // This read "the client refuses every HelloRetryRequest, so no
+        // HRR holds by construction; there is nothing to arm" — and the
+        // line that supplies `retry_key_share_private`, forty lines into
+        // `runClient`, is what stopped that being true. Same shape as
+        // finding 24 and finding 18 before it, with a worse failure
+        // mode: a stale *decline* narrows the corpus where the ledger
+        // can eventually see it, while a stale *assertion* reports a
+        // pass. Armed now, against `ClientHandshake.retried`.
+        connection.expect_hrr = false;
+    } else if (std.mem.eql(u8, name, "-expect-hrr")) {
+        connection.expect_hrr = true;
+    } else if (std.mem.eql(u8, name, "-verify-fail")) {
+        connection.verify_fail = true;
     } else if (std.mem.eql(u8, name, "-enable-early-data")) {
         connection.enable_early_data = true;
     } else if (std.mem.eql(u8, name, "-on-resume-expect-accept-early-data") or
@@ -723,8 +776,12 @@ fn runServer(
     var credentials = Credentials.load(pem.cert, pem.key, &chain_storage, false) catch |err| switch (err) {
         // ECDSA signing only, by embedder policy (DESIGN.md §1). BoGo
         // hands every server case an RSA leaf unless the case says
-        // otherwise, so this is the single largest source of 89s — and a
-        // written decision rather than a gap.
+        // otherwise — a written decision rather than a gap. This once
+        // claimed to be "the single largest source of 89s"; it is 27 of
+        // 6490, outside the top thirty, because the flags a case names
+        // are read before its key is loaded and most decline first.
+        // Counting by hand is how that stayed wrong: the reasons are
+        // recoverable by wrapping the shim and re-running the corpus.
         error.UnsupportedKey => return unimplemented("-key-file:not-ecdsa"),
         else => return err,
     };
@@ -738,10 +795,7 @@ fn runServer(
     var strike_entries: [anti_replay.StrikeRegister.probe_max]anti_replay.StrikeRegister.Entry =
         @splat(.free);
     var strike_register: anti_replay.StrikeRegister = .{ .entries = &strike_entries };
-    const signing_schemes: ?[]const u16 = if (connection.signing_pref_count == 0)
-        null
-    else
-        connection.signing_prefs[0..connection.signing_pref_count];
+    const signing_schemes = configuredSigningSchemes(connection);
     var server = ServerHandshake.init(&.{
         .credentials = &credentials,
         .server_random = entropy[0..32].*,
@@ -757,6 +811,7 @@ fn runServer(
             .{
                 .require = connection.require_client_certificate,
                 .verify_schemes = client_verify_schemes,
+                .chain_verifier = configuredChainVerifier(connection),
             }
         else
             null,
@@ -800,6 +855,7 @@ fn runServer(
         null,
         server.key_share_group,
         store.peer_signature_scheme,
+        null,
     );
     try writeExportedMaterial(pump, &server, connection);
     // Checked, not reported. BoGo asks whether early data was accepted,
@@ -904,6 +960,11 @@ fn runClient(
         // the embedder's (DESIGN.md §1), so the BoGo cases that turn on
         // them are named in bogo/config.json rather than quietly passed.
         .certificate_policy = .leaf_signature,
+        // `-verify-fail` is the embedder refusing the chain, and it is
+        // reached through the hook a real one uses. This was declined as
+        // an unknown flag while `chain_verifier` sat unused in the same
+        // config literal.
+        .chain_verifier = configuredChainVerifier(connection),
         .resume_session = resumption,
         .reassembly = &handshake_reassembly,
     });
@@ -922,6 +983,7 @@ fn runClient(
         client.alpnSelected(),
         zssl.backend.Group.fromWire(client.share_group),
         store.peer_signature_scheme,
+        client.retried,
     );
     try writeExportedMaterial(pump, &client, connection);
 
@@ -1002,9 +1064,19 @@ fn checkNegotiated(
     alpn: ?[]const u8,
     group: ?zssl.backend.Group,
     peer_scheme: ?zssl.backend.SignatureScheme,
+    retried: ?bool,
 ) !void {
     if (connection.expect_version) |version| {
         if (version != version_tls13) return error.UnexpectedVersion;
+    }
+    if (connection.expect_hrr) |wanted| {
+        // Null is the server role, whose retry is a state it passes
+        // through rather than one it keeps: `awaiting_retry_client_hello`
+        // is gone by `.connected`. Declining is the honest answer and the
+        // whole point of the fix — an assertion we cannot evaluate must
+        // not report a pass.
+        const actual = retried orelse return unimplemented("-expect-hrr:server");
+        if (actual != wanted) return error.UnexpectedRetry;
     }
     if (connection.expect_peer_signature_algorithm) |wanted| {
         const expected = zssl.backend.SignatureScheme.fromWire(wanted) orelse
