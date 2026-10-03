@@ -332,6 +332,14 @@ fn issueTicket(
     @memset(&resumption.psk, 0);
     @memcpy(resumption.psk[0..client_psk.len], client_psk);
     try testing.expectEqualSlices(u8, server_psk, client_psk);
+
+    // §4.6.1's `ticket_nonce<0..255>`: an empty nonce, which Go's
+    // crypto/tls sends, derives a PSK too — through HKDF-Expand-Label with
+    // a zero-length context — and a different one.
+    var empty_psk_buffer: [cipher_suite.hash_bytes_max]u8 = undefined;
+    const empty_psk = harness.client.resumptionPsk(&.{}, &empty_psk_buffer);
+    try testing.expectEqual(client_psk.len, empty_psk.len);
+    try testing.expect(!std.mem.eql(u8, client_psk, empty_psk));
     return resumption;
 }
 

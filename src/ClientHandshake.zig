@@ -1784,13 +1784,14 @@ fn parseTicket(body: []const u8) Error!Ticket {
     var ticket: Ticket = undefined;
     ticket.lifetime_s = try cursor.takeU32();
     ticket.age_add = try cursor.takeU32();
+    // §4.6.1 writes `ticket_nonce<0..255>`, and empty is inside it. The
+    // nonce only has to be unique among tickets issued on one connection,
+    // so a server that issues one ticket per connection has nothing to
+    // put there: Go's crypto/tls sends it empty. Refusing that was a
+    // policy of ours, not the RFC's, and it failed every connection to a
+    // Go server on the first read after the handshake. The sibling below
+    // *is* the grammar — `ticket<1..2^16-1>` has a floor of one.
     const nonce_bytes = try cursor.takeByte();
-    // §4.6.1 writes `ticket_nonce<0..255>`, so an empty nonce is inside
-    // the grammar and this is zssl's policy rather than the RFC's: a
-    // nonce is what a resumption PSK is derived from, and one with no
-    // bytes has nothing to distinguish it. The sibling below *is* the
-    // grammar — `ticket<1..2^16-1>` has a floor of one.
-    if (nonce_bytes == 0) return error.MalformedMessage;
     ticket.nonce = try cursor.takeSlice(nonce_bytes);
     const ticket_bytes = try cursor.takeU16();
     if (ticket_bytes == 0) return error.MalformedMessage;
@@ -1806,7 +1807,7 @@ fn parseTicket(body: []const u8) Error!Ticket {
     const extensions = try cursor.takeSlice(extensions_bytes);
     if (cursor.remaining() != 0) return error.MalformedMessage;
     ticket.early_data_bytes_max = try checkTicketExtensions(extensions);
-    assert(ticket.nonce.len >= 1);
+    assert(ticket.nonce.len <= 255);
     assert(ticket.ticket.len >= 1);
     return ticket;
 }
@@ -1819,7 +1820,7 @@ pub fn resumptionPsk(
     out: *[cipher_suite.hash_bytes_max]u8,
 ) []const u8 {
     assert(self.writable());
-    assert(ticket_nonce.len >= 1);
+    assert(ticket_nonce.len <= 255);
     switch (self.ladder.?) {
         inline else => |*arm, comptime_suite| {
             const Schedule = key_schedule.KeySchedule(comptime_suite);
@@ -2232,6 +2233,34 @@ fn ArmOf(comptime suite: CipherSuite) type {
             return builder.written();
         }
     };
+}
+
+test "§4.6.1: a NewSessionTicket with an empty nonce is accepted" {
+    // `ticket_nonce<0..255>`: empty is in the grammar, and it is what Go's
+    // crypto/tls sends. Refusing it failed every connection to a Go server
+    // on the first post-handshake record.
+    var buffer: [32]u8 = undefined;
+    var b = wire.Builder.init(&buffer);
+    b.putU32(604800); // lifetime
+    b.putU32(0x01020304); // age_add
+    b.putByte(0); // ticket_nonce<0>
+    b.putU16(2); // ticket<2>
+    b.putSlice(&.{ 0xaa, 0xbb });
+    b.putU16(0); // extensions<0>
+    const parsed = try parseTicket(b.written());
+    try std.testing.expectEqual(@as(usize, 0), parsed.nonce.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, parsed.ticket);
+    try std.testing.expectEqual(@as(u32, 604800), parsed.lifetime_s);
+
+    // An empty ticket is still outside the grammar.
+    var refused: [32]u8 = undefined;
+    var r = wire.Builder.init(&refused);
+    r.putU32(604800);
+    r.putU32(0);
+    r.putByte(0);
+    r.putU16(0); // ticket<0>
+    r.putU16(0);
+    try std.testing.expectError(error.MalformedMessage, parseTicket(r.written()));
 }
 
 test "§4.6.1: a NewSessionTicket's extension block is checked, not skipped" {
