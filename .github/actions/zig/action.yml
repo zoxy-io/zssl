@@ -8,4 +8,4 @@ runs:
     - uses: mlugg/setup-zig@v2
       with:
         # The pin. Moving it here moves it everywhere.
-        version: 0.16.0
+        version: 0.17.1

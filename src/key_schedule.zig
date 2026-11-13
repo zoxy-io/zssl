@@ -72,7 +72,7 @@ pub fn KeySchedule(comptime suite: CipherSuite) type {
         /// schedule from nothing.
         pub fn initEarly(psk: ?[]const u8) Self {
             if (psk) |bytes| assert(bytes.len >= 1 and bytes.len <= cipher_suite.hash_bytes_max);
-            const zeros = [_]u8{0} ** hash_bytes;
+            const zeros: [hash_bytes]u8 = @splat(0);
             const ikm = psk orelse &zeros;
             const schedule: Self = .{ .stage = .early, .secret = Kdf.extract(&.{}, ikm) };
             assert(!std.mem.allEqual(u8, &schedule.secret, 0));
@@ -93,7 +93,7 @@ pub fn KeySchedule(comptime suite: CipherSuite) type {
         pub fn advanceToMaster(self: *Self) void {
             assert(self.stage == .handshake);
             const derived = self.deriveSecret("derived", &emptyTranscriptHash());
-            const zeros = [_]u8{0} ** hash_bytes;
+            const zeros: [hash_bytes]u8 = @splat(0);
             self.secret = Kdf.extract(&derived, &zeros);
             self.stage = .master;
             assert(!std.mem.allEqual(u8, &self.secret, 0));
@@ -244,7 +244,7 @@ test "the three-stage ladder refuses to skip a rung" {
     const Schedule = KeySchedule(.aes_128_gcm_sha256);
     var schedule = Schedule.initEarly(null);
     try std.testing.expectEqual(Schedule.Stage.early, schedule.stage);
-    const shared = [_]u8{0x42} ** 32;
+    const shared: [32]u8 = @splat(0x42);
     schedule.advanceToHandshake(&shared);
     try std.testing.expectEqual(Schedule.Stage.handshake, schedule.stage);
     schedule.advanceToMaster();
@@ -256,7 +256,7 @@ test "the three-stage ladder refuses to skip a rung" {
 
 test "§4.2.11.2: the two PSK kinds derive different binders" {
     const Schedule = KeySchedule(.aes_128_gcm_sha256);
-    const psk = [_]u8{0xab} ** 32;
+    const psk: [32]u8 = @splat(0xab);
     var truncated_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("truncated ClientHello", &truncated_hash, .{});
 
@@ -289,7 +289,7 @@ test "an external PSK need not be a hash length" {
     // hash length both produce a schedule, and different ones.
     var short = Schedule.initEarly(&[_]u8{0x01});
     defer short.wipe();
-    var long = Schedule.initEarly(&([_]u8{0x01} ** 32));
+    var long = Schedule.initEarly(&@as([32]u8, @splat(0x01)));
     defer long.wipe();
     try std.testing.expect(!std.mem.eql(
         u8,

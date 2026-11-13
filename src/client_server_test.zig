@@ -28,13 +28,13 @@ const transcript = @import("transcript.zig");
 const wire = @import("wire.zig");
 const handshake = @import("handshake.zig");
 
-const client_x25519_private = [_]u8{0x31} ** 31 ++ [_]u8{0x07};
+const client_x25519_private = @as([31]u8, @splat(0x31)) ++ [_]u8{0x07};
 
 /// A self-signed leaf carrying a 512-bit RSA key — smaller than any
 /// modulus `verifyRsaPss` accepts, and the smallest openssl will mint.
 /// Throwaway material, never a credential.
 const rsa512_leaf_der = @embedFile("testdata/rsa512-leaf.der");
-const server_key_share_private = [_]u8{0x93} ** 47 ++ [_]u8{0x0e};
+const server_key_share_private = @as([47]u8, @splat(0x93)) ++ [_]u8{0x0e};
 
 const Buffers = struct {
     client_out: [2 * record.wire_record_bytes_max]u8 = undefined,
@@ -132,7 +132,7 @@ const Harness = struct {
         };
         harness.server = ServerHandshake.init(&.{
             .credentials = &harness.credentials,
-            .server_random = .{0x6d} ** 32,
+            .server_random = @splat(0x6d),
             .key_share_private = server_key_share_private,
             .alpn = options.server_alpn,
             .groups = options.server_groups,
@@ -146,9 +146,9 @@ const Harness = struct {
             } else null,
         });
         harness.client = ClientHandshake.init(&.{
-            .client_random = .{0x1a} ** 32,
+            .client_random = @splat(0x1a),
             .x25519_private = client_x25519_private,
-            .session_id = &(.{0x44} ** 32),
+            .session_id = &@as([32]u8, @splat(0x44)),
             .server_name = "spike.zoxy.test",
             .alpn_protocols = options.client_alpn,
             .certificate_policy = options.certificate_policy,
@@ -503,7 +503,7 @@ test "a hostile server flight errors rather than panicking" {
         switch (shape.kind) {
             .verify_without_certificate => {
                 // CertificateVerify with nothing to verify against.
-                const forged = server_messages.certificateVerify(plaintext[used..], 0x0403, &(.{0x30} ** 70));
+                const forged = server_messages.certificateVerify(plaintext[used..], 0x0403, &@as([70]u8, @splat(0x30)));
                 used += forged.len;
             },
             .duplicate_certificate => {
@@ -520,7 +520,7 @@ test "a hostile server flight errors rather than panicking" {
                 // rsa_pss_rsae_sha256 over a 512-bit modulus: the scheme
                 // and the key kind agree, so this reaches the size gate
                 // rather than being turned away by the kind check.
-                const forged = server_messages.certificateVerify(plaintext[used..], 0x0804, &(.{0x30} ** 64));
+                const forged = server_messages.certificateVerify(plaintext[used..], 0x0804, &@as([64]u8, @splat(0x30)));
                 used += forged.len;
             },
         }
@@ -598,7 +598,7 @@ fn retryRecord(out: []u8, group: u16) []const u8 {
     var message_buffer: [server_messages.server_hello_bytes_max]u8 = undefined;
     const retry = server_messages.helloRetryRequest(
         &message_buffer,
-        &(.{0x44} ** 32),
+        &@as([32]u8, @splat(0x44)),
         .aes_128_gcm_sha256,
         group,
     );
@@ -619,7 +619,7 @@ test "§4.1.4: a retry naming the group we already shared is illegal" {
     // "I cannot", where the truth is "you may not".
     var buffers: Buffers = .{};
     var harness: Harness = undefined;
-    try harness.init(.{ .retry_private = .{0x71} ** 48 });
+    try harness.init(.{ .retry_private = @splat(0x71) });
     defer harness.deinit();
     _ = harness.client.start(&buffers.client_out);
 
@@ -635,7 +635,7 @@ test "§4.1.4: a retry naming the group we already shared is illegal" {
 test "§4.1.4: a retry into a group we advertised produces a second hello" {
     var buffers: Buffers = .{};
     var harness: Harness = undefined;
-    try harness.init(.{ .retry_private = .{0x71} ** 48 });
+    try harness.init(.{ .retry_private = @splat(0x71) });
     defer harness.deinit();
     const first = harness.client.start(&buffers.client_out);
     const first_hello = try client_hello_mod.parse(first[record.header_bytes..]);
@@ -688,7 +688,7 @@ test "a PSK whose hash is not the retry's suite is dropped, and a selected one r
     var store: TicketStore = .{
         .identity = undefined,
         .identity_bytes = 6,
-        .psk = .{0x5e} ** cipher_suite.hash_bytes_max,
+        .psk = @splat(0x5e),
     };
     @memcpy(store.identity[0..6], "ticket");
     const resumption: ClientHandshake.Resumption = .{
@@ -698,7 +698,7 @@ test "a PSK whose hash is not the retry's suite is dropped, and a selected one r
         .psk_bytes = 48, // SHA-384; the retry below names SHA-256.
     };
     var harness: Harness = undefined;
-    try harness.init(.{ .retry_private = .{0x71} ** 48, .resume_session = resumption });
+    try harness.init(.{ .retry_private = @splat(0x71), .resume_session = resumption });
     defer harness.deinit();
     _ = harness.client.start(&buffers.client_out);
 
@@ -719,10 +719,10 @@ test "a PSK whose hash is not the retry's suite is dropped, and a selected one r
     var b = wire.Builder.init(&hello_buffer);
     const message = handshake.beginMessage(&b, .server_hello);
     b.putU16(0x0303);
-    b.putSlice(&(.{0x2b} ** 32));
+    b.putSlice(&@as([32]u8, @splat(0x2b)));
     b.putByte(32);
-    b.putSlice(&(.{0x44} ** 32));
-    b.putU16(@intFromEnum(cipher_suite.CipherSuite.aes_128_gcm_sha256));
+    b.putSlice(&@as([32]u8, @splat(0x44)));
+    b.putU16(@backingInt(cipher_suite.CipherSuite.aes_128_gcm_sha256));
     b.putByte(0);
     const extensions = b.markU16();
     b.putU16(43); // supported_versions
@@ -762,11 +762,11 @@ test "§4.4.1: a PSK crosses a retry, bound to the reconstructed transcript" {
     // derivations is the check; one of them going through
     // `Transcript.hashWith` would only prove the function equals itself.
     var buffers: Buffers = .{};
-    const psk = [_]u8{0x5e} ** 32;
+    const psk: [32]u8 = @splat(0x5e);
     var store: TicketStore = .{
         .identity = undefined,
         .identity_bytes = 6,
-        .psk = .{0x5e} ** cipher_suite.hash_bytes_max,
+        .psk = @splat(0x5e),
     };
     @memcpy(store.identity[0..6], "ticket");
     const resumption: ClientHandshake.Resumption = .{
@@ -776,7 +776,7 @@ test "§4.4.1: a PSK crosses a retry, bound to the reconstructed transcript" {
         .psk_bytes = 32, // SHA-256, which is what the retry names.
     };
     var harness: Harness = undefined;
-    try harness.init(.{ .retry_private = .{0x71} ** 48, .resume_session = resumption });
+    try harness.init(.{ .retry_private = @splat(0x71), .resume_session = resumption });
     defer harness.deinit();
     const first = harness.client.start(&buffers.client_out);
     const ch1 = lastRecord(first)[record.header_bytes..];
@@ -829,7 +829,7 @@ test "§4.1.4: a second retry, and a retry we hold no scalar for" {
     // unexpected_message alert" on a second.
     {
         var harness: Harness = undefined;
-        try harness.init(.{ .retry_private = .{0x71} ** 48 });
+        try harness.init(.{ .retry_private = @splat(0x71) });
         defer harness.deinit();
         _ = harness.client.start(&buffers.client_out);
         var wire_buffer: [record.header_bytes + server_messages.server_hello_bytes_max]u8 = undefined;
@@ -904,7 +904,7 @@ test "end to end through a HelloRetryRequest: working keys, data, agreeing expor
     var harness: Harness = undefined;
     try harness.init(.{
         .server_groups = &.{ client_hello_mod.group_secp256r1, client_hello_mod.group_secp384r1 },
-        .retry_private = .{0x71} ** 48,
+        .retry_private = @splat(0x71),
     });
     defer harness.deinit();
     try harness.connect(&buffers);
@@ -951,7 +951,7 @@ test "end to end: a resumed session crosses a HelloRetryRequest" {
         .store = &store,
         .resume_session = resumption,
         .server_groups = &.{client_hello_mod.group_secp256r1},
-        .retry_private = .{0x71} ** 48,
+        .retry_private = @splat(0x71),
     });
     defer second.deinit();
     try second.connect(&buffers);
@@ -1650,7 +1650,7 @@ test "§5: a ChangeCipherSpec carrying anything but 0x01 is unexpected_message" 
         // the record's whole content is the message.
         &.{ 0x01, 0x01 },
         &.{ 0x01, 0x00 },
-        &([_]u8{0x01} ** 64),
+        &@as([64]u8, @splat(0x01)),
     };
 
     for (payloads) |payload| {
@@ -2083,7 +2083,7 @@ test "§6: a fatal alert from the peer says which alert it was" {
         },
     }
     try testing.expectEqual(
-        @as(?u8, @intFromEnum(alert.Description.record_overflow)),
+        @as(?u8, @backingInt(alert.Description.record_overflow)),
         harness.server.peer_alert_description,
     );
 }
@@ -2342,7 +2342,7 @@ test "§4.4.3: a CertificateVerify scheme we never offered is illegal_parameter"
         const verify = server_messages.certificateVerify(
             &body,
             shape.signed_with,
-            &(.{0xa5} ** 64),
+            &@as([64]u8, @splat(0xa5)),
         );
 
         try testing.expectError(
@@ -2692,7 +2692,7 @@ test "§4.4: the client bounds its flight's message count, not the server" {
                     &buffers.scratch,
                 );
                 var body: [128]u8 = undefined;
-                const verify = server_messages.certificateVerify(&body, 0x0403, &(.{0xa5} ** 64));
+                const verify = server_messages.certificateVerify(&body, 0x0403, &@as([64]u8, @splat(0xa5)));
                 // The first is accepted — the policy declines to check
                 // it — which is what leaves a second one to refuse.
                 _ = try harness.client.handleRecord(

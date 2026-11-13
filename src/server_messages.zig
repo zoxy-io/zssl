@@ -59,7 +59,7 @@ pub fn serverHello(
     builder.putSlice(random);
     builder.putByte(@intCast(session_echo.len));
     builder.putSlice(session_echo);
-    builder.putU16(@intFromEnum(suite));
+    builder.putU16(@backingInt(suite));
     builder.putByte(0); // legacy_compression_method
     const extensions = builder.markU16();
     // pre_shared_key, key_share, supported_versions — the order both of
@@ -103,7 +103,7 @@ pub fn helloRetryRequest(
     builder.putSlice(&hello_retry_magic);
     builder.putByte(@intCast(session_echo.len));
     builder.putSlice(session_echo);
-    builder.putU16(@intFromEnum(suite));
+    builder.putU16(@backingInt(suite));
     builder.putByte(0);
     const extensions = builder.markU16();
     builder.putU16(extension_key_share);
@@ -177,7 +177,7 @@ pub fn certificateRequest(out: []u8, schemes: []const backend.SignatureScheme) [
     builder.putU16(extension_signature_algorithms);
     const body = builder.markU16();
     const list = builder.markU16();
-    for (schemes) |scheme| builder.putU16(@intFromEnum(scheme));
+    for (schemes) |scheme| builder.putU16(@backingInt(scheme));
     builder.patchU16(list);
     builder.patchU16(body);
     builder.patchU16(extensions);
@@ -351,7 +351,7 @@ pub fn certificateVerifyContent(side: Side, transcript_hash: []const u8, out: []
         .client => "TLS 1.3, client CertificateVerify",
     };
     var builder = wire.Builder.init(out);
-    builder.putSlice(&(.{0x20} ** 64));
+    builder.putSlice(&@as([64]u8, @splat(0x20)));
     builder.putSlice(label);
     builder.putByte(0);
     builder.putSlice(transcript_hash);
@@ -399,7 +399,7 @@ test "helloRetryRequest carries the §4.1.3 magic and the demanded group" {
     try std.testing.expectEqualSlices(u8, &hello_retry_magic, encoded[6..38]);
     // Session echo survives, and the message parses as server_hello.
     try std.testing.expectEqual(@as(u8, 2), encoded[38]);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(handshake.MessageType.server_hello)), encoded[0]);
+    try std.testing.expectEqual(@as(u8, @backingInt(handshake.MessageType.server_hello)), encoded[0]);
     // Negative space: an HRR names a group but ships no key bytes.
     try std.testing.expect(encoded.len < 64);
 }

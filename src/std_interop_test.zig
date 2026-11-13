@@ -138,8 +138,8 @@ test "std.crypto.tls.Client: full handshake and data, no shared code" {
     var flight: [Credentials.chain_bytes_max + 1024]u8 = undefined;
     var server = ServerHandshake.init(&.{
         .credentials = &credentials,
-        .server_random = .{0x2f} ** 32,
-        .key_share_private = .{0x77} ** 47 ++ .{0x01},
+        .server_random = @splat(0x2f),
+        .key_share_private = @as([47]u8, @splat(0x77)) ++ [_]u8{0x01},
         .reassembly = &reassembly,
         .flight = &flight,
     });

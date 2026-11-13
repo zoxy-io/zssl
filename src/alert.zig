@@ -58,7 +58,7 @@ pub const Alert = struct {
 
     pub fn isCloseNotify(self: *const Alert) bool {
         assert(self.level_wire >= 1);
-        return self.description_wire == @intFromEnum(Description.close_notify);
+        return self.description_wire == @backingInt(Description.close_notify);
     }
 };
 
@@ -88,8 +88,8 @@ pub fn disposition(self: Alert) Disposition {
     // file comment: in 1.3 a close_notify is a close whatever level byte
     // rode with it.
     if (self.isCloseNotify()) return .close;
-    if (self.level_wire != @intFromEnum(Level.warning)) return .peer_fatal;
-    if (self.description_wire == @intFromEnum(Description.user_canceled)) return .ignore;
+    if (self.level_wire != @backingInt(Level.warning)) return .peer_fatal;
+    if (self.description_wire == @backingInt(Description.user_canceled)) return .ignore;
     return .refuse;
 }
 
@@ -98,8 +98,8 @@ pub fn encode(description: Description) [bytes]u8 {
         .warning
     else
         .fatal;
-    assert(@intFromEnum(level) == 1 or @intFromEnum(level) == 2);
-    return .{ @intFromEnum(level), @intFromEnum(description) };
+    assert(@backingInt(level) == 1 or @backingInt(level) == 2);
+    return .{ @backingInt(level), @backingInt(description) };
 }
 
 pub const ParseError = error{MalformedAlert};

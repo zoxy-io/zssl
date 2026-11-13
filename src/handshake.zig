@@ -36,7 +36,7 @@ pub const MessageType = enum(u8) {
 
 /// Begin a handshake message: type byte plus a u24 length to patch.
 pub fn beginMessage(builder: *wire.Builder, message_type: MessageType) usize {
-    builder.putByte(@intFromEnum(message_type));
+    builder.putByte(@backingInt(message_type));
     return builder.markU24();
 }
 
@@ -241,7 +241,7 @@ test "a length the message type cannot have is decode_error, not capacity" {
         var assembler = Assembler.init(&storage);
         try assembler.push(&.{ 20, 0, 0, 48 });
         try std.testing.expectEqual(@as(?Message, null), try assembler.next());
-        try assembler.push(&([_]u8{0xab} ** 48));
+        try assembler.push(&@as([48]u8, @splat(0xab)));
         try std.testing.expectEqual(MessageType.finished, (try assembler.next()).?.messageType().?);
         try assembler.push(&.{ 24, 0, 0, 1, 1 });
         try std.testing.expectEqual(MessageType.key_update, (try assembler.next()).?.messageType().?);

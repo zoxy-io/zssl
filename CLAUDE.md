@@ -1,6 +1,6 @@
 # zssl
 
-Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
+Sans-I/O TLS 1.3 protocol layer in Zig 0.17 over libcrypto primitives
 (`zoxy-io/openssl`). Prototype engine for zoxy. Read before writing code:
 
 - [docs/DESIGN.md](docs/DESIGN.md) — §1 is what is built, not built,
@@ -43,11 +43,8 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
   before the counts — when the harness died mid-run, because a corpus
   that ran against a corpse reports a low number that looks exactly like
   a corpus that refused us. See docs/TLSANVIL.md.
-- `zig fmt --check src interop bench bogo fuzz tlsanvil tlsfuzzer
-  scripts build.zig build.zig.zon` — format gate. `fuzz/` is in the list
-  even though its one file is vendored from the compiler: it is
-  zig-fmt-clean upstream, so keeping it under the gate costs nothing and
-  a re-sync that is not costs a one-line `zig fmt`.
+- `zig fmt --check src interop bench bogo tlsanvil tlsfuzzer scripts
+  build.zig build.zig.zon` — format gate.
 - Run the `tiger-style-reviewer` agent on the working diff before
   committing a slice (same rule as zoxy). Its definition lives in
   `.claude/agents/tiger-style-reviewer.md`; zoxy's copy remains the
@@ -58,8 +55,11 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
 
 ## Invariants (grep-checkable; a reviewer failure if broken)
 
-- **Exactly one `@cImport`**, in `src/crypto/c.zig`; C symbols are
-  called only from `src/crypto/backend_openssl.zig` and
+- **Exactly one C import.** Zig 0.17 removed `@cImport`, so it is the
+  `#include` list in `src/crypto/c.h`, translated by the one
+  `addTranslateC` in build.zig and imported only by `src/crypto/c.zig`:
+  `grep -rn '@import("libcrypto")' src/` names that file alone. C
+  symbols are called only from `src/crypto/backend_openssl.zig` and
   `src/crypto/mem_hooks.zig`. Everything above that boundary is Zig.
 - **No allocators.** `std.mem.Allocator` appears nowhere; every buffer
   is caller-owned or a fixed array. libcrypto's internal allocations are
@@ -71,7 +71,7 @@ Sans-I/O TLS 1.3 protocol layer in Zig 0.16 over libcrypto primitives
   entropy does — supplied per connection, never measured. Seeded replay
   depends on this exactly as it depends on the rule above:
   `grep -rnE '\.now\(|clock_gettime|milliTimestamp|nanoTimestamp' src/`
-  must stay empty. In Zig 0.16 a clock is `Io.Clock.Timestamp.now(io,
+  must stay empty. In Zig 0.17 a clock is `Io.Clock.Timestamp.now(io,
   …)`, so `.now(` is the pattern that matters and the `std.time.*`
   spellings are there for a future that brings them back. Unit constants
   (`std.time.ns_per_ms`) are arithmetic, not a clock.

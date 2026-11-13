@@ -2,7 +2,7 @@
     .name = .zssl,
     .version = "0.0.1",
     .fingerprint = 0x33674eab883287e6, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // libcrypto, built by Zig for the target — the same pin zoxy carries
         // in its own build.zig.zon (see the audit prose there: OpenSSL rather

@@ -29,8 +29,8 @@ const CipherSuite = cipher_suite.CipherSuite;
 const cert_pem = @embedFile("cert_pem");
 const key_pem = @embedFile("key_pem");
 
-const client_x25519_private = [_]u8{0x31} ** 31 ++ [_]u8{0x07};
-const server_key_share_private = [_]u8{0x93} ** 47 ++ [_]u8{0x0e};
+const client_x25519_private = @as([31]u8, @splat(0x31)) ++ [_]u8{0x07};
+const server_key_share_private = @as([47]u8, @splat(0x93)) ++ [_]u8{0x0e};
 
 // ---------------------------------------------------------------------
 // Timing
@@ -203,7 +203,7 @@ const Pair = struct {
     ) void {
         pair.server = ServerHandshake.init(&.{
             .credentials = credentials,
-            .server_random = .{0x6d} ** 32,
+            .server_random = @splat(0x6d),
             .key_share_private = server_key_share_private,
             .alpn = "http/1.1",
             .reassembly = &pair.server_reassembly,
@@ -214,9 +214,9 @@ const Pair = struct {
             } else null,
         });
         pair.client = ClientHandshake.init(&.{
-            .client_random = .{0x1a} ** 32,
+            .client_random = @splat(0x1a),
             .x25519_private = client_x25519_private,
-            .session_id = &(.{0x44} ** 32),
+            .session_id = &@as([32]u8, @splat(0x44)),
             .server_name = "spike.zoxy.test",
             .alpn_protocols = &.{"http/1.1"},
             .certificate_policy = .leaf_signature,
@@ -287,7 +287,7 @@ fn handshakeBody(context: HandshakeContext, iterations: usize) anyerror!u64 {
     for (0..iterations) |_| {
         pair_storage.init(context.credentials, context.store, context.resumption);
         try pair_storage.connect(&buffers_storage);
-        accumulator +%= @intFromEnum(pair_storage.server.cipherSuite());
+        accumulator +%= @backingInt(pair_storage.server.cipherSuite());
         pair_storage.deinit();
     }
     return accumulator;
@@ -304,7 +304,7 @@ const phase_names = [phase_count][]const u8{
     "phase_client_finish",
     "phase_server_finish",
 };
-var phase_totals: [phase_count]u64 = .{0} ** phase_count;
+var phase_totals: [phase_count]u64 = @splat(0);
 
 fn handshakePhases(credentials: *const Credentials, buffers: *Buffers) !void {
     pair_storage.init(credentials, null, null);
@@ -360,7 +360,7 @@ fn measurePhases(credentials: *const Credentials, requested: usize) !void {
 
     var per_round: [phase_count][rounds]f64 = undefined;
     for (0..rounds) |round| {
-        phase_totals = .{0} ** phase_count;
+        phase_totals = @splat(0);
         for (0..iterations) |_| try handshakePhases(credentials, &buffers_storage);
         for (0..phase_count) |phase| {
             per_round[phase][round] = @as(f64, @floatFromInt(phase_totals[phase])) /
@@ -477,8 +477,8 @@ fn recordBody(_: void, iterations: usize) anyerror!u64 {
 }
 
 fn resetProtectors(suite: CipherSuite) !void {
-    const key = [_]u8{0xab} ** cipher_suite.key_bytes_max;
-    const static_iv = [_]u8{0xcd} ** cipher_suite.nonce_bytes;
+    const key: [cipher_suite.key_bytes_max]u8 = @splat(0xab);
+    const static_iv: [cipher_suite.nonce_bytes]u8 = @splat(0xcd);
     protector_storage.sealer = try protect.Protector.init(suite, key[0..suite.keyBytes()], &static_iv);
     protector_storage.opener = try protect.Protector.init(suite, key[0..suite.keyBytes()], &static_iv);
 }
@@ -492,7 +492,7 @@ var aead_scratch: [chunk_bytes]u8 = undefined;
 
 fn aeadSealBody(_: void, iterations: usize) anyerror!u64 {
     var accumulator: u64 = 0;
-    const nonce = [_]u8{0x11} ** cipher_suite.nonce_bytes;
+    const nonce: [cipher_suite.nonce_bytes]u8 = @splat(0x11);
     const aad = [_]u8{ 0x17, 0x03, 0x03, 0x40, 0x11 };
     var tag: [cipher_suite.tag_bytes]u8 = undefined;
     for (0..iterations) |_| {
@@ -516,7 +516,7 @@ fn aeadSealBody(_: void, iterations: usize) anyerror!u64 {
 /// This line is here to say what that costs.
 fn aeadInitBody(suite: CipherSuite, iterations: usize) anyerror!u64 {
     var accumulator: u64 = 0;
-    const key = [_]u8{0xab} ** cipher_suite.key_bytes_max;
+    const key: [cipher_suite.key_bytes_max]u8 = @splat(0xab);
     for (0..iterations) |_| {
         var aead = try backend.AeadKey.init(suite, key[0..suite.keyBytes()]);
         accumulator +%= aead.key_bytes;
@@ -528,7 +528,7 @@ fn aeadInitBody(suite: CipherSuite, iterations: usize) anyerror!u64 {
 var signer_storage: backend.Signer = undefined;
 var signature_storage: [backend.signature_bytes_max]u8 = undefined;
 
-const sign_content = [_]u8{0x20} ** 130;
+const sign_content: [130]u8 = @splat(0x20);
 
 fn signBody(_: void, iterations: usize) anyerror!u64 {
     var accumulator: u64 = 0;
@@ -687,7 +687,7 @@ pub fn main() !void {
         .{ CipherSuite.aes_256_gcm_sha384, "aead_seal_aes256" },
         .{ CipherSuite.chacha20_poly1305_sha256, "aead_seal_chacha20" },
     }) |entry| {
-        const key = [_]u8{0xab} ** cipher_suite.key_bytes_max;
+        const key: [cipher_suite.key_bytes_max]u8 = @splat(0xab);
         aead_storage = try backend.AeadKey.init(entry[0], key[0..entry[0].keyBytes()]);
         try measure(entry[1], "byte", chunk_bytes, 8000, {}, aeadSealBody);
         aead_storage.deinit();
@@ -726,7 +726,7 @@ pub fn main() !void {
 
     // The client's real CertificateVerify path, priced against the
     // libcrypto verifier it does not use.
-    const std_keys = P256.KeyPair.generateDeterministic(.{0x5c} ** 32) catch
+    const std_keys = P256.KeyPair.generateDeterministic(@splat(0x5c)) catch
         return error.KeyGeneration;
     std_public_sec1 = std_keys.public_key.toUncompressedSec1();
     const std_signature = try std_keys.sign(&sign_content, null);

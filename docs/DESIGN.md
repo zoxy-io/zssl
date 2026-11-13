@@ -196,10 +196,11 @@ bindings anyway is how ztls spent ~660 lines saying "unsupported". The
 pin is `zoxy-io/openssl` 3.5.7 (LTS to 2030), the same commit zoxy
 links, because the embedder's binary must contain exactly one libcrypto.
 
-The C surface is two files: `src/crypto/c.zig` (the single `@cImport`)
-and `src/crypto/backend_openssl.zig` (every call site). Nothing behind
-the boundary parses attacker bytes; callers hand in framed slices with
-asserted lengths.
+The C surface is two files: `src/crypto/c.zig` (the single C import —
+its header list is `c.h` beside it, translated by build.zig, because Zig
+0.17 has no `@cImport`) and `src/crypto/backend_openssl.zig` (every call
+site). Nothing behind the boundary parses attacker bytes; callers hand
+in framed slices with asserted lengths.
 
 ## §3 Memory
 
@@ -315,12 +316,13 @@ the `*builtin.StackTrace` from `@errorReturnTrace()` to
 `std.debug.writeStackTrace`, which takes a `*const debug.StackTrace` —
 different types, and the wrong one of two similarly-named functions.
 `std.debug.writeErrorReturnTrace` is the right one.
-`fuzz/test_runner.zig` is Zig's file with that one word changed, used by
-the `test-fuzz` step alone so a stale copy costs the search and never
-the gates. The path only exists under `--fuzz` because
-`std.testing.fuzz` fixes its callback at `anyerror!void`, which is why
-`zig build test` never noticed and why nothing outside the runner could
-route around it.
+`fuzz/test_runner.zig` was Zig's file with that one word changed, used by
+the `test-fuzz` step alone so a stale copy cost the search and never
+the gates. 0.17's stock runner makes the right call, so the copy is
+deleted and the search runs on Zig's own. The path only exists under
+`--fuzz` because `std.testing.fuzz` fixes its callback at
+`anyerror!void`, which is why `zig build test` never noticed and why
+nothing outside the runner could route around it.
 
 The second was never recorded because nothing had got far enough to hit
 it: the coverage instrumentation `--fuzz` steers by comes from the LLVM

@@ -176,7 +176,7 @@ const ClientHandshake = @This();
 
 /// Every code point `SignatureScheme` has: the intersection can be no
 /// wider than what our own key could sign with.
-const signable_max = @typeInfo(backend.SignatureScheme).@"enum".fields.len;
+const signable_max = @typeInfo(backend.SignatureScheme).@"enum".field_names.len;
 
 /// An RSA-4096 `RSAPublicKey` — two INTEGERs and a SEQUENCE header — is
 /// the largest key we accept; the uncompressed P-384 SEC1 point that
@@ -551,7 +551,7 @@ pub fn init(config: *const Config) ClientHandshake {
     // no signature can complete no handshake, and saying so at `init` is
     // better than a handshake_failure three flights later.
     assert(config.verify_schemes.len >= 1);
-    assert(config.verify_schemes.len <= @typeInfo(backend.SignatureScheme).@"enum".fields.len);
+    assert(config.verify_schemes.len <= @typeInfo(backend.SignatureScheme).@"enum".field_names.len);
     var shares_an_advertised_group = false;
     for (config.groups) |group| {
         assert(client_hello.groupShareBytes(group) != null);
@@ -966,7 +966,7 @@ fn handleHelloRetryRequest(
     // A cookie-only retry re-sends the share it already sent, so the
     // scalar is the one that built it; a group change needs the second.
     const scalar: [backend.group_private_bytes_max]u8 = if (selected == client_hello.group_x25519)
-        self.config.x25519_private ++ [_]u8{0} ** (backend.group_private_bytes_max - 32)
+        self.config.x25519_private ++ @as([backend.group_private_bytes_max - 32]u8, @splat(0))
     else
         self.config.retry_key_share_private orelse return error.HandshakeFailure;
 
@@ -2038,7 +2038,7 @@ fn ArmOf(comptime suite: CipherSuite) type {
             var ch1_hash: [hash_bytes]u8 = undefined;
             Hash.hash(ch1, &ch1_hash, .{});
             const synthetic_header = [handshake.header_bytes]u8{
-                @intFromEnum(handshake.MessageType.message_hash),
+                @backingInt(handshake.MessageType.message_hash),
                 0,
                 0,
                 hash_bytes,
@@ -2138,7 +2138,7 @@ fn ArmOf(comptime suite: CipherSuite) type {
                 const signature = try credentials.signer.sign(scheme, to_sign, &signature_buffer);
                 const verify_message = server_messages.certificateVerify(
                     auth.flight,
-                    @intFromEnum(scheme),
+                    @backingInt(scheme),
                     signature,
                 );
                 self.transcript.update(verify_message);
@@ -2193,7 +2193,7 @@ fn ArmOf(comptime suite: CipherSuite) type {
             // early data the hashes are equal and this is a no-op.
             if (early) |protector| {
                 const end_of_early_data = [_]u8{
-                    @intFromEnum(handshake.MessageType.end_of_early_data),
+                    @backingInt(handshake.MessageType.end_of_early_data),
                     0,
                     0,
                     0,
