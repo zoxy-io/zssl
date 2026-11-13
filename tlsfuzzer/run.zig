@@ -110,7 +110,11 @@ const default_leaf = "ecdsa";
 /// Throwaway material by construction: it authenticates nothing but a
 /// loopback conversation with a corpus, and it is committed for the same
 /// reason `src/testdata`'s keys are.
-const external_psk_hex = "ab" ** 32;
+///
+/// Thirty-two 0xab bytes, in hex, written out as `scripts.json` writes
+/// them: Zig 0.17 removed the `**` that spelled this `"ab" ** 32`, and a
+/// literal is a form the two files can share character for character.
+const external_psk_hex = "abababababababababababababababababababababababababababababababab";
 const external_psk_identity = "test";
 
 /// Generous: a cold run clones the corpus and pip-installs two packages

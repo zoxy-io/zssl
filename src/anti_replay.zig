@@ -212,11 +212,11 @@ test "§8.2: a hello is admitted once, and a full window refuses rather than evi
     var register: StrikeRegister = .{ .entries = &storage };
     const now: u64 = 5_000_000;
 
-    var key = [_]u8{0xa5} ** 32;
+    var key: [32]u8 = @splat(0xa5);
     try std.testing.expect(register.admit(&key, now));
     try std.testing.expect(!register.admit(&key, now));
     // A different value is a different hello, and still admitted.
-    var other = [_]u8{0xa5} ** 32;
+    var other: [32]u8 = @splat(0xa5);
     other[31] = 0x5a;
     try std.testing.expect(register.admit(&other, now));
 
@@ -230,7 +230,7 @@ test "§8.2: a hello is admitted once, and a full window refuses rather than evi
     // pinned.
     var full_storage: [StrikeRegister.probe_max]StrikeRegister.Entry = @splat(.free);
     var full: StrikeRegister = .{ .entries = &full_storage };
-    var filler = [_]u8{0} ** 32;
+    var filler: [32]u8 = @splat(0);
     var placed: usize = 0;
     var candidate: u8 = 0;
     while (placed < StrikeRegister.probe_max) : (candidate += 1) {
@@ -239,7 +239,7 @@ test "§8.2: a hello is admitted once, and a full window refuses rather than evi
         if (candidate == 255) break;
     }
     try std.testing.expectEqual(StrikeRegister.probe_max, placed);
-    var late = [_]u8{0xff} ** 32;
+    var late: [32]u8 = @splat(0xff);
     try std.testing.expect(!full.admit(&late, now));
     // And nothing it could have displaced was displaced.
     filler[0] = 0;
@@ -267,7 +267,7 @@ test "§8.2: the record outlives the last instant a replay could still pass §8.
 
     var storage: [StrikeRegister.probe_max]StrikeRegister.Entry = @splat(.free);
     var register: StrikeRegister = .{ .entries = &storage };
-    const key = [_]u8{0xc3} ** 32;
+    const key: [32]u8 = @splat(0xc3);
     try std.testing.expect(register.admit(&key, first_seen_ms));
 
     // A replay at exactly the last instant §8.3 still admits: plausible,
@@ -317,7 +317,7 @@ test "§8.2: a table wider than one probe window still finds what it recorded" {
     }
     // A value never seen is still admitted: the table is far from full,
     // and a busy neighbour must not refuse an unrelated hello.
-    var fresh = [_]u8{0x40} ** 32;
+    var fresh: [32]u8 = @splat(0x40);
     fresh[0] = 0xfe;
     fresh[7] = 0xfe;
     try std.testing.expect(register.admit(&fresh, now));

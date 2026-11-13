@@ -601,7 +601,7 @@ test "§4.2.11: the three ways a PSK offer's two lists can be wrong" {
     // collapsed into a single verdict cost a case in BoGo. All three are
     // driven here so a plain `zig build test` proves them — BoGo is an
     // oracle that can SKIP, and these have to hold without it.
-    const random = [_]u8{0} ** 32;
+    const random: [32]u8 = @splat(0);
 
     // One PSK extension body: `identities` then `binders`, both length
     // prefixed, built so each case differs in exactly one place.

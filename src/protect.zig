@@ -91,7 +91,7 @@ pub const Protector = struct {
         // The inner plaintext is assembled in place: content, then type.
         const body = out[record.header_bytes..wire_bytes];
         @memcpy(body[0..content.len], content);
-        body[content.len] = @intFromEnum(content_type);
+        body[content.len] = @backingInt(content_type);
 
         const nonce = self.nonceFor(self.sequence);
         var tag: [cipher_suite.tag_bytes]u8 = undefined;
@@ -163,8 +163,8 @@ pub const Protector = struct {
 
 test "sequence exhaustion is an error, not a wrap" {
     const suite: CipherSuite = .aes_128_gcm_sha256;
-    const key = [_]u8{0x11} ** 16;
-    const static_iv = [_]u8{0x22} ** 12;
+    const key: [16]u8 = @splat(0x11);
+    const static_iv: [12]u8 = @splat(0x22);
     var protector = try Protector.init(suite, &key, &static_iv);
     defer protector.deinit();
     protector.sequence = records_per_key_max;
@@ -174,7 +174,7 @@ test "sequence exhaustion is an error, not a wrap" {
 
 test "nonce XOR folds the sequence into the IV tail" {
     const suite: CipherSuite = .aes_128_gcm_sha256;
-    const key = [_]u8{0x11} ** 16;
+    const key: [16]u8 = @splat(0x11);
     const static_iv = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
     var protector = try Protector.init(suite, &key, &static_iv);
     defer protector.deinit();
@@ -193,8 +193,8 @@ test "§5.4: an inner plaintext past the cap is record_overflow, before any AEAD
     // peer sent, not on what survives unpadding, and reading it the other
     // way is what left this open with the wrong diagnosis attached.
     const suite: CipherSuite = .aes_128_gcm_sha256;
-    const key = [_]u8{0x22} ** 16;
-    const static_iv = [_]u8{0x33} ** 12;
+    const key: [16]u8 = @splat(0x22);
+    const static_iv: [12]u8 = @splat(0x33);
     var protector = try Protector.init(suite, &key, &static_iv);
     defer protector.deinit();
 

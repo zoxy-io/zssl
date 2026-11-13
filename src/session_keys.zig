@@ -251,8 +251,8 @@ pub fn SessionKeys(comptime suite: CipherSuite) type {
 
 test "rotation changes both key material and generation, deterministically" {
     const Keys = SessionKeys(.aes_128_gcm_sha256);
-    const transmit_secret = [_]u8{0x42} ** 32;
-    const receive_secret = [_]u8{0x24} ** 32;
+    const transmit_secret: [32]u8 = @splat(0x42);
+    const receive_secret: [32]u8 = @splat(0x24);
     var ours = try Keys.init(&transmit_secret, &receive_secret, 0);
     defer ours.deinit();
     var theirs = try Keys.init(&receive_secret, &transmit_secret, 0);
@@ -279,7 +279,7 @@ test "rotation changes both key material and generation, deterministically" {
 
 test "the rotation ceiling is an error, not a spin" {
     const Keys = SessionKeys(.aes_128_gcm_sha256);
-    const secret = [_]u8{0x11} ** 32;
+    const secret: [32]u8 = @splat(0x11);
     var keys = try Keys.init(&secret, &secret, 0);
     defer keys.deinit();
     keys.rotations = rotations_max;
@@ -288,7 +288,7 @@ test "the rotation ceiling is an error, not a spin" {
 
 test "§4.6.3: a run of update requests is answered once, until application data" {
     const Keys = SessionKeys(.aes_128_gcm_sha256);
-    const secret = [_]u8{0x22} ** 32;
+    const secret: [32]u8 = @splat(0x22);
     var keys = try Keys.init(&secret, &secret, 0);
     defer keys.deinit();
     var out: [record.wire_record_bytes_max]u8 = undefined;
@@ -325,7 +325,7 @@ test "§4.6.3: a run of update requests is answered once, until application data
 
 test "§4.6.3: update_not_requested is never answered, and clears nothing" {
     const Keys = SessionKeys(.aes_128_gcm_sha256);
-    const secret = [_]u8{0x33} ** 32;
+    const secret: [32]u8 = @splat(0x33);
     var keys = try Keys.init(&secret, &secret, 0);
     defer keys.deinit();
     var out: [record.wire_record_bytes_max]u8 = undefined;

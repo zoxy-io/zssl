@@ -136,7 +136,7 @@ pub fn writeHeader(header: Header, out: *[header_bytes]u8) void {
     else
         plaintext_bytes_max;
     assert(header.length <= cap);
-    out[0] = @intFromEnum(header.content_type);
+    out[0] = @backingInt(header.content_type);
     std.mem.writeInt(u16, out[1..3], 0x0303, .big);
     std.mem.writeInt(u16, out[3..5], header.length, .big);
 }
@@ -193,7 +193,7 @@ test "§5 admits one ChangeCipherSpec payload and no other" {
     // byte does not rescue it. This is the shape tlsfuzzer sends.
     try std.testing.expect(!isCompatibilityCcs(&.{ 0x01, 0x01 }));
     try std.testing.expect(!isCompatibilityCcs(&.{ 0x01, 0x00 }));
-    try std.testing.expect(!isCompatibilityCcs(&([_]u8{0x01} ** 64)));
+    try std.testing.expect(!isCompatibilityCcs(&@as([64]u8, @splat(0x01))));
 
     // Empty never reaches this from the wire — §5.1 makes a zero-length
     // non-application record `EmptyFragment` at the header — but the

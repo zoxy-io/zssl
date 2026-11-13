@@ -332,7 +332,7 @@ fn verifyRsaPss(comptime Hash: type, public_key: []const u8, content: []const u8
             const key = rsa.PublicKey.fromBytes(components.exponent, components.modulus) catch
                 return error.BadCertificate;
             const sig = rsa.PSSSignature.fromBytes(modulus_bytes, signature);
-            rsa.PSSSignature.verify(modulus_bytes, sig, content, key, Hash) catch
+            rsa.PSSSignature.verify(modulus_bytes, &sig, content, key, Hash) catch
                 return error.BadSignature;
         },
         else => return error.BadCertificate,

@@ -1012,7 +1012,7 @@ fn configuredGroups(connection: *const Connection) ?[]const u16 {
 /// The most schemes `-verify-prefs` can name before we stop honouring
 /// it. Five is every code point `SignatureScheme` has; a case naming
 /// more is naming one we do not verify, and is declined for that.
-const verify_schemes_max = @typeInfo(zssl.backend.SignatureScheme).@"enum".fields.len;
+const verify_schemes_max = @typeInfo(zssl.backend.SignatureScheme).@"enum".field_names.len;
 
 /// The accept-set `-verify-prefs` asked for, written into `out`, or the
 /// library's default when the case named none. Null is a decline: a

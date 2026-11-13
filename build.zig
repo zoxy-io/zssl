@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
     });
     const libcrypto = openssl_dependency.artifact("crypto");
     libcrypto.root_module.sanitize_c = .off;
+    const libcrypto_import = addLibcryptoImport(b, target, optimize, libcrypto);
 
     const zssl_module = b.addModule("zssl", .{
         .root_source_file = b.path("src/root.zig"),
@@ -24,6 +25,7 @@ pub fn build(b: *std.Build) void {
     });
     zssl_module.link_libc = true;
     zssl_module.linkLibrary(libcrypto);
+    zssl_module.addImport("libcrypto", libcrypto_import);
 
     const unit_tests = b.addTest(.{ .root_module = zssl_module });
     const module_tests = b.addRunArtifact(unit_tests);
@@ -70,12 +72,7 @@ pub fn build(b: *std.Build) void {
         });
         suite_module.link_libc = true;
         suite_module.linkLibrary(libcrypto);
-        // The fuzz suite alone runs on a vendored test runner. Zig
-        // 0.16.0's own crosses two `StackTrace` types on the fuzzing
-        // error path, so `--fuzz` does not compile against it;
-        // `fuzz/test_runner.zig` is that file with the one word fixed,
-        // and its header says how to drop it. Confined to this suite so
-        // that a stale copy costs the search and never the CI gates.
+        suite_module.addImport("libcrypto", libcrypto_import);
         const is_fuzz_suite = std.mem.eql(u8, suite.step, "test-fuzz");
         const suite_tests = b.addTest(.{
             .root_module = suite_module,
@@ -86,10 +83,6 @@ pub fn build(b: *std.Build) void {
             // The same reason the `coverage` step below sets it: two
             // tools, one backend that does not tell them anything.
             .use_llvm = if (is_fuzz_suite) true else null,
-            .test_runner = if (is_fuzz_suite) .{
-                .path = b.path("fuzz/test_runner.zig"),
-                .mode = .server,
-            } else null,
         });
         const suite_run = b.addRunArtifact(suite_tests);
         b.step(suite.step, suite.blurb).dependOn(&suite_run.step);
@@ -98,6 +91,35 @@ pub fn build(b: *std.Build) void {
     addCoverageStep(b, zssl_module);
 
     addGateSteps(b, target, optimize, zssl_module);
+}
+
+/// libcrypto's headers as a Zig module: the `libcrypto` import that
+/// `src/crypto/c.zig` re-exports as zssl's single C import. Every module
+/// that compiles `src/` needs it, which is why the library, the suites
+/// and the bench harness all take it from this one function.
+///
+/// Zig 0.17 removed `@cImport`, so translation moved from c.zig to this
+/// step and the header list to `src/crypto/c.h`. The include path is the
+/// header tree `libcrypto` installs — what `linkLibrary` already puts on
+/// a module's path, and what `@cImport` resolved against — rather than a
+/// directory of the fetched source, because OpenSSL generates
+/// `configuration.h` per target and the artifact built for `target`
+/// carries the copy its objects were compiled against. `target` and
+/// `optimize` are the caller's for the same reason: the translation has
+/// to describe the libcrypto it is linked with.
+fn addLibcryptoImport(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+    libcrypto: *std.Build.Step.Compile,
+) *std.Build.Module {
+    const translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/crypto/c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translate.addIncludePath(libcrypto.getEmittedIncludeTree());
+    return translate.createModule();
 }
 
 /// The rustls comparison harness. Its own function because `build` was
@@ -124,10 +146,10 @@ fn addBenchStep(b: *std.Build, target: std.Build.ResolvedTarget) void {
     // the other would describe a configuration nobody runs. Both are in
     // bench/README.md. See also the `sanitize_c` note below.
     const bench_optimize = b.option(
-        std.builtin.OptimizeMode,
+        std.lang.Optimize,
         "bench-optimize",
         "Optimize mode for the bench harness and everything under it (default ReleaseFast)",
-    ) orelse .ReleaseFast;
+    ) orelse .fast;
     const bench_openssl = b.dependency("openssl", .{
         .target = target,
         .optimize = bench_optimize,
@@ -146,6 +168,7 @@ fn addBenchStep(b: *std.Build, target: std.Build.ResolvedTarget) void {
     });
     bench_zssl.link_libc = true;
     bench_zssl.linkLibrary(bench_libcrypto);
+    bench_zssl.addImport("libcrypto", addLibcryptoImport(b, target, bench_optimize, bench_libcrypto));
 
     const bench_module = b.createModule(.{
         .root_source_file = b.path("bench/zssl_bench.zig"),
@@ -159,7 +182,7 @@ fn addBenchStep(b: *std.Build, target: std.Build.ResolvedTarget) void {
     b.installArtifact(bench_exe);
     const bench_run = b.addRunArtifact(bench_exe);
     bench_run.has_side_effects = true;
-    if (b.args) |forwarded| bench_run.addArgs(forwarded);
+    bench_run.addPassthruArgs();
     const bench_step = b.step("bench", "Throughput harness for the rustls comparison (JSON lines)");
     bench_step.dependOn(&bench_run.step);
 }
@@ -226,7 +249,7 @@ fn addCoverageStep(b: *std.Build, zssl_module: *std.Build.Module) void {
 fn addGateSteps(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     zssl_module: *std.Build.Module,
 ) void {
     // The interop gate: our machines against the real `openssl` binary —
@@ -277,7 +300,7 @@ fn addGateSteps(
     bogo_run.addArtifactArg(shim_exe);
     bogo_run.addArg("--config");
     bogo_run.addFileArg(b.path("bogo/config.json"));
-    if (b.args) |forwarded| bogo_run.addArgs(forwarded);
+    bogo_run.addPassthruArgs();
     const bogo_step = b.step("bogo", "Adversarial gate: BoringSSL's BoGo runner against zssl");
     bogo_step.dependOn(&bogo_run.step);
 
@@ -291,7 +314,7 @@ fn addGateSteps(
 fn addPythonGateSteps(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     zssl_module: *std.Build.Module,
 ) void {
     // The second adversarial gate: tlsfuzzer, a TLS client in Python over
@@ -355,6 +378,6 @@ fn addPythonGateSteps(
     );
     const tlsfuzzer_server_run = b.addRunArtifact(tlsfuzzer_server);
     tlsfuzzer_server_run.has_side_effects = true;
-    if (b.args) |forwarded| tlsfuzzer_server_run.addArgs(forwarded);
+    tlsfuzzer_server_run.addPassthruArgs();
     tlsfuzzer_server_step.dependOn(&tlsfuzzer_server_run.step);
 }

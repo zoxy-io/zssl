@@ -160,8 +160,8 @@ test "fuzz: PEM — decode or reject" {
 }
 
 fn fuzzProtectorOpen(input: []const u8) !void {
-    const key = [_]u8{0x42} ** 16;
-    const static_iv = [_]u8{0x24} ** 12;
+    const key: [16]u8 = @splat(0x42);
+    const static_iv: [12]u8 = @splat(0x24);
     var protector = protect.Protector.init(.aes_128_gcm_sha256, &key, &static_iv) catch return;
     defer protector.deinit();
     var wire: [record.wire_record_bytes_max]u8 = undefined;

@@ -5,7 +5,7 @@
 # below on what is not here: a package no gate runs, and a gate no
 # package can satisfy.
 #
-#   zig       every gate; 0.16.0 exactly, the other half of the
+#   zig       every gate; 0.17, the other half of the
 #             `minimum_zig_version` pin in build.zig.zon
 #   openssl   `zig build interop` spawns the real `openssl s_client` /
 #             `s_server`. This is `.bin`, not zoxy's `.dev`: zssl builds
@@ -47,7 +47,7 @@
 {
   packages =
     [
-      pkgs.zig_0_16
+      pkgs.zig_0_17
       pkgs.openssl.bin
       pkgs.go
       pkgs.python3

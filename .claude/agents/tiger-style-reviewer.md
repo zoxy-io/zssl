@@ -69,9 +69,13 @@ ReleaseSafe is what release builds ship.
 
 ## Checklist — zssl's invariants (CLAUDE.md, DESIGN.md)
 
-- **Exactly one `@cImport`**, in `src/crypto/c.zig`. C symbols are
-  called only from `src/crypto/backend_openssl.zig` and
-  `src/crypto/mem_hooks.zig`; everything above that boundary is Zig.
+- **Exactly one C import.** Zig 0.17 has no `@cImport`: the header
+  list is `src/crypto/c.h`, build.zig translates it with one
+  `addTranslateC`, and only `src/crypto/c.zig` imports the result
+  (`@import("libcrypto")`). A second header list, translate step, or
+  importer is the violation. C symbols are called only from
+  `src/crypto/backend_openssl.zig` and `src/crypto/mem_hooks.zig`;
+  everything above that boundary is Zig.
 - **No allocators** (§3). `std.mem.Allocator` appears nowhere in `src/`;
   every buffer is caller-owned or a fixed array. Gates and harnesses
   under `bogo/`, `tlsfuzzer/`, and `interop/` are not the library and

@@ -15,9 +15,9 @@ const test_client = @import("test_client.zig");
 
 const Client = test_client.TestClient(.aes_128_gcm_sha256);
 
-const client_x25519_private = [_]u8{0x11} ** 31 ++ [_]u8{0x42};
-const server_key_share_private = [_]u8{0x99} ** 47 ++ [_]u8{0x24};
-const server_random = [_]u8{0x5c} ** 32;
+const client_x25519_private = @as([31]u8, @splat(0x11)) ++ [_]u8{0x42};
+const server_key_share_private = @as([47]u8, @splat(0x99)) ++ [_]u8{0x24};
+const server_random: [32]u8 = @splat(0x5c);
 
 const Harness = struct {
     chain_storage: [Credentials.chain_bytes_max]u8,
@@ -84,7 +84,7 @@ test "full 1-RTT: ALPN, app data both ways, kTLS export, clean close" {
     try harness.init("http/1.1");
     defer harness.deinit();
     var client = Client.init(&client_x25519_private, &.{
-        .session_id = &(.{0xab} ** 32),
+        .session_id = &@as([32]u8, @splat(0xab)),
         .alpn = "http/1.1",
         .server_name = "spike.zoxy.test",
     });

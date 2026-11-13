@@ -319,7 +319,7 @@ zig build tlsfuzzer-server -- --port 4433   # that server alone, to hand-drive
 zig build test-fuzz                     # the fuzz targets, once over their seeds
 zig build test-fuzz --fuzz              # the coverage-guided search; runs until interrupted
 zig build coverage                      # line coverage, needs kcov (Linux)
-zig fmt --check src interop bench bogo fuzz tlsanvil tlsfuzzer scripts build.zig build.zig.zon
+zig fmt --check src interop bench bogo tlsanvil tlsfuzzer scripts build.zig build.zig.zon
 ```
 
 RFC 8448 vectors are generated, never transcribed:

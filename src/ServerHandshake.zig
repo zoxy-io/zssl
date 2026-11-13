@@ -879,7 +879,7 @@ fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Err
         const ladder_suite: CipherSuite = self.ladder.?;
         if (suite != ladder_suite) return error.IllegalRetry;
         // The retry must answer the group we asked for, and no other.
-        if (hello.keyShareFor(@intFromEnum(self.key_share_group)) == null) {
+        if (hello.keyShareFor(@backingInt(self.key_share_group)) == null) {
             return error.IllegalRetry;
         }
     }
@@ -1145,13 +1145,13 @@ fn selectScheme(
         for (allowed) |wanted| {
             if (!hello.offersScheme(wanted)) continue;
             for (supported) |scheme| {
-                if (@intFromEnum(scheme) == wanted) return scheme;
+                if (@backingInt(scheme) == wanted) return scheme;
             }
         }
         return null;
     }
     for (supported) |scheme| {
-        if (hello.offersScheme(@intFromEnum(scheme))) return scheme;
+        if (hello.offersScheme(@backingInt(scheme))) return scheme;
     }
     return null;
 }
@@ -1185,7 +1185,7 @@ fn sendHelloRetry(self: *ServerHandshake, ch1: []const u8, suite: CipherSuite, o
     self.ladder = Ladder.initFor(suite);
     var message_buffer: [server_messages.server_hello_bytes_max]u8 = undefined;
     const echo = self.session_echo[0..self.session_echo_bytes];
-    const hrr = server_messages.helloRetryRequest(&message_buffer, echo, suite, @intFromEnum(self.key_share_group));
+    const hrr = server_messages.helloRetryRequest(&message_buffer, echo, suite, @backingInt(self.key_share_group));
     switch (self.ladder.?) {
         inline else => |*arm| arm.absorbRetryClientHello(ch1, hrr),
     }
@@ -1250,7 +1250,7 @@ fn acceptClientHello(
     out: []u8,
 ) Error!Event {
     const group = self.key_share_group;
-    const peer_share = hello.keyShareFor(@intFromEnum(group)).?;
+    const peer_share = hello.keyShareFor(@backingInt(group)).?;
     const first_flight = self.state == .awaiting_client_hello;
     if (first_flight) {
         assert(self.ladder == null);
@@ -1275,7 +1275,7 @@ fn acceptClientHello(
         &self.config.server_random,
         echo,
         suite,
-        @intFromEnum(group),
+        @backingInt(group),
         public_key,
         if (selected_psk) |psk| psk.index else null,
     );
@@ -1368,7 +1368,7 @@ fn buildFlightPlaintext(
         );
         const verify_message = server_messages.certificateVerify(
             flight[builder.index..],
-            @intFromEnum(self.signature_scheme),
+            @backingInt(self.signature_scheme),
             signature,
         );
         builder.index += verify_message.len;
@@ -2153,7 +2153,7 @@ fn LadderOf(comptime suite: CipherSuite) type {
             var ch1_hash: [hash_bytes]u8 = undefined;
             Hash.hash(ch1, &ch1_hash, .{});
             const synthetic_header = [handshake.header_bytes]u8{
-                @intFromEnum(handshake.MessageType.message_hash),
+                @backingInt(handshake.MessageType.message_hash),
                 0,
                 0,
                 hash_bytes,

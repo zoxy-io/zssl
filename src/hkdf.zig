@@ -177,7 +177,7 @@ pub const HkdfSha384 = Hkdf(std.crypto.hash.sha2.Sha384);
 test "extract matches RFC 8448 early secret" {
     // Early secret = Extract(salt: 0, ikm: 32 zero bytes) — RFC 8448 §3.
     const vectors = @import("rfc8448_vectors.zig");
-    const zeros = [_]u8{0} ** 32;
+    const zeros: [32]u8 = @splat(0);
     const early = HkdfSha256.extract(&.{}, &zeros);
     try std.testing.expectEqualSlices(u8, &vectors.early_secret, &early);
 }

@@ -142,9 +142,9 @@ pub fn clientHello(out: []u8, params: *const HelloParams) []const u8 {
     // All three §B.4 suites, AES-128-GCM first — the order the server's
     // own preference list starts with.
     builder.putU16(6);
-    builder.putU16(@intFromEnum(CipherSuite.aes_128_gcm_sha256));
-    builder.putU16(@intFromEnum(CipherSuite.chacha20_poly1305_sha256));
-    builder.putU16(@intFromEnum(CipherSuite.aes_256_gcm_sha384));
+    builder.putU16(@backingInt(CipherSuite.aes_128_gcm_sha256));
+    builder.putU16(@backingInt(CipherSuite.chacha20_poly1305_sha256));
+    builder.putU16(@backingInt(CipherSuite.aes_256_gcm_sha384));
     builder.putByte(1);
     builder.putByte(0);
     const extensions = builder.markU16();
@@ -186,7 +186,7 @@ fn helloExtensions(builder: *wire.Builder, params: *const HelloParams) void {
     builder.putU16(13);
     const schemes = builder.markU16();
     const scheme_list = builder.markU16();
-    for (params.signature_schemes) |scheme| builder.putU16(@intFromEnum(scheme));
+    for (params.signature_schemes) |scheme| builder.putU16(@backingInt(scheme));
     builder.patchU16(scheme_list);
     builder.patchU16(schemes);
     if (params.alpn_protocols.len >= 1) {
@@ -259,7 +259,7 @@ fn helloPreSharedKey(builder: *wire.Builder, psk: *const PskParams) void {
     builder.patchU16(identities);
     const binders = builder.markU16();
     builder.putByte(psk.binder_bytes);
-    const placeholder = [_]u8{0} ** 48;
+    const placeholder: [48]u8 = @splat(0);
     builder.putSlice(placeholder[0..psk.binder_bytes]);
     builder.patchU16(binders);
     builder.patchU16(extension);
@@ -323,11 +323,11 @@ pub fn patchBinder(message: []u8, psk: []const u8, transcript_hash: ?[]const u8)
 
 test "the production hello parses under our own strict parser" {
     var out: [hello_bytes_max]u8 = undefined;
-    const random = [_]u8{0x07} ** 32;
-    const public = [_]u8{0x0b} ** 32;
+    const random: [32]u8 = @splat(0x07);
+    const public: [32]u8 = @splat(0x0b);
     const encoded = clientHello(&out, &.{
         .random = &random,
-        .session_id = &(.{0xee} ** 32),
+        .session_id = &@as([32]u8, @splat(0xee)),
         .share_group = client_hello.group_x25519,
         .share_public = &public,
         .signature_schemes = &signature_schemes_default,
@@ -357,9 +357,9 @@ test "the production hello parses under our own strict parser" {
 
 test "a PSK hello carries a well-formed offer and a patchable binder" {
     var out: [hello_bytes_max]u8 = undefined;
-    const random = [_]u8{0x07} ** 32;
-    const public = [_]u8{0x0b} ** 32;
-    const psk = [_]u8{0x33} ** 32;
+    const random: [32]u8 = @splat(0x07);
+    const public: [32]u8 = @splat(0x0b);
+    const psk: [32]u8 = @splat(0x33);
     const encoded = clientHello(&out, &.{
         .random = &random,
         .session_id = &.{},
@@ -393,13 +393,13 @@ test "a maximal ClientHello fits its own buffer" {
     // at once: a retried resumption is the flight that carries a cookie
     // and a PSK identity in the same hello.
     var out: [hello_bytes_max]u8 = undefined;
-    const identity = [_]u8{0xa5} ** psk_identity_bytes_max;
-    const cookie = [_]u8{0xc0} ** cookie_bytes_max;
-    const name = [_]u8{'n'} ** 255;
-    const public = [_]u8{0x0b} ** 97; // Uncompressed P-384, the widest share.
+    const identity: [psk_identity_bytes_max]u8 = @splat(0xa5);
+    const cookie: [cookie_bytes_max]u8 = @splat(0xc0);
+    const name: [255]u8 = @splat('n');
+    const public: [97]u8 = @splat(0x0b); // Uncompressed P-384, the widest share.
     const encoded = clientHello(&out, &.{
-        .random = &(.{0x07} ** 32),
-        .session_id = &(.{0xee} ** 32),
+        .random = &@as([32]u8, @splat(0x07)),
+        .session_id = &@as([32]u8, @splat(0xee)),
         .share_group = client_hello.group_secp384r1,
         .share_public = &public,
         .signature_schemes = &signature_schemes_default,
@@ -407,10 +407,10 @@ test "a maximal ClientHello fits its own buffer" {
         .cookie = &cookie,
         .server_name = &name,
         .alpn_protocols = &.{
-            &(.{'a'} ** alpn_protocol_bytes_max),
-            &(.{'b'} ** alpn_protocol_bytes_max),
-            &(.{'c'} ** alpn_protocol_bytes_max),
-            &(.{'d'} ** alpn_protocol_bytes_max),
+            &@as([alpn_protocol_bytes_max]u8, @splat('a')),
+            &@as([alpn_protocol_bytes_max]u8, @splat('b')),
+            &@as([alpn_protocol_bytes_max]u8, @splat('c')),
+            &@as([alpn_protocol_bytes_max]u8, @splat('d')),
         },
         .psk = .{ .identity = &identity, .obfuscated_age = 7, .binder_bytes = 48 },
     });

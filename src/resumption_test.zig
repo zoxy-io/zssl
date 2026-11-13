@@ -25,8 +25,8 @@ const Client = test_client.TestClient(.aes_128_gcm_sha256);
 const Schedule = key_schedule.KeySchedule(.aes_128_gcm_sha256);
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-const client_x25519_private = [_]u8{0x11} ** 31 ++ [_]u8{0x42};
-const server_key_share_private = [_]u8{0x99} ** 47 ++ [_]u8{0x24};
+const client_x25519_private = @as([31]u8, @splat(0x11)) ++ [_]u8{0x42};
+const server_key_share_private = @as([47]u8, @splat(0x99)) ++ [_]u8{0x24};
 
 test "§4 vectors: the binder chain, truncation arithmetic, and the PSK ladder" {
     // §3 ends where §4 begins: the resumed trace's PSK is §3's
@@ -162,7 +162,7 @@ const Harness = struct {
         );
         harness.server = ServerHandshake.init(&.{
             .credentials = &harness.credentials,
-            .server_random = .{0x5c} ** 32,
+            .server_random = @splat(0x5c),
             .key_share_private = server_key_share_private,
             .reassembly = &harness.reassembly,
             .flight = &harness.flight,
@@ -187,7 +187,7 @@ const Harness = struct {
         );
         harness.server = ServerHandshake.init(&.{
             .credentials = &harness.credentials,
-            .server_random = .{0x5c} ** 32,
+            .server_random = @splat(0x5c),
             .key_share_private = server_key_share_private,
             .reassembly = &harness.reassembly,
             .flight = &harness.flight,
@@ -337,8 +337,8 @@ test "§4.4.1: the server verifies a binder on a retry ClientHello" {
     // The transcript is rebuilt here with `std.crypto` from the bytes
     // that actually crossed, so the check is agreement between two
     // derivations rather than `Transcript.hashWith` against itself.
-    const psk = [_]u8{0x9a} ** 32;
-    const random = [_]u8{0x07} ** 32;
+    const psk: [32]u8 = @splat(0x9a);
+    const random: [32]u8 = @splat(0x07);
     const unusable_group: u16 = 0xfefe; // Parsed, skipped, no share we can use.
 
     // CH1 offers the identity and a share for a group we do not hold,
@@ -350,7 +350,7 @@ test "§4.4.1: the server verifies a binder on a retry ClientHello" {
         .random = &random,
         .session_id = &.{},
         .share_group = unusable_group,
-        .share_public = &(.{0xab} ** 32),
+        .share_public = &@as([32]u8, @splat(0xab)),
         .signature_schemes = &client_messages.signature_schemes_default,
         .groups = &.{client_hello.group_secp256r1},
         .psk = .{ .identity = "ticket", .obfuscated_age = 0, .binder_bytes = 32 },
@@ -363,7 +363,7 @@ test "§4.4.1: the server verifies a binder on a retry ClientHello" {
     var share_storage: [backend.group_public_bytes_max]u8 = undefined;
     const share = try backend.keySharePublic(
         .secp256r1,
-        &(.{0x71} ** 32),
+        &@as([32]u8, @splat(0x71)),
         &share_storage,
     );
 
@@ -468,7 +468,7 @@ fn frameHandshake(out: []u8, message: []const u8) []const u8 {
 /// is the part a resumption-only implementation quietly assumes.
 const ExternalStore = struct {
     const identity = "out-of-band-identity";
-    const secret = [_]u8{0x5a} ** 16;
+    const secret: [16]u8 = @splat(0x5a);
 
     fn lookup(
         context: *anyopaque,
@@ -682,7 +682,7 @@ test "§4.6.1: an expired ticket falls back to a full handshake, not an error" {
     // handshake the client would have got with no ticket at all. A
     // refusal here would turn every expired resumption into a failed
     // connection.
-    const psk = [_]u8{0x9a} ** 32;
+    const psk: [32]u8 = @splat(0x9a);
     var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
     var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
     const hour_ms: u64 = 60 * 60 * 1000;
@@ -753,7 +753,7 @@ const EarlyDataStore = struct {
 };
 
 const EarlyDataFixture = struct {
-    const psk = [_]u8{0x7e} ** 32;
+    const psk: [32]u8 = @splat(0x7e);
     const issued_at_ms: u64 = 4_000_000;
     const age_add: u32 = 0x0bad_c0de;
     /// The client learned the ticket 250 ms ago and we are 250 ms past
@@ -1097,8 +1097,8 @@ test "§4.6.1: the largest legal ticket still fits with 0-RTT advertised" {
     // did not move with it — a legal maximum-size ticket would have run
     // off the end of the buffer `sendNewSessionTicket` allocates.
     var message_out: [server_messages.new_session_ticket_bytes_max]u8 = undefined;
-    const nonce = [_]u8{0x5a} ** 255;
-    const ticket = [_]u8{0xa5} ** server_messages.ticket_bytes_max;
+    const nonce: [255]u8 = @splat(0x5a);
+    const ticket: [server_messages.ticket_bytes_max]u8 = @splat(0xa5);
     const largest = server_messages.newSessionTicket(
         &message_out,
         server_messages.ticket_lifetime_s_max,
@@ -1146,9 +1146,9 @@ test "§4.2.10 end to end: our client offers 0-RTT and our server takes it" {
     @memset(&resumption.psk, 0);
     @memcpy(resumption.psk[0..EarlyDataFixture.psk.len], &EarlyDataFixture.psk);
     var client = ClientHandshake.init(&.{
-        .client_random = .{0x2c} ** 32,
+        .client_random = @splat(0x2c),
         .x25519_private = client_x25519_private,
-        .session_id = &(.{0x33} ** 32),
+        .session_id = &@as([32]u8, @splat(0x33)),
         .server_name = "spike.zoxy.test",
         .certificate_policy = .insecure_no_verification,
         .resume_session = resumption,
@@ -1238,9 +1238,9 @@ fn offeringClient(
     @memset(&resumption.psk, 0);
     @memcpy(resumption.psk[0..psk.len], psk);
     return ClientHandshake.init(&.{
-        .client_random = .{0x2c} ** 32,
+        .client_random = @splat(0x2c),
         .x25519_private = client_x25519_private,
-        .session_id = &(.{0x33} ** 32),
+        .session_id = &@as([32]u8, @splat(0x33)),
         .certificate_policy = .insecure_no_verification,
         .resume_session = resumption,
         .reassembly = reassembly,
@@ -1256,7 +1256,7 @@ test "§4.2.10: early keys follow the ticket's suite, not the PSK's length" {
     //
     // This is the test that would have caught it. The two clients differ
     // in exactly one field.
-    const psk = [_]u8{0x7e} ** 32;
+    const psk: [32]u8 = @splat(0x7e);
     var aes_reassembly: [16 * 1024]u8 = undefined;
     var chacha_reassembly: [16 * 1024]u8 = undefined;
     var aes_out: [2 * record.wire_record_bytes_max]u8 = undefined;
@@ -1293,7 +1293,7 @@ test "§4.2.10: early keys follow the ticket's suite, not the PSK's length" {
 }
 
 test "§4.2.10: what a client will not offer, and will not overspend" {
-    const psk = [_]u8{0x7e} ** 32;
+    const psk: [32]u8 = @splat(0x7e);
     var reassembly: [16 * 1024]u8 = undefined;
     var out: [2 * record.wire_record_bytes_max]u8 = undefined;
     var early_out: [record.wire_record_bytes_max]u8 = undefined;
@@ -1353,7 +1353,7 @@ test "§4.1.2: a HelloRetryRequest withdraws the 0-RTT offer, keys and all" {
     // anything still holding them would seal against a hello the server
     // never saw. A server answering `early_data` after a retry would
     // then have been believed.
-    const psk = [_]u8{0x7e} ** 32;
+    const psk: [32]u8 = @splat(0x7e);
     var reassembly: [16 * 1024]u8 = undefined;
     var out: [2 * record.wire_record_bytes_max]u8 = undefined;
     var early_out: [record.wire_record_bytes_max]u8 = undefined;
@@ -1368,12 +1368,12 @@ test "§4.1.2: a HelloRetryRequest withdraws the 0-RTT offer, keys and all" {
     @memset(&resumption.psk, 0);
     @memcpy(resumption.psk[0..psk.len], &psk);
     var client = ClientHandshake.init(&.{
-        .client_random = .{0x2c} ** 32,
+        .client_random = @splat(0x2c),
         .x25519_private = client_x25519_private,
-        .session_id = &(.{0x33} ** 32),
+        .session_id = &@as([32]u8, @splat(0x33)),
         .certificate_policy = .insecure_no_verification,
         .resume_session = resumption,
-        .retry_key_share_private = .{0x71} ** 48,
+        .retry_key_share_private = @splat(0x71),
         .reassembly = &reassembly,
     });
     defer client.deinit();
@@ -1386,7 +1386,7 @@ test "§4.1.2: a HelloRetryRequest withdraws the 0-RTT offer, keys and all" {
     var message_buffer: [server_messages.server_hello_bytes_max]u8 = undefined;
     const retry = server_messages.helloRetryRequest(
         &message_buffer,
-        &(.{0x33} ** 32),
+        &@as([32]u8, @splat(0x33)),
         .aes_128_gcm_sha256,
         client_hello.group_secp256r1,
     );
@@ -1514,9 +1514,9 @@ test "§4.2.10: an accepted offer whose keys were never built errors, not panics
     @memset(&resumption.psk, 0);
     @memcpy(resumption.psk[0..EarlyDataFixture.psk.len], &EarlyDataFixture.psk);
     var client = ClientHandshake.init(&.{
-        .client_random = .{0x2c} ** 32,
+        .client_random = @splat(0x2c),
         .x25519_private = client_x25519_private,
-        .session_id = &(.{0x33} ** 32),
+        .session_id = &@as([32]u8, @splat(0x33)),
         .server_name = "spike.zoxy.test",
         .certificate_policy = .insecure_no_verification,
         .resume_session = resumption,

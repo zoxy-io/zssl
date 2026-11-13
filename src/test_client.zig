@@ -280,11 +280,11 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                 builder.putSlice(suites);
             } else {
                 builder.putU16(6);
-                builder.putU16(@intFromEnum(suite));
+                builder.putU16(@backingInt(suite));
                 inline for (.{ CipherSuite.aes_128_gcm_sha256, CipherSuite.chacha20_poly1305_sha256 }) |filler| {
-                    if (filler != suite) builder.putU16(@intFromEnum(filler));
+                    if (filler != suite) builder.putU16(@backingInt(filler));
                 }
-                if (suite != .aes_256_gcm_sha384) builder.putU16(@intFromEnum(CipherSuite.aes_256_gcm_sha384));
+                if (suite != .aes_256_gcm_sha384) builder.putU16(@backingInt(CipherSuite.aes_256_gcm_sha384));
             }
             builder.putByte(1);
             builder.putByte(0);
@@ -408,10 +408,10 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             const shares = builder.markU16();
             const share_list = builder.markU16();
             if (self.options.offer_bogus_p256_share) {
-                builder.putU16(@intFromEnum(backend.Group.secp256r1));
+                builder.putU16(@backingInt(backend.Group.secp256r1));
                 builder.putU16(65);
                 builder.putByte(0x04);
-                builder.putSlice(&(.{0x5a} ** 64));
+                builder.putSlice(&@as([64]u8, @splat(0x5a)));
             }
             if (with_decoy) {
                 // secp521r1: a group zssl does not hold, so the share is
@@ -422,7 +422,7 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                 builder.putU16(0x0019);
                 builder.putU16(133);
                 builder.putByte(0x04);
-                builder.putSlice(&(.{0x5a} ** 132));
+                builder.putSlice(&@as([132]u8, @splat(0x5a)));
             }
             if (with_x25519) {
                 // Unreachable rather than propagated: the scalar is a
@@ -436,7 +436,7 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                     self.scalar(),
                     &public_buffer,
                 ) catch unreachable;
-                builder.putU16(@intFromEnum(group));
+                builder.putU16(@backingInt(group));
                 builder.putU16(@intCast(public.len));
                 builder.putSlice(public);
             }
@@ -488,10 +488,10 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             // it belongs to is ever looked up.
             if (self.options.psk_decoy_first) {
                 builder.putByte(hash_bytes);
-                builder.putSlice(&(.{0} ** hash_bytes));
+                builder.putSlice(&@as([hash_bytes]u8, @splat(0)));
             }
             builder.putByte(hash_bytes);
-            builder.putSlice(&(.{0} ** hash_bytes));
+            builder.putSlice(&@as([hash_bytes]u8, @splat(0)));
             builder.patchU16(binders);
             builder.patchU16(extension);
         }
@@ -554,7 +554,7 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                 if (extension_type == 51 and !is_retry) {
                     var share = wire.Cursor.init(data);
                     const group = self.options.group;
-                    if (try share.takeU16() != @intFromEnum(group)) return error.BadServerHello;
+                    if (try share.takeU16() != @backingInt(group)) return error.BadServerHello;
                     const expected = group.publicBytes();
                     if (try share.takeU16() != expected) return error.BadServerHello;
                     const bytes = try share.takeSlice(expected);
@@ -800,13 +800,13 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                 // count above zero has something legal to follow: §4.4.3
                 // is refused outright after an empty list.
                 const empty_certificate = [_]u8{
-                    @intFromEnum(handshake.MessageType.certificate),
+                    @backingInt(handshake.MessageType.certificate),
                     0, 0, 4, // u24 body length
                     0, // certificate_request_context: empty, echoing §4.3.2
                     0, 0, 0, // certificate_list: u24 zero
                 };
                 const filled_certificate = [_]u8{
-                    @intFromEnum(handshake.MessageType.certificate),
+                    @backingInt(handshake.MessageType.certificate),
                     0, 0, 12, // u24 body length
                     0, // certificate_request_context
                     0, 0, 8, // certificate_list length
@@ -833,7 +833,7 @@ pub fn TestClient(comptime suite: CipherSuite) type {
                     const verify_message = server_messages.certificateVerify(
                         &verify_buffer,
                         0x0403,
-                        &(.{0xa5} ** 64),
+                        &@as([64]u8, @splat(0xa5)),
                     );
                     self.transcript.update(verify_message);
                     const sealed_verify = try self.send.?.seal(
@@ -877,7 +877,7 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             // two hashes are equal and this is a no-op.
             if (self.early_send) |*early| {
                 const end_of_early_data = [_]u8{
-                    @intFromEnum(handshake.MessageType.end_of_early_data),
+                    @backingInt(handshake.MessageType.end_of_early_data),
                     0,
                     0,
                     0,

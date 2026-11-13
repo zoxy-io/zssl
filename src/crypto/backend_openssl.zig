@@ -838,7 +838,7 @@ test "AEAD differential against std.crypto, all three suites" {
     var plaintext: [1000]u8 = undefined;
     for (&plaintext, 0..) |*byte, index| byte.* = @truncate(index *% 31);
     const additional_data = "zssl differential aad";
-    const nonce = [_]u8{0xa5} ** 12;
+    const nonce: [12]u8 = @splat(0xa5);
 
     inline for (.{
         .{ CipherSuite.aes_128_gcm_sha256, std.crypto.aead.aes_gcm.Aes128Gcm },
@@ -1049,7 +1049,7 @@ test "x25519 matches RFC 8448 and refuses the identity" {
     try x25519Public(&vectors.client_x25519_private, &public);
     try std.testing.expectEqualSlices(u8, &vectors.client_x25519_public, &public);
     // Negative space: the all-zero point is an abort, not a shared secret.
-    const zero_point = [_]u8{0} ** 32;
+    const zero_point: [32]u8 = @splat(0);
     try std.testing.expectError(
         error.IdentityElement,
         x25519Shared(&vectors.client_x25519_private, &zero_point, &shared),
@@ -1076,8 +1076,8 @@ test "libcrypto's error queue is empty after a failure" {
 
     // The all-zero peer point: EVP_PKEY_derive refuses it, which is the
     // §7.4.2 abort and also an error-queue entry.
-    const private_key = [_]u8{0x11} ** 31 ++ [_]u8{0x42};
-    const zero_point = [_]u8{0} ** 32;
+    const private_key = @as([31]u8, @splat(0x11)) ++ [_]u8{0x42};
+    const zero_point: [32]u8 = @splat(0);
     var shared: [32]u8 = undefined;
     try std.testing.expectError(
         error.IdentityElement,
@@ -1087,10 +1087,10 @@ test "libcrypto's error queue is empty after a failure" {
 
     // A tag that does not authenticate — the one failure a peer can
     // cause at will, so the one whose residue would accumulate fastest.
-    const key = [_]u8{0x33} ** 16;
+    const key: [16]u8 = @splat(0x33);
     var aead = try AeadKey.init(.aes_128_gcm_sha256, &key);
     defer aead.deinit();
-    const nonce = [_]u8{0x44} ** nonce_bytes;
+    const nonce: [nonce_bytes]u8 = @splat(0x44);
     var sealed: [8]u8 = undefined;
     var tag: [tag_bytes]u8 = undefined;
     try aead.seal(&nonce, "aad", "12345678", &sealed, &tag);
@@ -1170,12 +1170,12 @@ test "verifyEcdsa accepts a std.crypto signature and keeps its two refusals apar
         const scheme: SignatureScheme = pair[0];
         const Ecdsa = pair[1];
 
-        const seed = [_]u8{0x5c} ** Ecdsa.KeyPair.seed_length;
+        const seed: [Ecdsa.KeyPair.seed_length]u8 = @splat(0x5c);
         const keys = try Ecdsa.KeyPair.generateDeterministic(seed);
         const sec1 = keys.public_key.toUncompressedSec1();
         // A CertificateVerify content structure's shape and length; the
         // bytes themselves do not matter to a signature check.
-        const content = [_]u8{0x20} ** 130;
+        const content: [130]u8 = @splat(0x20);
         var der_storage: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
         const der = (try keys.sign(&content, null)).toDer(&der_storage);
 
@@ -1185,7 +1185,7 @@ test "verifyEcdsa accepts a std.crypto signature and keeps its two refusals apar
         // `SignatureInvalid` — libcrypto's ASN.1 decoder rejecting the
         // encoding and its verifier rejecting the maths are the same
         // answer to the peer, exactly as `std.crypto`'s were.
-        const other = [_]u8{0x21} ** 130;
+        const other: [130]u8 = @splat(0x21);
         try std.testing.expectError(
             error.SignatureInvalid,
             verifyEcdsa(scheme, &sec1, &other, der),
