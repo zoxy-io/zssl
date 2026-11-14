@@ -782,7 +782,7 @@ const EarlyDataFixture = struct {
         var s: EarlyDataStore = .{
             .psk = undefined,
             .issued = .{ .at_ms = issued_at_ms, .age_add = age_add, .lifetime_s = 3600 },
-            .early_data = .{ .bytes_max = bytes_max, .suite = suite },
+            .early_data = .{ .bytes_max = bytes_max, .suite = suite, .alpn = null },
         };
         @memset(&s.psk, 0);
         @memcpy(s.psk[0..psk.len], &psk);
@@ -876,22 +876,30 @@ fn earlyDataAccepted(options: struct {
     /// Offer an identity the server does not know ahead of the real
     /// one, so the PSK it selects is not the first offered.
     decoy_first: bool = false,
+    /// §4.2.10's ALPN half: what the ticket's session negotiated, what
+    /// the server will select from, and what this hello offers.
+    ticket_alpn: ?[]const u8 = null,
+    server_alpn: []const []const u8 = &.{},
+    client_alpn: ?[]const u8 = null,
 }) !bool {
     var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
     var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
     var store = EarlyDataFixture.store(options.bytes_max, options.suite);
+    store.early_data.?.alpn = options.ticket_alpn;
     if (!options.terms) store.early_data = null;
     var harness: Harness = undefined;
     try harness.initLookup(.{ .context = &store, .lookup = EarlyDataStore.lookup });
     defer harness.deinit();
     if (options.clock) harness.server.config.now_ms = options.now_ms;
     harness.server.config.strike_register = options.register;
+    harness.server.config.alpn_protocols = options.server_alpn;
 
     var ticket = EarlyDataFixture.ticket();
     var client = Client.init(&client_x25519_private, &.{
         .resume_with = &ticket,
         .offer_early_data = true,
         .psk_decoy_first = options.decoy_first,
+        .alpn = options.client_alpn,
     });
     defer client.deinit();
     const flight = (try harness.server.handleRecord(
@@ -903,6 +911,59 @@ fn earlyDataAccepted(options: struct {
     // costs a round trip and never the connection.
     try testing.expect(harness.server.resumed);
     return harness.server.early_data_accepted;
+}
+
+test "§4.2.10: early data rides only on the protocol the ticket's session spoke" {
+    // A fresh register per row, so a refusal is the ALPN gate's and never
+    // the strike register recognising a hello it has already admitted.
+    const Register = struct {
+        entries: [anti_replay.StrikeRegister.probe_max]anti_replay.StrikeRegister.Entry = @splat(.free),
+
+        fn register(storage: *@This()) anti_replay.StrikeRegister {
+            return .{ .entries = &storage.entries };
+        }
+    };
+    const both: []const []const u8 = &.{ "h2", "http/1.1" };
+
+    // The control: minted under h2, resumed under h2, and accepted.
+    var same: Register = .{};
+    var same_register = same.register();
+    try testing.expect(try earlyDataAccepted(.{
+        .register = &same_register,
+        .ticket_alpn = "h2",
+        .server_alpn = both,
+        .client_alpn = "h2",
+    }));
+
+    // Minted under h2, resumed under http/1.1: the early bytes were
+    // written for a protocol this session is not speaking.
+    var other: Register = .{};
+    var other_register = other.register();
+    try testing.expect(!try earlyDataAccepted(.{
+        .register = &other_register,
+        .ticket_alpn = "h2",
+        .server_alpn = both,
+        .client_alpn = "http/1.1",
+    }));
+
+    // Minted under h2, resumed with no ALPN at all. Absent is a value
+    // here, not a wildcard.
+    var absent: Register = .{};
+    var absent_register = absent.register();
+    try testing.expect(!try earlyDataAccepted(.{
+        .register = &absent_register,
+        .ticket_alpn = "h2",
+        .server_alpn = both,
+    }));
+
+    // And the mirror: minted with none, resumed under h2.
+    var minted_bare: Register = .{};
+    var minted_bare_register = minted_bare.register();
+    try testing.expect(!try earlyDataAccepted(.{
+        .register = &minted_bare_register,
+        .server_alpn = both,
+        .client_alpn = "h2",
+    }));
 }
 
 test "§8: every gate on early data refuses on its own, and none of them fails the handshake" {

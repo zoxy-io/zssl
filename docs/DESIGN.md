@@ -61,7 +61,10 @@ the four decisions everything else follows from.
   embedder. Accepted bytes arrive as `Event.early_data`, never as
   `application_data`: Appendix E.5 is a warning the embedder has to act
   on, and an exhaustive switch is how it gets asked. See below.
-- **SNI and ALPN** reads, with RFC 7301 selection checks client-side.
+- **SNI and ALPN** reads, with RFC 7301 selection checks client-side
+  and server-preference selection server-side. A ticket's 0-RTT terms
+  carry the protocol its session negotiated, and early data is refused
+  on a resumption that negotiates a different one (RFC 8446 §4.2.10).
 - **Client certificates**, both directions (§4.3.2). A server asks
   through `Config.client_auth` and judges the answer by §4.4.2.1's
   `require`; a client answers through `Config.client_credentials`, and

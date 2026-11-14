@@ -288,7 +288,7 @@ fn serve(
         .credentials = credentials,
         .server_random = entropy[0..32].*,
         .key_share_private = entropy[32..80].*,
-        .alpn = options.alpn,
+        .alpn_protocols = if (options.alpn) |*protocol| protocol[0..1] else &.{},
         .reassembly = &reassembly,
         .flight = &flight_storage,
         .psk_lookup = .{ .context = store, .lookup = TicketStore.lookup },

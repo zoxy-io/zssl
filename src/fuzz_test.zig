@@ -235,7 +235,7 @@ fn fuzzServerMachine(input: []const u8) !void {
         .credentials = fuzzCredentials(),
         .server_random = @splat(0x5c),
         .key_share_private = @splat(0x77),
-        .alpn = "http/1.1",
+        .alpn_protocols = &.{"http/1.1"},
         .reassembly = &reassembly,
         .flight = &flight,
     });

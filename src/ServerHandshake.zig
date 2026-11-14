@@ -61,6 +61,12 @@ session_echo: [32]u8,
 /// Whether this session came up on an accepted PSK — the fact behind
 /// zoxy's `tls_resumed` counter.
 resumed: bool,
+/// Which of `Config.alpn_protocols` this server selected, if any. An
+/// index rather than a slice, as on the client: the names are the
+/// embedder's memory and this must not imply a lifetime it cannot keep.
+/// Set at each ClientHello this server answers, so after a
+/// HelloRetryRequest it is the second hello's answer.
+alpn_selected: ?u8,
 /// The description byte of the fatal alert the peer sent, or null while
 /// it has sent none.
 ///
@@ -288,9 +294,17 @@ pub const Config = struct {
     /// short scalar would quietly take the entropy policy away from the
     /// embedder it belongs to.
     key_share_private: [backend.group_private_bytes_max]u8,
-    /// The one protocol this server will negotiate via ALPN, or null to
-    /// skip the extension entirely.
-    alpn: ?[]const u8 = null,
+    /// Application protocols this server negotiates via ALPN, most
+    /// preferred first. RFC 7301 §3.2 leaves the choice among the
+    /// client's offer to the server, and this order is that choice: the
+    /// first name here the client also offered wins, whatever order the
+    /// client listed them in. Empty skips the extension entirely — no
+    /// offer is read and none is answered.
+    ///
+    /// The slices are the embedder's and must outlive the handshake.
+    /// Bounded by the client's own offer caps (`client_messages`), so the
+    /// one name EncryptedExtensions carries back is bounded too.
+    alpn_protocols: []const []const u8 = &.{},
     /// Our key-exchange group preference, most wanted first. §4.2.8
     /// leaves the choice to the server among what the client offered,
     /// and this is where that choice is made.
@@ -442,6 +456,17 @@ pub const EarlyData = struct {
     /// bound to a hash and two of our three suites share one, so the
     /// suite has to be carried rather than inferred from the length.
     suite: CipherSuite,
+    /// The same sentence's other half: "... and selected ALPN protocol,
+    /// if any". What the ticket's session negotiated — read it from
+    /// `alpnSelected` when the ticket is minted — or null for none.
+    ///
+    /// No default, deliberately. Early data is application bytes in the
+    /// protocol the *ticket's* session spoke, so a ticket minted under
+    /// `h2` whose early data lands on an `http/1.1` session hands the
+    /// embedder bytes in the wrong protocol. Letting an omitted field
+    /// read as "none" would let exactly that through every ticket that
+    /// never said.
+    alpn: ?[]const u8,
 };
 
 const SelectedPsk = struct {
@@ -562,7 +587,16 @@ pub fn init(config: *const Config) ServerHandshake {
     assert(config.reassembly.len >= 1024);
     assert(config.flight.len >= Credentials.chain_bytes_max + 1024);
     assert(config.credentials.certificate_count >= 1);
-    if (config.alpn) |protocol| assert(protocol.len >= 1);
+    assert(config.alpn_protocols.len <= client_messages.alpn_protocols_max);
+    for (config.alpn_protocols, 0..) |protocol, index| {
+        assert(protocol.len >= 1);
+        assert(protocol.len <= client_messages.alpn_protocol_bytes_max);
+        // A name listed twice is a preference order that says nothing
+        // the first listing did not, and a sign the list was built wrong.
+        for (config.alpn_protocols[0..index]) |earlier| {
+            assert(!std.mem.eql(u8, earlier, protocol));
+        }
+    }
     assert(config.groups.len >= 1);
     assert(config.groups.len <= client_hello.groups_supported.len);
     // Non-empty, and deliberately unbounded above: unlike `groups`,
@@ -598,6 +632,7 @@ pub fn init(config: *const Config) ServerHandshake {
         .session_echo_bytes = 0,
         .session_echo = undefined,
         .resumed = false,
+        .alpn_selected = null,
         .ch1_offered_psk = false,
         .peer_alert_description = null,
         .early_data_offered = false,
@@ -1210,6 +1245,7 @@ fn admitEarlyData(
     hello: *const client_hello.ClientHello,
     selected: *const SelectedPsk,
     suite: CipherSuite,
+    selected_alpn: ?[]const u8,
 ) bool {
     if (!hello.early_data) return false;
     // §4.1.2/§4.2.10: early data is not permitted after a
@@ -1225,6 +1261,10 @@ fn admitEarlyData(
     // §4.2.10 again: the suite must be the ticket's own. Two of our
     // three share a hash, so the PSK's length does not settle this.
     if (terms.suite != suite) return false;
+    // And so must the protocol. Absent on both sides is a match; present
+    // on one side only is not, because "this session speaks no ALPN
+    // protocol" and "it speaks h2" read the same early bytes differently.
+    if (!alpnEqual(terms.alpn, selected_alpn)) return false;
     const now_ms = self.config.now_ms orelse return false;
     const issued = selected.issued orelse return false;
     const register = self.config.strike_register orelse return false;
@@ -1281,8 +1321,12 @@ fn acceptClientHello(
     );
     self.resumed = selected_psk != null;
 
-    const selected_alpn = try self.selectAlpn(hello);
-    const accept_early = if (selected_psk) |*psk| self.admitEarlyData(hello, psk, suite) else false;
+    self.alpn_selected = try self.selectAlpn(hello);
+    const selected_alpn = self.alpnSelected();
+    const accept_early = if (selected_psk) |*psk|
+        self.admitEarlyData(hello, psk, suite, selected_alpn)
+    else
+        false;
     if (accept_early) {
         self.early_data_accepted = true;
         self.early_data_bytes_max = selected_psk.?.early_data.?.bytes_max;
@@ -1396,26 +1440,58 @@ fn buildFlightPlaintext(
 }
 
 /// RFC 7301 §3.2: if the client offered ALPN and we speak one of its
-/// protocols, select it; offered-but-no-overlap is a fatal alert; no
-/// offer means no extension.
-fn selectAlpn(self: *const ServerHandshake, hello: *const client_hello.ClientHello) Error!?[]const u8 {
+/// protocols, select the one *we* prefer; offered-but-no-overlap is the
+/// fatal `no_application_protocol`; no offer, or nothing configured,
+/// means no extension. Answers an index into `Config.alpn_protocols`.
+fn selectAlpn(self: *const ServerHandshake, hello: *const client_hello.ClientHello) Error!?u8 {
     const offered = hello.alpn_wire orelse return null;
-    const ours = self.config.alpn orelse return null;
-    assert(ours.len >= 1);
+    const ours = self.config.alpn_protocols;
+    if (ours.len == 0) return null;
+    assert(ours.len <= client_messages.alpn_protocols_max);
     assert(offered.len >= 4); // Validated at extension parse.
+    for (ours, 0..) |protocol, index| {
+        if (try alpnOffered(offered, protocol)) return @intCast(index);
+    }
+    return error.NoApplicationProtocol;
+}
+
+/// Whether `protocol` is one of the names in an ALPN extension body.
+///
+/// Bounded by the same `alpn_entries_max` the hello parser enforced, not
+/// a second number of its own: this loop used to stop at sixteen while
+/// `validateAlpnList` admitted thirty-two, so a hello offering seventeen
+/// names parsed cleanly and was then refused as malformed — but only by
+/// a server that had ALPN configured. One bound, one verdict.
+fn alpnOffered(offered: []const u8, protocol: []const u8) Error!bool {
+    assert(protocol.len >= 1);
     var cursor = @import("wire.zig").Cursor.init(offered);
     const list_bytes = cursor.takeU16() catch return error.MalformedExtension;
     if (list_bytes != cursor.remaining()) return error.MalformedExtension;
-    var entries: u8 = 0;
+    var entries: u16 = 0;
     while (cursor.remaining() > 0) : (entries += 1) {
-        if (entries == 16) return error.MalformedExtension;
-        assert(entries < 16);
+        if (entries == client_hello.alpn_entries_max) return error.MalformedExtension;
+        assert(entries < client_hello.alpn_entries_max);
         const name_bytes = cursor.takeByte() catch return error.MalformedExtension;
         if (name_bytes == 0) return error.MalformedExtension;
         const name = cursor.takeSlice(name_bytes) catch return error.MalformedExtension;
-        if (std.mem.eql(u8, name, ours)) return ours;
+        if (std.mem.eql(u8, name, protocol)) return true;
     }
-    return error.NoApplicationProtocol;
+    return false;
+}
+
+/// §4.2.10's ALPN comparison: both absent, or both present and equal.
+///
+/// Only `session` is asserted on. It is this server's own selection, so
+/// a malformed one is a bug here. `ticket` is whatever the embedder's
+/// store handed back, and an empty name in it simply matches nothing —
+/// refusing 0-RTT is already the safe answer, so an assertion could only
+/// turn a corrupt store into an abort where a refusal would do.
+fn alpnEqual(ticket: ?[]const u8, session: ?[]const u8) bool {
+    if (session) |actual| assert(actual.len >= 1);
+    if (session) |actual| assert(actual.len <= client_messages.alpn_protocol_bytes_max);
+    const expected = ticket orelse return session == null;
+    const actual = session orelse return false;
+    return std.mem.eql(u8, expected, actual);
 }
 
 fn handleProtectedRecord(self: *ServerHandshake, wire_record: []const u8, out: []u8) Error!?Event {
@@ -1871,9 +1947,17 @@ pub fn sendAlert(self: *ServerHandshake, description: alert.Description, out: []
 /// and an AEAD tag, over a record header.
 pub const alert_bytes_min: u8 = record.header_bytes + alert.bytes + 1 + cipher_suite.tag_bytes;
 
-/// §4.6.1: derive the PSK a ticket nonce will stand for. Separate from
-/// sending, because a stateless embedder needs the PSK *before* the
-/// ticket that seals it exists — zoxy's `Tickets.seal` order.
+/// The protocol this server selected from `Config.alpn_protocols`, or
+/// null if it selected none — the client offered no ALPN, or the server
+/// was configured with none. Valid once the ClientHello is answered,
+/// and what an embedder records in `EarlyData.alpn` when it mints a
+/// ticket.
+pub fn alpnSelected(self: *const ServerHandshake) ?[]const u8 {
+    const index = self.alpn_selected orelse return null;
+    assert(index < self.config.alpn_protocols.len);
+    return self.config.alpn_protocols[index];
+}
+
 /// §4.2.9: whether a NewSessionTicket may be sent to this peer. False
 /// only when the ClientHello advertised key exchange modes and none of
 /// them is one zssl can resume under. An embedder should ask before
@@ -1884,6 +1968,9 @@ pub fn ticketPermitted(self: *const ServerHandshake) bool {
     return self.ticket_permitted;
 }
 
+/// §4.6.1: derive the PSK a ticket nonce will stand for. Separate from
+/// sending, because a stateless embedder needs the PSK *before* the
+/// ticket that seals it exists — zoxy's `Tickets.seal` order.
 pub fn resumptionPsk(
     self: *const ServerHandshake,
     ticket_nonce: []const u8,
