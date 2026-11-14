@@ -55,6 +55,11 @@ pub const Options = struct {
     /// Cipher suites to offer, wire order; null offers all three.
     suites_wire: ?[]const u8 = null,
     alpn: ?[]const u8 = null,
+    /// Distinct names offered *ahead of* `alpn`, so a server has to walk
+    /// past them to find it — the shape that reaches a selection loop's
+    /// own entry bound. Ignored without `alpn`; the total stays within
+    /// the hello parser's `alpn_entries_max`.
+    alpn_decoys: u8 = 0,
     server_name: ?[]const u8 = null,
     send_change_cipher_spec: bool = true,
     /// Offer this ticket's PSK for resumption (§4.2.11).
@@ -372,9 +377,19 @@ pub fn TestClient(comptime suite: CipherSuite) type {
             }
             buildFixedExtensions(builder);
             if (self.options.alpn) |protocol| {
+                assert(self.options.alpn_decoys < client_hello.alpn_entries_max);
                 builder.putU16(16);
                 const body = builder.markU16();
                 const list = builder.markU16();
+                for (0..self.options.alpn_decoys) |index| {
+                    const decoy = [_]u8{
+                        'd',
+                        '0' + @as(u8, @intCast(index / 10)),
+                        '0' + @as(u8, @intCast(index % 10)),
+                    };
+                    builder.putByte(decoy.len);
+                    builder.putSlice(&decoy);
+                }
                 builder.putByte(@intCast(protocol.len));
                 builder.putSlice(protocol);
                 builder.patchU16(list);

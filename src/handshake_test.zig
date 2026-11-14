@@ -26,13 +26,13 @@ const Harness = struct {
     flight: [Credentials.chain_bytes_max + 1024]u8,
     server: ServerHandshake,
 
-    fn init(harness: *Harness, alpn: ?[]const u8) !void {
+    fn init(harness: *Harness, alpn: []const []const u8) !void {
         return harness.initWith(alpn, null);
     }
 
     fn initWith(
         harness: *Harness,
-        alpn: ?[]const u8,
+        alpn: []const []const u8,
         client_auth: ?ServerHandshake.ClientAuth,
     ) !void {
         harness.credentials = try Credentials.load(
@@ -45,7 +45,7 @@ const Harness = struct {
             .credentials = &harness.credentials,
             .server_random = server_random,
             .key_share_private = server_key_share_private,
-            .alpn = alpn,
+            .alpn_protocols = alpn,
             .client_auth = client_auth,
             .reassembly = &harness.reassembly,
             .flight = &harness.flight,
@@ -81,7 +81,7 @@ fn feedRecords(server: *ServerHandshake, bytes: []const u8, out: []u8) !ServerHa
 
 test "full 1-RTT: ALPN, app data both ways, kTLS export, clean close" {
     var harness: Harness = undefined;
-    try harness.init("http/1.1");
+    try harness.init(&.{"http/1.1"});
     defer harness.deinit();
     var client = Client.init(&client_x25519_private, &.{
         .session_id = &@as([32]u8, @splat(0xab)),
@@ -143,7 +143,7 @@ test "full 1-RTT: ALPN, app data both ways, kTLS export, clean close" {
 
 test "a ClientHello fragmented across three records reassembles" {
     var harness: Harness = undefined;
-    try harness.init(null);
+    try harness.init(&.{});
     defer harness.deinit();
     var client = Client.init(&client_x25519_private, &.{});
     defer client.deinit();
@@ -187,7 +187,7 @@ test "a ClientHello fragmented across three records reassembles" {
 
 test "HelloRetryRequest: no usable share, retry, complete" {
     var harness: Harness = undefined;
-    try harness.init(null);
+    try harness.init(&.{});
     defer harness.deinit();
     var client = Client.init(&client_x25519_private, &.{
         .offer_x25519_share = false,
@@ -222,7 +222,7 @@ test "failure paths fail closed" {
     // No common cipher suite: an offer of one TLS 1.2 suite only.
     {
         var harness: Harness = undefined;
-        try harness.init(null);
+        try harness.init(&.{});
         defer harness.deinit();
         var client = Client.init(&client_x25519_private, &.{ .suites_wire = &.{ 0xc0, 0x2f } });
         defer client.deinit();
@@ -234,7 +234,7 @@ test "failure paths fail closed" {
     // ALPN offered with no overlap is fatal (RFC 7301 §3.2).
     {
         var harness: Harness = undefined;
-        try harness.init("http/1.1");
+        try harness.init(&.{"http/1.1"});
         defer harness.deinit();
         var client = Client.init(&client_x25519_private, &.{ .alpn = "h2" });
         defer client.deinit();
@@ -242,10 +242,27 @@ test "failure paths fail closed" {
         try testing.expectError(error.NoApplicationProtocol, harness.server.handleRecord(hello, &server_out));
     }
 
+    // An offer past the old selection loop's private stop at sixteen.
+    // The hello parser admits `alpn_entries_max` names and the selection
+    // now walks that same bound, so a protocol at position twenty is
+    // found rather than refused as a malformed extension — which it used
+    // to be, and only by a server that had ALPN configured at all.
+    {
+        var harness: Harness = undefined;
+        try harness.init(&.{"http/1.1"});
+        defer harness.deinit();
+        var client = Client.init(&client_x25519_private, &.{ .alpn = "http/1.1", .alpn_decoys = 19 });
+        defer client.deinit();
+        const hello = client.helloRecord(&client_out);
+        const flight = (try harness.server.handleRecord(hello, &server_out)).?;
+        try testing.expectEqual(std.meta.activeTag(flight), .send);
+        try testing.expectEqualSlices(u8, "http/1.1", harness.server.alpnSelected().?);
+    }
+
     // A tampered client Finished dies as an AEAD failure, pre-verification.
     {
         var harness: Harness = undefined;
-        try harness.init(null);
+        try harness.init(&.{});
         defer harness.deinit();
         var client = Client.init(&client_x25519_private, &.{ .send_change_cipher_spec = false });
         defer client.deinit();
@@ -266,7 +283,7 @@ test "failure paths fail closed" {
     // handshake, not a renegotiation.
     {
         var harness: Harness = undefined;
-        try harness.init(null);
+        try harness.init(&.{});
         defer harness.deinit();
         var client = Client.init(&client_x25519_private, &.{});
         defer client.deinit();
@@ -289,7 +306,7 @@ test "the server negotiates whichever group the client offers a share for" {
     // Finished — not merely that the ECDH agrees.
     for ([_]backend.Group{ .secp256r1, .secp384r1 }) |group| {
         var harness: Harness = undefined;
-        try harness.init(null);
+        try harness.init(&.{});
         defer harness.deinit();
         var client = Client.init(&client_x25519_private, &.{ .group = group });
         defer client.deinit();
@@ -314,7 +331,7 @@ test "the server negotiates whichever group the client offers a share for" {
 
 test "a share whose point is not on the curve is refused, not negotiated" {
     var harness: Harness = undefined;
-    try harness.init(null);
+    try harness.init(&.{});
     defer harness.deinit();
     // A P-256 group with a garbage point: the length is right, so the
     // parser admits it and the refusal has to come from the key
@@ -348,7 +365,7 @@ test "§9.2: an omitted key_share is missing_extension, an empty one is a retry"
 
     {
         var harness: Harness = undefined;
-        try harness.init(null);
+        try harness.init(&.{});
         defer harness.deinit();
         var client = Client.init(&client_x25519_private, &.{ .omit_key_share = true });
         defer client.deinit();
@@ -362,7 +379,7 @@ test "§9.2: an omitted key_share is missing_extension, an empty one is a retry"
     // not hold is the §4.2.8 case, and must still earn a retry.
     {
         var harness: Harness = undefined;
-        try harness.init(null);
+        try harness.init(&.{});
         defer harness.deinit();
         var client = Client.init(&client_x25519_private, &.{
             .offer_x25519_share = false,
@@ -390,7 +407,7 @@ test "§4.2.9 and §4.6.1: psk_key_exchange_modes gates both the offer and the t
     // behind a working connection.
     {
         var harness: Harness = undefined;
-        try harness.init(null);
+        try harness.init(&.{});
         defer harness.deinit();
         var ticket: test_client.Ticket = .{
             .lifetime_s = 3600,
@@ -429,7 +446,7 @@ test "§4.2.9 and §4.6.1: psk_key_exchange_modes gates both the offer and the t
     // about, and that is a legitimate client.
     {
         var harness: Harness = undefined;
-        try harness.init(null);
+        try harness.init(&.{});
         defer harness.deinit();
         var client = Client.init(&client_x25519_private, &.{ .psk_mode_byte = 0x1a });
         defer client.deinit();
@@ -444,7 +461,7 @@ test "§4.2.9 and §4.6.1: psk_key_exchange_modes gates both the offer and the t
         // there is nothing the ticket can contradict.
         {
             var permissive: Harness = undefined;
-            try permissive.init(null);
+            try permissive.init(&.{});
             defer permissive.deinit();
             var bare = Client.init(&client_x25519_private, &.{ .omit_psk_modes = true });
             defer bare.deinit();
@@ -491,7 +508,7 @@ test "§4.2.10: early data we declined is skipped, and the handshake completes" 
     var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
     var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
     var harness: Harness = undefined;
-    try harness.init(null);
+    try harness.init(&.{});
     defer harness.deinit();
     var client = Client.init(&client_x25519_private, &.{ .offer_early_data = true });
     defer client.deinit();
@@ -530,7 +547,7 @@ test "§4.2.10: more skipped early data than the ceiling ends the connection" {
     var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
     var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
     var harness: Harness = undefined;
-    try harness.init(null);
+    try harness.init(&.{});
     defer harness.deinit();
     var client = Client.init(&client_x25519_private, &.{ .offer_early_data = true });
     defer client.deinit();
@@ -562,7 +579,7 @@ test "§4.2.10: an empty early-data record spends the budget too" {
     var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
     var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
     var harness: Harness = undefined;
-    try harness.init(null);
+    try harness.init(&.{});
     defer harness.deinit();
     var client = Client.init(&client_x25519_private, &.{ .offer_early_data = true });
     defer client.deinit();
@@ -597,7 +614,7 @@ test "§4.2.10: early_data carries no body in a ClientHello, and none on a retry
     // though we decline everything it offers.
     {
         var harness: Harness = undefined;
-        try harness.init(null);
+        try harness.init(&.{});
         defer harness.deinit();
         var client = Client.init(&client_x25519_private, &.{
             .offer_early_data = true,
@@ -616,7 +633,7 @@ test "§4.2.10: early_data carries no body in a ClientHello, and none on a retry
     // may not answer.
     {
         var harness: Harness = undefined;
-        try harness.init(null);
+        try harness.init(&.{});
         defer harness.deinit();
         var client = Client.init(&client_x25519_private, &.{
             .offer_x25519_share = false,
@@ -644,7 +661,7 @@ test "§4.3.2: the server asks for a certificate, and §4.4.2.1 decides what a r
     };
     for (cases) |case| {
         var harness: Harness = undefined;
-        try harness.initWith("http/1.1", .{ .require = case.require });
+        try harness.initWith(&.{"http/1.1"}, .{ .require = case.require });
         defer harness.deinit();
 
         var client = Client.init(&client_x25519_private, &.{ .alpn = "http/1.1" });
@@ -684,7 +701,7 @@ test "§4.3.2: no CertificateRequest unless the embedder asked for one" {
     // never configured for mTLS sends nothing extra and our client never
     // sees a request.
     var harness: Harness = undefined;
-    try harness.init("http/1.1");
+    try harness.init(&.{"http/1.1"});
     defer harness.deinit();
 
     var client = Client.init(&client_x25519_private, &.{ .alpn = "http/1.1" });
@@ -712,7 +729,7 @@ test "§4.4: one CertificateVerify per flight, and the count is not the peer's" 
     var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
 
     var harness: Harness = undefined;
-    try harness.initWith("http/1.1", .{
+    try harness.initWith(&.{"http/1.1"}, .{
         .require = false,
         .policy = .insecure_no_verification,
     });

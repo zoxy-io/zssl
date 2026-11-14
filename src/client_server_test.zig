@@ -76,8 +76,9 @@ const Harness = struct {
     const Options = struct {
         store: ?*TicketStore = null,
         resume_session: ?ClientHandshake.Resumption = null,
-        /// What the server selects, or null to select nothing.
-        server_alpn: ?[]const u8 = "http/1.1",
+        /// What the server will select from, most preferred first;
+        /// empty to select nothing.
+        server_alpn: []const []const u8 = &.{"http/1.1"},
         client_alpn: []const []const u8 = &.{"http/1.1"},
         certificate_policy: ClientHandshake.CertificatePolicy = .leaf_signature,
         chain_verifier: ?ClientHandshake.ChainVerifier = null,
@@ -134,7 +135,7 @@ const Harness = struct {
             .credentials = &harness.credentials,
             .server_random = @splat(0x6d),
             .key_share_private = server_key_share_private,
-            .alpn = options.server_alpn,
+            .alpn_protocols = options.server_alpn,
             .groups = options.server_groups,
             .signing_schemes = options.server_signing_schemes,
             .client_auth = options.client_auth,
@@ -1013,7 +1014,7 @@ test "ALPN: the client reports which of its offers the server took" {
     // simply echoed its own preference would fail this.
     try harness.init(.{
         .client_alpn = &.{ "h2", "http/1.1" },
-        .server_alpn = "http/1.1",
+        .server_alpn = &.{"http/1.1"},
     });
     defer harness.deinit();
     try harness.connect(&buffers);
@@ -1029,7 +1030,7 @@ test "ALPN: a protocol the client never offered is refused" {
     // embedder a protocol it never agreed to speak.
     var buffers: Buffers = .{};
     var harness: Harness = undefined;
-    try harness.init(.{ .client_alpn = &.{"h2"}, .server_alpn = "h2" });
+    try harness.init(.{ .client_alpn = &.{"h2"}, .server_alpn = &.{"h2"} });
     defer harness.deinit();
 
     const hello = harness.client.start(&buffers.client_out);
@@ -1058,10 +1059,54 @@ test "ALPN: a protocol the client never offered is refused" {
     try testing.expectEqual(@as(?[]const u8, null), harness.client.alpnSelected());
 }
 
+test "ALPN: the server's preference wins, whatever order the client offers" {
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    // The client lists `http/1.1` first. RFC 7301 §3.2 gives the choice
+    // to the server, so a server that took the client's first match
+    // would answer `http/1.1` and fail this.
+    try harness.init(.{
+        .client_alpn = &.{ "http/1.1", "h2" },
+        .server_alpn = &.{ "h2", "http/1.1" },
+    });
+    defer harness.deinit();
+    try harness.connect(&buffers);
+
+    try testing.expectEqualSlices(u8, "h2", harness.server.alpnSelected().?);
+    try testing.expectEqualSlices(u8, "h2", harness.client.alpnSelected().?);
+}
+
+test "ALPN: a client that offers only the server's second choice gets it" {
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{
+        .client_alpn = &.{"http/1.1"},
+        .server_alpn = &.{ "h2", "http/1.1" },
+    });
+    defer harness.deinit();
+    try harness.connect(&buffers);
+
+    try testing.expectEqualSlices(u8, "http/1.1", harness.server.alpnSelected().?);
+    try testing.expectEqualSlices(u8, "http/1.1", harness.client.alpnSelected().?);
+}
+
+test "ALPN: a client that offers nothing gets nothing, whatever the server speaks" {
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{ .client_alpn = &.{}, .server_alpn = &.{ "h2", "http/1.1" } });
+    defer harness.deinit();
+    try harness.connect(&buffers);
+
+    // §3.2 answers an offer; with none there is nothing to answer and no
+    // extension goes back, so neither side may report a protocol.
+    try testing.expectEqual(@as(?[]const u8, null), harness.server.alpnSelected());
+    try testing.expectEqual(@as(?[]const u8, null), harness.client.alpnSelected());
+}
+
 test "ALPN: a server that selects nothing leaves the choice unmade" {
     var buffers: Buffers = .{};
     var harness: Harness = undefined;
-    try harness.init(.{ .client_alpn = &.{ "h2", "http/1.1" }, .server_alpn = null });
+    try harness.init(.{ .client_alpn = &.{ "h2", "http/1.1" }, .server_alpn = &.{} });
     defer harness.deinit();
     try harness.connect(&buffers);
 
@@ -1484,7 +1529,7 @@ test "§4.2: EncryptedExtensions may carry only what we offered, where it is leg
     for (shapes) |shape| {
         var buffers: Buffers = .{};
         var harness: Harness = undefined;
-        try harness.init(.{ .client_alpn = shape.alpn, .server_alpn = null });
+        try harness.init(.{ .client_alpn = shape.alpn, .server_alpn = &.{} });
         defer harness.deinit();
         harness.client.config.server_name = shape.server_name;
 

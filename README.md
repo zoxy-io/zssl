@@ -115,7 +115,7 @@ var server = zssl.ServerHandshake.init(&.{
     .server_random = entropy[0..32].*,
     // 48 bytes: enough scalar for the largest group zssl offers.
     .key_share_private = entropy[32..80].*,
-    .alpn = "http/1.1",
+    .alpn_protocols = &.{"http/1.1"},
     .reassembly = &reassembly,
     .flight = &flight,
 });
@@ -202,6 +202,14 @@ stream: while (try records.next()) |wire_record| {
 reports what the server took, or null if it took nothing — an answer
 rather than an error, because a server that ignores an `h2` offer is
 something a client should report, not die on.
+
+The server's `alpn_protocols` is a preference order too, and RFC 7301
+§3.2 makes it the one that counts: the first of the server's names the
+client also offered wins, whatever order the client listed them in, and
+`server.alpnSelected()` says which. An offer with no overlap is
+`error.NoApplicationProtocol`; zssl returns it and leaves the alert to
+you (`sendAlert(.no_application_protocol, ...)`), as it does every
+alert.
 
 Certificate handling is split in two, on purpose.
 

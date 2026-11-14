@@ -564,6 +564,12 @@ const TicketStore = struct {
     /// The suite the ticket was issued under. §4.2.10 wants the resumed
     /// connection to negotiate the same one before early data is read.
     suite: cipher_suite.CipherSuite = .aes_128_gcm_sha256,
+    /// And the protocol, by the same sentence. Copied rather than
+    /// borrowed: the selection points into this exchange's flags, and
+    /// `-on-resume-select-alpn` gives the next exchange different ones —
+    /// which is exactly the case §4.2.10's check exists for.
+    alpn: [alpn_protocol_bytes_max]u8 = undefined,
+    alpn_bytes: ?u8 = null,
     /// The scheme the peer signed with when this session was first
     /// established. A resumed TLS 1.3 handshake carries no
     /// CertificateVerify, so the library reports null for it — the
@@ -601,10 +607,11 @@ const TicketStore = struct {
                 .age_add = self.age_add,
                 .lifetime_s = ticket_lifetime_s,
             },
-            .early_data = if (self.early_data_bytes_max) |bytes_max|
-                .{ .bytes_max = bytes_max, .suite = self.suite }
-            else
-                null,
+            .early_data = if (self.early_data_bytes_max) |bytes_max| .{
+                .bytes_max = bytes_max,
+                .suite = self.suite,
+                .alpn = if (self.alpn_bytes) |bytes| self.alpn[0..bytes] else null,
+            } else null,
         };
     }
 };
@@ -733,6 +740,11 @@ fn issueTicket(
         store.identity_bytes = ticket_identity.len;
         store.issued_at_ms = nowMs(io);
         store.suite = server.cipherSuite();
+        store.alpn_bytes = null;
+        if (server.alpnSelected()) |protocol| {
+            @memcpy(store.alpn[0..protocol.len], protocol);
+            store.alpn_bytes = @intCast(protocol.len);
+        }
         store.early_data_bytes_max =
             if (connection.enable_early_data) early_data_bytes_max else null;
         const sealed = server.sendNewSessionTicket(&.{
@@ -800,7 +812,7 @@ fn runServer(
         .credentials = &credentials,
         .server_random = entropy[0..32].*,
         .key_share_private = entropy[32..80].*,
-        .alpn = connection.select_alpn,
+        .alpn_protocols = if (connection.select_alpn) |*protocol| protocol[0..1] else &.{},
         .groups = groups,
         .signing_schemes = signing_schemes,
         // Identity stays unconfigured on purpose: BoGo's client

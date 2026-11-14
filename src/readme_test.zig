@@ -63,7 +63,7 @@ test "README: terminating TLS" {
         .credentials = &credentials,
         .server_random = entropy[0..32].*,
         .key_share_private = entropy[32..80].*,
-        .alpn = "http/1.1",
+        .alpn_protocols = &.{"http/1.1"},
         .reassembly = &reassembly,
         .flight = &flight,
     });
