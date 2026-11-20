@@ -16,6 +16,7 @@ same pair, kept in step by hand. The rest are zssl's own.
 | `cert.pem`, `key.pem` | P-256 leaf, `ecdsa-with-SHA256` | most of the suite; interop leg 1; the tlsfuzzer gate's ECDSA leaf |
 | `p384-cert.pem`, `p384-key.pem` | P-384 leaf, `ecdsa-with-SHA384` | interop leg 2, and the `client_server_test` that exercises `ecdsa_secp384r1_sha384` |
 | `rsa2048-cert.pem`, `rsa2048-key.pem` | RSA-2048 leaf | the RSA signing path; the tlsfuzzer gate's RSA leaf |
+| `rsa3065-cert.pem`, `rsa3065-key.pem` | RSA leaf, exactly 3065 bits, three primes | proving a modulus of 8k+1 bits is refused rather than asserted on (#23), from either side |
 | `rsa1024-key.pem` | RSA-1024 key, no certificate | proving `rsa_bits_min` is a load-time refusal |
 | `rsa512-leaf.der` | RSA-512 leaf, DER | proving the client refuses a modulus below the floor |
 
@@ -45,6 +46,15 @@ openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
 openssl req -new -x509 -key rsa2048-key.pem -subj "/CN=spike.zoxy.test" \
   -addext "subjectAltName=DNS:spike.zoxy.test" -days 3650 \
   -out rsa2048-cert.pem
+
+# RSA, 3065 bits. Three primes because openssl's two-prime keygen lands
+# on 3064 when asked for 3065; check `openssl pkey -text` says 3065, or
+# the tests it serves stop testing anything.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3065 \
+  -pkeyopt rsa_keygen_primes:3 -out rsa3065-key.pem
+openssl req -new -x509 -key rsa3065-key.pem -subj "/CN=spike.zoxy.test" \
+  -addext "subjectAltName=DNS:spike.zoxy.test" -days 3650 -sha256 \
+  -out rsa3065-cert.pem
 ```
 
 The two undersized RSA fixtures exist to be refused and have no reason
