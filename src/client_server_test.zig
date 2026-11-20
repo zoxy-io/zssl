@@ -84,7 +84,7 @@ const Harness = struct {
         chain_verifier: ?ClientHandshake.ChainVerifier = null,
         /// The leaf the server presents. RSA draws a fresh PSS salt per
         /// signature, so it cannot run with deterministic nonces.
-        leaf: enum { ecdsa_p256, ecdsa_p384, rsa_2048 } = .ecdsa_p256,
+        leaf: enum { ecdsa_p256, ecdsa_p384, rsa_2048, rsa_3065 } = .ecdsa_p256,
         /// The client's second key-exchange scalar, and the switch that
         /// lets it answer a HelloRetryRequest at all.
         retry_private: ?[backend.group_private_bytes_max]u8 = null,
@@ -127,6 +127,12 @@ const Harness = struct {
             .rsa_2048 => try Credentials.load(
                 @embedFile("testdata/rsa2048-cert.pem"),
                 @embedFile("testdata/rsa2048-key.pem"),
+                &harness.chain_storage,
+                false,
+            ),
+            .rsa_3065 => try Credentials.load(
+                @embedFile("testdata/rsa3065-cert.pem"),
+                @embedFile("testdata/rsa3065-key.pem"),
                 &harness.chain_storage,
                 false,
             ),
@@ -1237,6 +1243,45 @@ test "an RSA leaf signs the server's CertificateVerify and our client accepts it
     const ping = try harness.client.sendApplicationData("rsa", &buffers.client_out);
     const event = (try harness.server.handleRecord(ping, &buffers.server_out)).?;
     try testing.expectEqualSlices(u8, "rsa", event.application_data);
+}
+
+test "§4.4.3: a server whose RSA modulus is 8k+1 bits is refused, not asserted on (#23)" {
+    // A 3065-bit modulus is 384 bytes wide, one of the four widths
+    // `verifyRsaPss` takes, but RFC 8017 §8.1.2's emLen for it is 383.
+    // `std.crypto`'s PSS verifier asserts the two are equal, so a genuine
+    // signature over this key used to panic the client. libcrypto signs
+    // with it happily: this is a real server, not a forged flight.
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{ .leaf = .rsa_3065 });
+    defer harness.deinit();
+    try testing.expectError(error.BadCertificate, harness.connect(&buffers));
+    try testing.expectEqual(ClientHandshake.State.failed, harness.client.state);
+    try testing.expect(!harness.client.peer.verified);
+}
+
+test "§4.4.3: a client whose RSA modulus is 8k+1 bits is refused, not asserted on (#23)" {
+    // The same verifier on the other side. An mTLS client chooses its
+    // key, so this is the direction an embedder's own users reach.
+    var chain_storage: [Credentials.chain_bytes_max]u8 = undefined;
+    var client_credentials = try Credentials.load(
+        @embedFile("testdata/rsa3065-cert.pem"),
+        @embedFile("testdata/rsa3065-key.pem"),
+        &chain_storage,
+        false,
+    );
+    defer client_credentials.deinit();
+
+    var buffers: Buffers = .{};
+    var harness: Harness = undefined;
+    try harness.init(.{
+        .client_auth = .{ .require = true },
+        .client_credentials = &client_credentials,
+    });
+    defer harness.deinit();
+    try testing.expectError(error.BadCertificate, harness.connect(&buffers));
+    try testing.expectEqual(ServerHandshake.State.failed, harness.server.state);
+    try testing.expect(!harness.server.peer.verified);
 }
 
 test "a P-384 leaf signs with ecdsa_secp384r1_sha384 and our client accepts it" {

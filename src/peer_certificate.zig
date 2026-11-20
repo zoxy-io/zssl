@@ -318,7 +318,8 @@ fn verifyEcdsa(
 /// `public_key` is the leaf's DER `RSAPublicKey`. The modulus lengths are
 /// the four `std.crypto.Certificate.rsa` supports, 1024 through 4096
 /// bits; anything else is a certificate we cannot check rather than a
-/// signature that failed, hence `BadCertificate`.
+/// signature that failed, hence `BadCertificate`. So is a modulus of
+/// 8k+1 bits inside those widths, which std asserts on (#23).
 fn verifyRsaPss(comptime Hash: type, public_key: []const u8, content: []const u8, signature: []const u8) Error!void {
     assert(content.len >= 98);
     const rsa = std.crypto.Certificate.rsa;
@@ -331,6 +332,17 @@ fn verifyRsaPss(comptime Hash: type, public_key: []const u8, content: []const u8
             if (signature.len != modulus_bytes) return error.BadSignature;
             const key = rsa.PublicKey.fromBytes(components.exponent, components.modulus) catch
                 return error.BadCertificate;
+            // `fromBytes` refuses a modulus below 512 bits, so the
+            // subtractions below cannot wrap.
+            assert(key.n.bits() >= 512);
+            // RFC 8017 §8.1.2: the encoded message is emBits = modBits - 1
+            // bits, so it is a byte narrower than the modulus when modBits
+            // is 8k+1 — a 3065-bit key in a 384-byte width. `verify`
+            // asserts it is not, so the peer's key would reach an
+            // assertion. This is std's own arithmetic, checked first.
+            const em_bits = key.n.bits() - 1;
+            const em_bytes = ((em_bits - 1) / 8) + 1;
+            if (em_bytes != modulus_bytes) return error.BadCertificate;
             const sig = rsa.PSSSignature.fromBytes(modulus_bytes, signature);
             rsa.PSSSignature.verify(modulus_bytes, &sig, content, key, Hash) catch
                 return error.BadSignature;
