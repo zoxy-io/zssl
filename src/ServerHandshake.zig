@@ -2449,6 +2449,9 @@ fn handleQuicMessage(self: *ServerHandshake, message: handshake.Message, out: []
         },
         .handshake => switch (self.ladder.?) {
             inline else => |*arm| {
+                // The Finished arm refuses bytes behind it, so the flight
+                // cannot outlive it; asked again so that it is stated.
+                if (!self.awaitingClientFlight()) return error.UnexpectedMessage;
                 const event = (try self.clientFlightMessage(arm, message)) orelse return null;
                 assert(event == .connected);
                 self.quic_progress.pending = &quic_after_client_finished;

@@ -296,7 +296,7 @@ test "fuzz: ServerHandshake — arbitrary records error, never panic" {
 /// fragmentation, any order. The property is the TCP one: error, then
 /// `failed`, and never a panic.
 fn feedCrypto(machine: anytype, input: []const u8) void {
-    var out: [ServerHandshake.quic_out_bytes_min]u8 = undefined;
+    var out: [@max(ServerHandshake.quic_out_bytes_min, ClientHandshake.quic_out_bytes_min)]u8 = undefined;
     const levels = [_]quic.Level{ .initial, .handshake, .application };
     var offset: usize = 0;
     var chunks: u16 = 0;
@@ -376,6 +376,35 @@ test "fuzz: ServerHandshake QUIC mode — arbitrary CRYPTO bytes error, never pa
         "\x00\x04\x01\x00\x00\xc4",
         "\x01\x04\x14\x00\x00\x20",
         "\x02\x05\x18\x00\x00\x01\x00",
+    } });
+}
+
+fn fuzzQuicClientMachine(input: []const u8) !void {
+    var reassembly: [16384]u8 = undefined;
+    var client = ClientHandshake.init(&.{
+        .client_random = @splat(0x1a),
+        .x25519_private = @splat(0x31),
+        .server_name = "spike.zoxy.test",
+        .alpn_protocols = &.{"h3"},
+        .certificate_policy = .leaf_signature,
+        .reassembly = &reassembly,
+        .quic = .{ .transport_parameters = "\x04\x02\x40\x80" },
+    });
+    defer client.deinit();
+    _ = client.startCrypto();
+    feedCrypto(&client, input);
+}
+
+/// RFC 8448's ServerHello as one chunk at Initial. Its session-ID echo is
+/// empty, as a QUIC client's must be, and its x25519 share agrees with
+/// any scalar, so the seed carries the client into its Handshake level.
+const quic_server_hello_seed = [_]u8{ 0x00, vectors.server_hello.len } ++ vectors.server_hello;
+
+test "fuzz: ClientHandshake QUIC mode — arbitrary CRYPTO bytes error, never panic" {
+    try std.testing.fuzz({}, adapt(fuzzQuicClientMachine, 8192), .{ .corpus = &.{
+        &quic_server_hello_seed,
+        "\x01\x06\x08\x00\x00\x02\x00\x00",
+        "\x02\x05\x18\x00\x00\x01\x01",
     } });
 }
 

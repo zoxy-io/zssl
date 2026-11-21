@@ -45,6 +45,8 @@ const ServerHarness = struct {
     const Options = struct {
         alpn: []const []const u8 = &.{"h3"},
         groups: []const u16 = &client_hello.groups_supported,
+        client_auth: ?ServerHandshake.ClientAuth = null,
+        psk_lookup: ?ServerHandshake.PskLookup = null,
     };
 
     fn init(harness: *ServerHarness, options: Options) !void {
@@ -60,6 +62,8 @@ const ServerHarness = struct {
             .key_share_private = server_key_share_private,
             .alpn_protocols = options.alpn,
             .groups = options.groups,
+            .client_auth = options.client_auth,
+            .psk_lookup = options.psk_lookup,
             .reassembly = &harness.reassembly,
             .flight = &harness.flight,
             .quic = .{ .transport_parameters = &server_parameters },
@@ -461,4 +465,482 @@ test "QUIC server: a HelloRetryRequest at Initial, no ChangeCipherSpec, then the
     try finish.feed(&harness, .handshake, &derived.client_finished, 1);
     try testing.expectEqual(std.meta.Tag(ServerHandshake.QuicEvent).connected, finish.kinds[1]);
     try testing.expectEqualSlices(u8, &derived.client_application, finish.bytes[0]);
+}
+
+// ---------------------------------------------------------------------
+// The production client against the production server, both in QUIC mode.
+
+const ClientHandshake = @import("ClientHandshake.zig");
+const CipherSuite = @import("cipher_suite.zig").CipherSuite;
+
+/// One direction's CRYPTO stream at one level, as a transport would hold
+/// it between datagrams.
+const Stream = struct {
+    bytes: [16384]u8 = undefined,
+    used: usize = 0,
+
+    fn append(stream: *Stream, data: []const u8) !void {
+        try testing.expect(stream.used + data.len <= stream.bytes.len);
+        @memcpy(stream.bytes[stream.used..][0..data.len], data);
+        stream.used += data.len;
+    }
+};
+
+/// What one side's transport would have installed, by level and direction.
+const Installed = struct {
+    secrets: [3][2][48]u8 = undefined,
+    lengths: [3][2]u8 = @splat(@splat(0)),
+    parameters: [64]u8 = undefined,
+    parameters_bytes: ?usize = null,
+    connected: bool = false,
+
+    fn install(installed: *Installed, handed: quic.Secret) !void {
+        const level = @backingInt(handed.level);
+        const direction = @backingInt(handed.direction);
+        // Each secret is handed out once.
+        try testing.expectEqual(@as(u8, 0), installed.lengths[level][direction]);
+        try testing.expectEqual(handed.suite.hashBytes(), handed.bytes.len);
+        @memcpy(installed.secrets[level][direction][0..handed.bytes.len], handed.bytes);
+        installed.lengths[level][direction] = @intCast(handed.bytes.len);
+    }
+
+    fn has(installed: *const Installed, level: quic.Level, direction: quic.Direction) bool {
+        return installed.lengths[@backingInt(level)][@backingInt(direction)] != 0;
+    }
+
+    fn secret(installed: *const Installed, level: quic.Level, direction: quic.Direction) []const u8 {
+        const length = installed.lengths[@backingInt(level)][@backingInt(direction)];
+        return installed.secrets[@backingInt(level)][@backingInt(direction)][0..length];
+    }
+
+    fn parametersSeen(installed: *Installed, body: []const u8) !void {
+        try testing.expectEqual(@as(?usize, null), installed.parameters_bytes);
+        @memcpy(installed.parameters[0..body.len], body);
+        installed.parameters_bytes = body.len;
+    }
+};
+
+const Pair = struct {
+    server_side: ServerHarness,
+    client: ClientHandshake,
+    client_reassembly: [16384]u8,
+    client_auth_flight: [Credentials.chain_bytes_max + 1024]u8,
+    client_out: [ClientHandshake.quic_out_bytes_min]u8,
+    to_server: [3]Stream,
+    to_client: [3]Stream,
+    server_installed: Installed,
+    client_installed: Installed,
+    tickets: u8,
+    ticket_storage: [512]u8,
+    ticket: ?ClientHandshake.Ticket,
+
+    const Options = struct {
+        server: ServerHarness.Options = .{},
+        alpn: []const []const u8 = &.{"h3"},
+        retry_private: ?[backend.group_private_bytes_max]u8 = null,
+        resume_session: ?ClientHandshake.Resumption = null,
+        client_credentials: ?*const Credentials = null,
+    };
+
+    fn init(pair: *Pair, options: Options) !void {
+        try pair.server_side.init(options.server);
+        pair.client = ClientHandshake.init(&.{
+            .client_random = @splat(0x1a),
+            .x25519_private = client_x25519_private,
+            .retry_key_share_private = options.retry_private,
+            .server_name = "quic.zssl.test",
+            .alpn_protocols = options.alpn,
+            .certificate_policy = .leaf_signature,
+            .client_credentials = options.client_credentials,
+            .client_auth_flight = &pair.client_auth_flight,
+            .resume_session = options.resume_session,
+            .reassembly = &pair.client_reassembly,
+            .quic = .{ .transport_parameters = &client_parameters },
+        });
+        pair.to_server = @splat(.{});
+        pair.to_client = @splat(.{});
+        pair.server_installed = .{};
+        pair.client_installed = .{};
+        pair.tickets = 0;
+        pair.ticket = null;
+    }
+
+    fn deinit(pair: *Pair) void {
+        pair.client.deinit();
+        pair.server_side.deinit();
+    }
+
+    /// Run the handshake to quiescence, delivering every level's bytes in
+    /// pieces of at most `chunk`. A transport holds no key to read a
+    /// level before the peer's TLS has handed it one, and this holds the
+    /// machines to that: bytes at a level are delivered only once the
+    /// receiving side has installed that level's receive secret.
+    fn run(pair: *Pair, chunk: usize) !void {
+        const hello = pair.client.startCrypto();
+        try testing.expectEqual(quic.Level.initial, hello.level);
+        try pair.to_server[0].append(hello.bytes);
+        var rounds: u8 = 0;
+        while (pair.pending()) : (rounds += 1) {
+            try testing.expect(rounds < 16);
+            for ([_]quic.Level{ .initial, .handshake, .application }) |level| {
+                try pair.deliverToServer(level, chunk);
+                try pair.deliverToClient(level, chunk);
+            }
+        }
+    }
+
+    fn pending(pair: *const Pair) bool {
+        for (pair.to_server, pair.to_client) |server_stream, client_stream| {
+            if (server_stream.used != 0 or client_stream.used != 0) return true;
+        }
+        return false;
+    }
+
+    fn deliverToServer(pair: *Pair, level: quic.Level, chunk: usize) !void {
+        const stream = &pair.to_server[@backingInt(level)];
+        if (stream.used == 0) return;
+        if (level != .initial) try testing.expect(pair.server_installed.has(level, .receive));
+        var offset: usize = 0;
+        while (offset < stream.used) {
+            const end = @min(offset + chunk, stream.used);
+            const server = &pair.server_side.server;
+            var event = try server.handleCrypto(level, stream.bytes[offset..end], &pair.server_side.out);
+            while (event) |ready| : (event = try server.drainCrypto(&pair.server_side.out)) {
+                switch (ready) {
+                    .crypto => |crypto| try pair.to_client[@backingInt(crypto.level)].append(crypto.bytes),
+                    .secret => |handed| try pair.server_installed.install(handed),
+                    .transport_parameters => |body| try pair.server_installed.parametersSeen(body),
+                    .connected => pair.server_installed.connected = true,
+                }
+            }
+            offset = end;
+        }
+        stream.used = 0;
+    }
+
+    fn deliverToClient(pair: *Pair, level: quic.Level, chunk: usize) !void {
+        const stream = &pair.to_client[@backingInt(level)];
+        if (stream.used == 0) return;
+        if (level != .initial) try testing.expect(pair.client_installed.has(level, .receive));
+        var offset: usize = 0;
+        while (offset < stream.used) {
+            const end = @min(offset + chunk, stream.used);
+            var event = try pair.client.handleCrypto(level, stream.bytes[offset..end], &pair.client_out);
+            while (event) |ready| : (event = try pair.client.drainCrypto(&pair.client_out)) {
+                switch (ready) {
+                    .crypto => |crypto| try pair.to_server[@backingInt(crypto.level)].append(crypto.bytes),
+                    .secret => |handed| try pair.client_installed.install(handed),
+                    .transport_parameters => |body| try pair.client_installed.parametersSeen(body),
+                    .connected => pair.client_installed.connected = true,
+                    .ticket => |ticket| try pair.keepTicket(ticket),
+                }
+            }
+            offset = end;
+        }
+        stream.used = 0;
+    }
+
+    fn keepTicket(pair: *Pair, ticket: ClientHandshake.Ticket) !void {
+        pair.tickets += 1;
+        try testing.expect(ticket.ticket.len + ticket.nonce.len <= pair.ticket_storage.len);
+        @memcpy(pair.ticket_storage[0..ticket.ticket.len], ticket.ticket);
+        @memcpy(pair.ticket_storage[ticket.ticket.len..][0..ticket.nonce.len], ticket.nonce);
+        var kept = ticket;
+        kept.ticket = pair.ticket_storage[0..ticket.ticket.len];
+        kept.nonce = pair.ticket_storage[ticket.ticket.len..][0..ticket.nonce.len];
+        pair.ticket = kept;
+    }
+
+    /// Both sides complete, every secret one side sends with is the one
+    /// the other receives with, and each saw the other's parameters.
+    fn expectAgreement(pair: *const Pair) !void {
+        try testing.expect(pair.client_installed.connected);
+        try testing.expect(pair.server_installed.connected);
+        try testing.expectEqual(ServerHandshake.State.connected, pair.server_side.server.state);
+        try testing.expectEqual(ClientHandshake.State.connected, pair.client.state);
+        for ([_]quic.Level{ .handshake, .application }) |level| {
+            const client_send = pair.client_installed.secret(level, .send);
+            try testing.expect(client_send.len == 32 or client_send.len == 48);
+            try testing.expectEqualSlices(u8, client_send, pair.server_installed.secret(level, .receive));
+            try testing.expectEqualSlices(u8, pair.server_installed.secret(level, .send), pair.client_installed.secret(level, .receive));
+            try testing.expect(!std.mem.eql(u8, client_send, pair.client_installed.secret(level, .receive)));
+        }
+        try testing.expectEqualSlices(u8, &client_parameters, pair.server_installed.parameters[0..pair.server_installed.parameters_bytes.?]);
+        try testing.expectEqualSlices(u8, &server_parameters, pair.client_installed.parameters[0..pair.client_installed.parameters_bytes.?]);
+        try testing.expectEqualSlices(u8, "h3", pair.client.alpnSelected().?);
+        try testing.expectEqualSlices(u8, "h3", pair.server_side.server.alpnSelected().?);
+    }
+
+    /// The server issues one ticket at the application level and the
+    /// client reads it there; both derive the same PSK from it.
+    fn exchangeTicket(pair: *Pair, nonce: []const u8) !void {
+        const ticket = try pair.server_side.server.sendNewSessionTicket(&.{
+            .lifetime_s = 3600,
+            .age_add = 0x01020304,
+            .ticket_nonce = nonce,
+            .ticket = "quic-ticket",
+        }, &pair.server_side.out);
+        try pair.to_client[@backingInt(quic.Level.application)].append(ticket);
+        try pair.deliverToClient(.application, 5);
+        try testing.expectEqual(@as(u8, 1), pair.tickets);
+        try testing.expectEqualSlices(u8, "quic-ticket", pair.ticket.?.ticket);
+        try testing.expectEqual(@as(?u32, null), pair.ticket.?.early_data_bytes_max);
+        var server_psk: [48]u8 = undefined;
+        var client_psk: [48]u8 = undefined;
+        try testing.expectEqualSlices(
+            u8,
+            pair.server_side.server.resumptionPsk(nonce, &server_psk),
+            pair.client.resumptionPsk(nonce, &client_psk),
+        );
+    }
+};
+
+test "QUIC end to end: every level fragmented every way, secrets and parameters agree" {
+    for ([_]usize{ 1, 7, 64, 1000, std.math.maxInt(u16) }) |chunk| {
+        var pair: Pair = undefined;
+        try pair.init(.{});
+        defer pair.deinit();
+        pair.run(chunk) catch |err| {
+            std.debug.print("chunk {d} failed\n", .{chunk});
+            return err;
+        };
+        try pair.expectAgreement();
+        try testing.expect(!pair.client.resumed);
+        try testing.expect(pair.client.peer.verified);
+        try pair.exchangeTicket(&.{ 0x00, 0x01 });
+    }
+}
+
+test "QUIC end to end: a HelloRetryRequest is answered at Initial and the retry completes" {
+    var pair: Pair = undefined;
+    try pair.init(.{
+        .server = .{ .groups = &.{client_hello.group_secp256r1} },
+        .retry_private = @as([31]u8, @splat(0x52)) ++ [_]u8{0x01} ++ @as([16]u8, @splat(0)),
+    });
+    defer pair.deinit();
+    try pair.run(100);
+    try pair.expectAgreement();
+    try testing.expect(pair.client.retried);
+}
+
+const QuicTicketStore = struct {
+    psk: [32]u8,
+
+    fn lookup(
+        context: *anyopaque,
+        identity: []const u8,
+        obfuscated_age: u32,
+        psk_out: *[48]u8,
+    ) ?ServerHandshake.Psk {
+        _ = obfuscated_age;
+        const store: *QuicTicketStore = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, identity, "quic-ticket")) return null;
+        psk_out[0..32].* = store.psk;
+        return .{ .psk_bytes = 32, .kind = .resumption };
+    }
+};
+
+test "QUIC end to end: a ticket issued at the application level resumes the next connection" {
+    var store: QuicTicketStore = undefined;
+    var resumption: ClientHandshake.Resumption = undefined;
+    {
+        var pair: Pair = undefined;
+        try pair.init(.{});
+        defer pair.deinit();
+        try pair.run(std.math.maxInt(u16));
+        try pair.expectAgreement();
+        const nonce = [_]u8{0x09};
+        try pair.exchangeTicket(&nonce);
+        var psk: [48]u8 = undefined;
+        @memcpy(&store.psk, pair.client.resumptionPsk(&nonce, &psk));
+        resumption = .{
+            .identity = "quic-ticket",
+            .obfuscated_age = 1000 +% pair.ticket.?.age_add,
+            .psk = psk,
+            .psk_bytes = 32,
+        };
+    }
+    var pair: Pair = undefined;
+    try pair.init(.{
+        .server = .{ .psk_lookup = .{ .context = &store, .lookup = QuicTicketStore.lookup } },
+        .resume_session = resumption,
+    });
+    defer pair.deinit();
+    try pair.run(33);
+    try pair.expectAgreement();
+    try testing.expect(pair.client.resumed);
+    try testing.expect(pair.server_side.server.resumed);
+}
+
+test "QUIC end to end: client certificates are asked for and proven, as over TCP" {
+    var chain_storage: [Credentials.chain_bytes_max]u8 = undefined;
+    var client_credentials = try Credentials.load(
+        @embedFile("testdata/p384-cert.pem"),
+        @embedFile("testdata/p384-key.pem"),
+        &chain_storage,
+        true,
+    );
+    defer client_credentials.deinit();
+    var pair: Pair = undefined;
+    try pair.init(.{
+        .server = .{ .client_auth = .{ .require = true } },
+        .client_credentials = &client_credentials,
+    });
+    defer pair.deinit();
+    try pair.run(50);
+    try pair.expectAgreement();
+    try testing.expect(pair.server_side.server.peer.verified);
+}
+
+test "QUIC end to end: no overlap in ALPN is no_application_protocol, 0x0178" {
+    var pair: Pair = undefined;
+    try pair.init(.{ .server = .{ .alpn = &.{"hq-interop"} } });
+    defer pair.deinit();
+    try testing.expectError(error.NoApplicationProtocol, pair.run(1000));
+    try testing.expectEqual(ServerHandshake.State.failed, pair.server_side.server.state);
+    try testing.expectEqual(@as(u64, 0x0178), quic.errorCode(error.NoApplicationProtocol));
+}
+
+/// The client after a real ServerHello, so its Handshake keys exist and
+/// the test can hand it an EncryptedExtensions of its own making.
+fn clientAwaitingExtensions(pair: *Pair) !void {
+    const hello = pair.client.startCrypto();
+    try pair.to_server[0].append(hello.bytes);
+    try pair.deliverToServer(.initial, 1 << 16);
+    // Only the ServerHello: the flight stays undelivered.
+    try pair.deliverToClient(.initial, 1 << 16);
+    try testing.expectEqual(ClientHandshake.State.awaiting_encrypted_extensions, pair.client.state);
+}
+
+fn encryptedExtensions(out: []u8, extensions: []const u8) []const u8 {
+    var builder = wire.Builder.init(out);
+    const mark = handshake.beginMessage(&builder, .encrypted_extensions);
+    builder.putU16(@intCast(extensions.len));
+    builder.putSlice(extensions);
+    handshake.endMessage(&builder, mark);
+    return builder.written();
+}
+
+test "QUIC client: what RFC 9001 asks of an EncryptedExtensions, each refused as its rule says" {
+    const alpn = [_]u8{ 0x00, 0x10, 0x00, 0x05, 0x00, 0x03, 0x02, 'h', '3' };
+    const parameters = [_]u8{ 0x00, 0x39, 0x00, 0x02, 0xab, 0xcd };
+    const Case = struct { name: []const u8, extensions: []const u8, want: anyerror, code: u64 };
+    for ([_]Case{
+        // §8.2: no transport parameters, 0x016d.
+        .{ .name = "no parameters", .extensions = &alpn, .want = error.MissingExtension, .code = 0x016d },
+        // §8.1: no application protocol, 0x0178.
+        .{ .name = "no ALPN", .extensions = &parameters, .want = error.NoApplicationProtocol, .code = 0x0178 },
+        // §4.2: one of each — two bodies is a server contradicting itself.
+        .{ .name = "parameters twice", .extensions = &(alpn ++ parameters ++ parameters), .want = error.DuplicateExtension, .code = 0x0132 },
+    }) |case| {
+        var pair: Pair = undefined;
+        try pair.init(.{});
+        defer pair.deinit();
+        try clientAwaitingExtensions(&pair);
+        var buffer: [64]u8 = undefined;
+        const message = encryptedExtensions(&buffer, case.extensions);
+        testing.expectError(case.want, pair.client.handleCrypto(.handshake, message, &pair.client_out)) catch |err| {
+            std.debug.print("case '{s}' did not refuse as expected\n", .{case.name});
+            return err;
+        };
+        try testing.expectEqual(case.code, quic.errorCode(@errorCast(case.want)));
+        try testing.expectEqual(ClientHandshake.State.failed, pair.client.state);
+    }
+}
+
+test "QUIC client: §6 refuses a KeyUpdate, §4.6.1 a ticket promising early data" {
+    for ([_]bool{ false, true }) |key_update| {
+        var pair: Pair = undefined;
+        try pair.init(.{});
+        defer pair.deinit();
+        try pair.run(1 << 16);
+        try pair.expectAgreement();
+        if (key_update) {
+            const message = [_]u8{ 24, 0, 0, 1, 1 };
+            try testing.expectError(error.UnexpectedMessage, pair.client.handleCrypto(.application, &message, &pair.client_out));
+            continue;
+        }
+        // A ticket whose early_data extension says anything but
+        // 0xffffffff is PROTOCOL_VIOLATION; 0xffffffff itself is a
+        // ticket like any other, surfaced with the number it carried.
+        var buffer: [64]u8 = undefined;
+        for ([_]u32{ std.math.maxInt(u32), 16384 }) |bytes_max| {
+            const ticket = newSessionTicket(&buffer, bytes_max);
+            if (bytes_max == std.math.maxInt(u32)) {
+                const event = (try pair.client.handleCrypto(.application, ticket, &pair.client_out)).?;
+                try testing.expectEqual(@as(?u32, bytes_max), event.ticket.early_data_bytes_max);
+            } else {
+                try testing.expectError(error.QuicProtocolViolation, pair.client.handleCrypto(.application, ticket, &pair.client_out));
+                try testing.expectEqual(@as(u64, 0x0a), quic.errorCode(error.QuicProtocolViolation));
+            }
+        }
+    }
+}
+
+fn newSessionTicket(out: []u8, early_data_bytes_max: u32) []const u8 {
+    var builder = wire.Builder.init(out);
+    const mark = handshake.beginMessage(&builder, .new_session_ticket);
+    builder.putU32(3600);
+    builder.putU32(0);
+    builder.putByte(1);
+    builder.putByte(0x07);
+    builder.putU16(4);
+    builder.putSlice("tick");
+    builder.putU16(8);
+    builder.putU16(42); // early_data, in its NewSessionTicket shape.
+    builder.putU16(4);
+    builder.putU32(early_data_bytes_max);
+    handshake.endMessage(&builder, mark);
+    return builder.written();
+}
+
+test "QUIC client: a level it holds no key for, and §4.1.3's leftovers" {
+    var pair: Pair = undefined;
+    try pair.init(.{});
+    defer pair.deinit();
+    _ = pair.client.startCrypto();
+    // Handshake bytes before any ServerHello: nothing could have
+    // protected them.
+    try testing.expectError(error.UnexpectedMessage, pair.client.handleCrypto(.handshake, &.{ 8, 0, 0, 2, 0, 0 }, &pair.client_out));
+
+    var second: Pair = undefined;
+    try second.init(.{});
+    defer second.deinit();
+    try clientAwaitingExtensions(&second);
+    // Half an EncryptedExtensions, then bytes at the application level.
+    try testing.expectEqual(@as(?ClientHandshake.QuicEvent, null), try second.client.handleCrypto(.handshake, &.{ 8, 0, 0, 9 }, &second.client_out));
+    try testing.expectError(error.QuicProtocolViolation, second.client.handleCrypto(.application, &.{ 4, 0 }, &second.client_out));
+}
+
+test "QUIC: nothing may ride behind a Finished at the Handshake level, on either side" {
+    const trailing = [_]u8{ 4, 0, 0, 1, 0 };
+    // The client: the server's whole flight with a message packed behind
+    // its Finished, in one delivery.
+    {
+        var pair: Pair = undefined;
+        try pair.init(.{});
+        defer pair.deinit();
+        try pair.to_server[0].append(pair.client.startCrypto().bytes);
+        try pair.deliverToServer(.initial, 1 << 16);
+        try pair.to_client[1].append(&trailing);
+        try pair.deliverToClient(.initial, 1 << 16);
+        try testing.expectError(error.UnexpectedMessage, pair.deliverToClient(.handshake, 1 << 16));
+        try testing.expectEqual(ClientHandshake.State.failed, pair.client.state);
+    }
+    // The server: the client's Finished with the same message behind it.
+    {
+        var harness: ServerHarness = undefined;
+        try harness.init(.{});
+        defer harness.deinit();
+        var hello_buffer: [client_messages.hello_bytes_max]u8 = undefined;
+        const hello = try quicHello(&hello_buffer, .{});
+        var events: Events = .{};
+        try events.feed(&harness, .initial, hello, 1);
+        var shared: [32]u8 = undefined;
+        try x25519Shared(events.bytes[0], &shared);
+        const derived = Derived.compute(hello, events.bytes[0], events.bytes[4], &shared);
+        const both = derived.client_finished ++ trailing;
+        try testing.expectError(error.UnexpectedMessage, harness.server.handleCrypto(.handshake, &both, &harness.out));
+        try testing.expectEqual(ServerHandshake.State.failed, harness.server.state);
+    }
 }

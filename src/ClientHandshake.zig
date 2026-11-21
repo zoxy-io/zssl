@@ -33,6 +33,11 @@
 //!   `.insecure_no_verification` is for pinned-transport tests and says
 //!   so in its name.
 //!
+//! With `Config.quic` set the same machine speaks RFC 9001: the messages
+//! and the key schedule are unchanged, the record layer is gone, and
+//! `startCrypto`/`handleCrypto`/`drainCrypto` replace `start`,
+//! `handleRecord` and `drain`.
+//!
 //! RSA leaves are accepted here and nowhere else in zssl. The server half
 //! signs with ECDSA only, on a latency argument (DESIGN.md §1) that is
 //! about *our* signing cost; a client originating to arbitrary upstreams
@@ -57,6 +62,7 @@ const handshake = @import("handshake.zig");
 const key_schedule = @import("key_schedule.zig");
 const ktls = @import("ktls.zig");
 const protect = @import("protect.zig");
+const quic = @import("quic.zig");
 const record = @import("record.zig");
 const server_messages = @import("server_messages.zig");
 const session_keys = @import("session_keys.zig");
@@ -166,6 +172,8 @@ alpn_selected: ?u8,
 leaf_public_key: [leaf_public_key_bytes_max]u8,
 leaf_public_key_bytes: u16,
 leaf_key_kind: LeafKeyKind,
+/// RFC 9001 mode's own progress, untouched over TCP. See `handleCrypto`.
+quic_progress: QuicProgress,
 /// The scheme the server signed its CertificateVerify with, once one has
 /// verified. Null before that and on a resumed handshake, which carries
 /// no CertificateVerify at all. Read-only to the embedder, and the
@@ -397,6 +405,20 @@ pub const Config = struct {
     /// Caller-owned reassembly space; must hold the server's certificate
     /// chain, so size it like a flight (8 KiB minimum).
     reassembly: []u8,
+    /// RFC 9001: run this handshake for QUIC. Null — the default — is TLS
+    /// over TCP; set, `startCrypto` and `handleCrypto` are the entry
+    /// points, `session_id` must be empty (§8.4), `alpn_protocols` must
+    /// not be (§8.1), `send_change_cipher_spec` is moot because nothing
+    /// is sent in records, and no early data may be offered.
+    quic: ?Quic = null,
+};
+
+/// What QUIC mode needs that TCP does not.
+pub const Quic = struct {
+    /// RFC 9001 §8.2: our `quic_transport_parameters` extension body,
+    /// encoded by the transport and carried opaque in the ClientHello. At
+    /// most `quic.transport_parameters_bytes_max` octets.
+    transport_parameters: []const u8,
 };
 
 /// A captured NewSessionTicket. The slices view the reassembly buffer
@@ -515,6 +537,17 @@ pub const Error = backend.Error || backend.SignError || protect.Error || session
     /// More extensions in a block than the bound above admits.
     ExtensionOverflow,
     PeerAlert,
+    /// No common application protocol — over QUIC, where RFC 9001 §8.1
+    /// makes one mandatory and a server that selects none has negotiated
+    /// nothing the connection can carry. Over TCP an absent selection is
+    /// an answer, and `alpnSelected` reports it.
+    NoApplicationProtocol,
+    /// RFC 9001's refusals that are a transport error rather than an
+    /// alert (`quic.errorCode` answers PROTOCOL_VIOLATION): handshake bytes
+    /// at a new level while a message at the old one is unfinished
+    /// (§4.1.3), and a NewSessionTicket whose `max_early_data_size` is
+    /// anything but 0xffffffff (§4.6.1).
+    QuicProtocolViolation,
 };
 
 pub const out_bytes_min: u32 = record.wire_record_bytes_max;
@@ -567,6 +600,17 @@ pub fn init(config: *const Config) ClientHandshake {
         // was wrong.
         assert(resumption.identity.len <= client_messages.psk_identity_bytes_max);
     }
+    if (config.quic) |mode| {
+        // §8.4: no middlebox compatibility mode, so nothing to echo.
+        assert(config.session_id.len == 0);
+        // §8.1: QUIC names its application by ALPN alone.
+        assert(config.alpn_protocols.len >= 1);
+        assert(mode.transport_parameters.len <= quic.transport_parameters_bytes_max);
+        // This mode never offers 0-RTT: no EndOfEarlyData to end it
+        // (§8.3), and no early-data story for a transport whose replay
+        // window is its own.
+        if (config.resume_session) |resumption| assert(resumption.early_data == null);
+    }
     return .{
         .state = .idle,
         .config = config.*,
@@ -595,6 +639,7 @@ pub fn init(config: *const Config) ClientHandshake {
         .leaf_public_key = undefined,
         .leaf_public_key_bytes = 0,
         .leaf_key_kind = .none,
+        .quic_progress = .{},
     };
 }
 
@@ -634,6 +679,33 @@ const ccs_seen_max: u8 = 2;
 pub fn start(self: *ClientHandshake, out: []u8) []const u8 {
     assert(self.state == .idle);
     assert(out.len >= record.header_bytes + client_messages.hello_bytes_max);
+    assert(self.config.quic == null);
+    self.buildFirstHello();
+    var builder = wire.Builder.init(out);
+    appendPlaintextRecord(&builder, .handshake, self.hello_storage[0..self.hello_bytes]);
+    self.state = .awaiting_server_hello;
+    return builder.written();
+}
+
+/// RFC 9001 §4's `start`: the opening ClientHello as Initial-level bytes
+/// for the transport's CRYPTO stream, with no record around it. Borrowed
+/// from the machine, which keeps the hello for its own transcript; valid
+/// until the next call.
+pub fn startCrypto(self: *ClientHandshake) quic.Crypto {
+    assert(self.state == .idle);
+    assert(self.config.quic != null);
+    self.buildFirstHello();
+    self.state = .awaiting_server_hello;
+    assert(self.hello_bytes >= handshake.header_bytes);
+    return .{ .level = .initial, .bytes = self.hello_storage[0..self.hello_bytes] };
+}
+
+/// Both transports' first ClientHello, into `hello_storage`, with the
+/// 0-RTT keys behind it when an offer is made — which over QUIC it never
+/// is (`init` holds that).
+fn buildFirstHello(self: *ClientHandshake) void {
+    assert(self.state == .idle);
+    assert(self.hello_bytes == 0);
     // The private key was asserted nonzero at init; what remains is a
     // libcrypto fault, which no peer caused and no alert can express.
     //
@@ -664,6 +736,7 @@ pub fn start(self: *ClientHandshake, out: []u8) []const u8 {
         .signature_schemes = self.config.verify_schemes,
         .server_name = self.config.server_name,
         .alpn_protocols = self.config.alpn_protocols,
+        .quic_transport_parameters = self.transportParameters(),
         .psk = psk,
     });
     self.hello_bytes = @intCast(message.len);
@@ -695,10 +768,14 @@ pub fn start(self: *ClientHandshake, out: []u8) []const u8 {
             self.early_send = null;
         };
     }
-    var builder = wire.Builder.init(out);
-    appendPlaintextRecord(&builder, .handshake, self.hello_storage[0..self.hello_bytes]);
-    self.state = .awaiting_server_hello;
-    return builder.written();
+}
+
+/// RFC 9001 §8.2: our transport parameters for a QUIC hello, and none
+/// for a TCP one, which §8.2 forbids to carry them.
+fn transportParameters(self: *const ClientHandshake) ?[]const u8 {
+    const mode = self.config.quic orelse return null;
+    assert(mode.transport_parameters.len <= quic.transport_parameters_bytes_max);
+    return mode.transport_parameters;
 }
 
 /// Feed one whole wire record. On any error the machine is `failed` and
@@ -713,6 +790,7 @@ pub fn handleRecord(self: *ClientHandshake, wire_record: []const u8, out: []u8) 
     assert(out.len >= out_bytes_min);
     assert(self.state != .failed);
     assert(self.state != .idle);
+    assert(self.config.quic == null);
     errdefer self.state = .failed;
     // A caller that stopped draining is told so here, rather than
     // finding out one record later. The extra message is still buffered
@@ -871,6 +949,7 @@ fn startEarlyKeys(self: *ClientHandshake) protect.Error!void {
 /// ServerHello lands in it.
 pub fn sendEarlyData(self: *ClientHandshake, bytes: []const u8, out: []u8) Error!?[]const u8 {
     assert(self.state == .awaiting_server_hello);
+    assert(self.config.quic == null);
     assert(bytes.len <= record.plaintext_bytes_max);
     const protector = &(self.early_send orelse return null);
     const bytes_max = self.config.resume_session.?.early_data.?.bytes_max;
@@ -983,6 +1062,44 @@ fn handleHelloRetryRequest(
     }
 
     const share = try self.replaceKeyShare(group, scalar[0..group.privateBytes()]);
+    self.writeRetryHello(suite, selected, share, retry.cookie);
+
+    // CH2 joins the transcript now; the ServerHello that answers it will
+    // be absorbed on top, and `handleServerHello` must not re-absorb CH1.
+    switch (self.ladder.?) {
+        inline else => |*arm| arm.transcript.update(self.hello_storage[0..self.hello_bytes]),
+    }
+    // RFC 9001 §4: CH2 itself, at Initial, borrowed from `hello_storage`
+    // — no record, and no ChangeCipherSpec, which §8.4's ban on
+    // compatibility mode leaves nothing to be compatible with.
+    if (self.config.quic != null) return .{ .send = self.hello_storage[0..self.hello_bytes] };
+    // §D.4: our own compatibility CCS goes before the first *protected*
+    // record, and the second hello is not one — but a peer in
+    // compatibility mode expects it after the retry, which is where
+    // every other 1.3 client puts it.
+    var builder = wire.Builder.init(out);
+    if (self.config.send_change_cipher_spec and !self.ccs_sent) {
+        builder.putSlice(&server_messages.change_cipher_spec_record);
+        self.ccs_sent = true;
+    }
+    appendPlaintextRecord(&builder, .handshake, self.hello_storage[0..self.hello_bytes]);
+    return .{ .send = builder.written() };
+}
+
+/// §4.1.2's second ClientHello, written over the first in
+/// `hello_storage`: the retry's group and share, its cookie, and the PSK
+/// where §4.2.11 lets one travel, with the binder patched against §4.4.1's
+/// reconstructed transcript. Split from `handleHelloRetryRequest`, which
+/// decides whether the retry is legal; this is only what answering it writes.
+fn writeRetryHello(
+    self: *ClientHandshake,
+    suite: CipherSuite,
+    selected: u16,
+    share: []const u8,
+    cookie: ?[]const u8,
+) void {
+    assert(self.ladder != null);
+    assert(share.len >= 1);
 
     // §4.2.11 on which offers may travel: "the client SHOULD NOT offer
     // any pre-shared keys associated with a hash other than that of the
@@ -1006,9 +1123,10 @@ fn handleHelloRetryRequest(
         .share_public = share,
         .groups = self.config.groups,
         .signature_schemes = self.config.verify_schemes,
-        .cookie = retry.cookie,
+        .cookie = cookie,
         .server_name = self.config.server_name,
         .alpn_protocols = self.config.alpn_protocols,
+        .quic_transport_parameters = self.transportParameters(),
         .psk = carried,
     });
     self.hello_bytes = @intCast(second.len);
@@ -1054,22 +1172,6 @@ fn handleHelloRetryRequest(
             },
         }
     }
-    // CH2 joins the transcript now; the ServerHello that answers it will
-    // be absorbed on top, and `handleServerHello` must not re-absorb CH1.
-    switch (self.ladder.?) {
-        inline else => |*arm| arm.transcript.update(self.hello_storage[0..self.hello_bytes]),
-    }
-    // §D.4: our own compatibility CCS goes before the first *protected*
-    // record, and the second hello is not one — but a peer in
-    // compatibility mode expects it after the retry, which is where
-    // every other 1.3 client puts it.
-    var builder = wire.Builder.init(out);
-    if (self.config.send_change_cipher_spec and !self.ccs_sent) {
-        builder.putSlice(&server_messages.change_cipher_spec_record);
-        self.ccs_sent = true;
-    }
-    appendPlaintextRecord(&builder, .handshake, self.hello_storage[0..self.hello_bytes]);
-    return .{ .send = builder.written() };
 }
 
 const RetryExtensions = struct {
@@ -1190,7 +1292,13 @@ fn handleServerHello(self: *ClientHandshake, message: []const u8, out: []u8) Err
                 self.config.resume_session.?.psk[0..self.config.resume_session.?.psk_bytes]
             else
                 null;
-            try arm.startHandshakeKeys(shared, psk);
+            // Over QUIC the transport protects Handshake packets with the
+            // secrets themselves (RFC 9001 §5.1); no protector is built.
+            if (self.config.quic == null) {
+                try arm.startHandshakeKeys(shared, psk);
+            } else {
+                arm.deriveHandshakeSecrets(shared, psk);
+            }
         },
     }
     // §Appendix A.1: ServerHello leaves WAIT_SH for WAIT_EE.
@@ -1422,84 +1530,96 @@ fn drainFlight(self: *ClientHandshake, arm: anytype, out: []u8) Error!?Event {
     var messages_seen: u8 = 0;
     while (try self.assembler.next()) |message| : (messages_seen += 1) {
         assert(messages_seen < 8); // EE, Certificate, CertificateVerify, Finished.
-        switch (message.messageType() orelse return error.UnexpectedMessage) {
-            .encrypted_extensions => {
-                if (self.state != .awaiting_encrypted_extensions) return error.UnexpectedMessage;
-                try self.checkEncryptedExtensions(message.body());
-                arm.transcript.update(message.bytes);
-                // §Appendix A.1's fork. §4.3.2 forbids a
-                // CertificateRequest under a PSK and §4.4.2 the
-                // Certificate with it, so a resumed session leaves WAIT_EE
-                // for WAIT_FINISHED and never passes through a state that
-                // accepts either. That missing edge is the authentication
-                // gap this refactor deletes rather than guards.
-                self.state = if (self.resumed)
-                    .awaiting_finished
-                else
-                    .awaiting_certificate_or_request;
-            },
-            // §4.3.2, and optional: the server may go straight to its
-            // Certificate. Arriving here is the only way to WAIT_CERT,
-            // which is why a second one has nowhere to land.
-            .certificate_request => {
-                if (self.state != .awaiting_certificate_or_request) return error.UnexpectedMessage;
-                try self.readCertificateRequest(message.body());
-                arm.transcript.update(message.bytes);
-                self.state = .awaiting_certificate;
-            },
-            .certificate => {
-                switch (self.state) {
-                    .awaiting_certificate_or_request, .awaiting_certificate => {},
-                    else => return error.UnexpectedMessage,
-                }
-                try self.peer.capture(message.body(), .{
-                    .policy = self.config.certificate_policy,
-                    .chain_verifier = self.config.chain_verifier,
-                });
-                arm.transcript.update(message.bytes);
-                self.state = .awaiting_certificate_verify;
-            },
-            .certificate_verify => {
-                // §4.4.3 signs what §4.4.2 presented. WAIT_CV is
-                // reachable only from a Certificate and is left by this
-                // message, so "no Certificate yet" and "a second copy"
-                // are both simply not this state — the two guards that
-                // used to say so, one of which was a remote panic before
-                // it was written, are the transition.
-                if (self.state != .awaiting_certificate_verify) return error.UnexpectedMessage;
-                try self.peer.verify(message, .{
-                    .policy = self.config.certificate_policy,
-                    .side = .server,
-                    .transcript_hash = &arm.transcriptHash(),
-                    .accepted = self.config.verify_schemes,
-                });
-                arm.transcript.update(message.bytes);
-                self.state = .awaiting_finished;
-            },
-            // §Appendix A.1 has one edge into CONNECTED and it leaves
-            // WAIT_FINISHED. The other flight states are not uniform in
-            // what they earn, and the difference is observable, so the
-            // choice stays in `completeHandshake`: a flight that reached
-            // the certificate states and skipped the signature inverted
-            // the order (`unexpected_message`), while one that never
-            // authenticated is an authentication failure
-            // (`bad_certificate`), and `.insecure_no_verification` lets
-            // an embedder that verifies elsewhere skip the leg outright.
-            // Moving that here would move the alert, which BoGo grades.
-            //
-            // WAIT_EE is the exception, and review caught that the
-            // comment which used to sit here did not account for it.
-            // §4.3.1 makes EncryptedExtensions mandatory in *every* 1.3
-            // handshake, and on a resumed one `completeHandshake` skips
-            // its whole policy block — so a bare Finished straight after
-            // the ServerHello was accepted, mandatory message and all.
-            // Predates this refactor; closed by it.
-            .finished => {
-                if (self.state == .awaiting_encrypted_extensions) return error.UnexpectedMessage;
-                return try self.completeHandshake(arm, message, out);
-            },
-            else => return error.UnexpectedMessage,
-        }
+        if (try self.flightMessage(arm, message, out)) |event| return event;
+    }
+    return null;
+}
+
+/// One message of the server's flight, already reassembled, in
+/// §Appendix A.1's order. Null for a message that moved the state and
+/// produced nothing; `.connected` for the Finished. Shared by both
+/// transports — the order and every refusal are the same over QUIC, and
+/// only what the Finished produces differs.
+fn flightMessage(self: *ClientHandshake, arm: anytype, message: handshake.Message, out: []u8) Error!?Event {
+    assert(self.inFlight());
+    assert(message.bytes.len >= handshake.header_bytes);
+    switch (message.messageType() orelse return error.UnexpectedMessage) {
+        .encrypted_extensions => {
+            if (self.state != .awaiting_encrypted_extensions) return error.UnexpectedMessage;
+            try self.checkEncryptedExtensions(message.body());
+            arm.transcript.update(message.bytes);
+            // §Appendix A.1's fork. §4.3.2 forbids a
+            // CertificateRequest under a PSK and §4.4.2 the
+            // Certificate with it, so a resumed session leaves WAIT_EE
+            // for WAIT_FINISHED and never passes through a state that
+            // accepts either. That missing edge is the authentication
+            // gap this refactor deletes rather than guards.
+            self.state = if (self.resumed)
+                .awaiting_finished
+            else
+                .awaiting_certificate_or_request;
+        },
+        // §4.3.2, and optional: the server may go straight to its
+        // Certificate. Arriving here is the only way to WAIT_CERT,
+        // which is why a second one has nowhere to land.
+        .certificate_request => {
+            if (self.state != .awaiting_certificate_or_request) return error.UnexpectedMessage;
+            try self.readCertificateRequest(message.body());
+            arm.transcript.update(message.bytes);
+            self.state = .awaiting_certificate;
+        },
+        .certificate => {
+            switch (self.state) {
+                .awaiting_certificate_or_request, .awaiting_certificate => {},
+                else => return error.UnexpectedMessage,
+            }
+            try self.peer.capture(message.body(), .{
+                .policy = self.config.certificate_policy,
+                .chain_verifier = self.config.chain_verifier,
+            });
+            arm.transcript.update(message.bytes);
+            self.state = .awaiting_certificate_verify;
+        },
+        .certificate_verify => {
+            // §4.4.3 signs what §4.4.2 presented. WAIT_CV is
+            // reachable only from a Certificate and is left by this
+            // message, so "no Certificate yet" and "a second copy"
+            // are both simply not this state — the two guards that
+            // used to say so, one of which was a remote panic before
+            // it was written, are the transition.
+            if (self.state != .awaiting_certificate_verify) return error.UnexpectedMessage;
+            try self.peer.verify(message, .{
+                .policy = self.config.certificate_policy,
+                .side = .server,
+                .transcript_hash = &arm.transcriptHash(),
+                .accepted = self.config.verify_schemes,
+            });
+            arm.transcript.update(message.bytes);
+            self.state = .awaiting_finished;
+        },
+        // §Appendix A.1 has one edge into CONNECTED and it leaves
+        // WAIT_FINISHED. The other flight states are not uniform in
+        // what they earn, and the difference is observable, so the
+        // choice stays in `completeHandshake`: a flight that reached
+        // the certificate states and skipped the signature inverted
+        // the order (`unexpected_message`), while one that never
+        // authenticated is an authentication failure
+        // (`bad_certificate`), and `.insecure_no_verification` lets
+        // an embedder that verifies elsewhere skip the leg outright.
+        // Moving that here would move the alert, which BoGo grades.
+        //
+        // WAIT_EE is the exception, and review caught that the
+        // comment which used to sit here did not account for it.
+        // §4.3.1 makes EncryptedExtensions mandatory in *every* 1.3
+        // handshake, and on a resumed one `completeHandshake` skips
+        // its whole policy block — so a bare Finished straight after
+        // the ServerHello was accepted, mandatory message and all.
+        // Predates this refactor; closed by it.
+        .finished => {
+            if (self.state == .awaiting_encrypted_extensions) return error.UnexpectedMessage;
+            return try self.completeHandshake(arm, message, out);
+        },
+        else => return error.UnexpectedMessage,
     }
     return null;
 }
@@ -1564,9 +1684,32 @@ fn checkEncryptedExtensions(self: *ClientHandshake, body: []const u8) Error!void
                 if (self.retried) return error.UnsupportedExtension;
                 self.early_data_accepted = true;
             },
+            // RFC 9001 §8.2's quic_transport_parameters: the server's,
+            // opaque, over QUIC — and over TCP an extension we never
+            // offered, which is unsolicited like any other.
+            0x39 => {
+                if (self.config.quic == null) return error.UnsupportedExtension;
+                self.quic_progress.peer_transport_parameters = data;
+                self.quic_progress.peer_transport_parameters_seen = true;
+            },
             else => return error.UnsupportedExtension,
         }
     }
+    if (self.config.quic != null) try self.checkQuicExtensions();
+}
+
+/// RFC 9001's two demands of an EncryptedExtensions, asked once the whole
+/// block has been read. §8.2: "endpoints that receive ClientHello or
+/// EncryptedExtensions messages without the quic_transport_parameters
+/// extension MUST close the connection with an error of type 0x016d".
+/// §8.1: a connection with no negotiated application protocol closes
+/// with no_application_protocol — over QUIC a server that selects none
+/// has not answered our offer, it has refused it.
+fn checkQuicExtensions(self: *const ClientHandshake) Error!void {
+    assert(self.config.quic != null);
+    assert(self.config.alpn_protocols.len >= 1);
+    if (!self.quic_progress.peer_transport_parameters_seen) return error.MissingExtension;
+    if (self.alpn_selected == null) return error.NoApplicationProtocol;
 }
 
 /// RFC 7301 §3.2: the server names exactly one protocol, and it must be
@@ -1615,7 +1758,10 @@ fn completeHandshake(self: *ClientHandshake, arm: anytype, message: handshake.Me
     // promised this degraded gracefully; it did not.
     if (self.early_data_accepted and self.early_send == null) return error.LibcryptoFailed;
     const early: ?*protect.Protector = if (self.early_data_accepted) &self.early_send.? else null;
-    const flight = try arm.finishHandshake(message, send_ccs, self.clientAuthFlight(), early, out);
+    const flight = if (self.config.quic == null)
+        try arm.finishHandshake(message, send_ccs, self.clientAuthFlight(), early, out)
+    else
+        try arm.finishQuicHandshake(message, self.clientAuthFlight(), out);
     if (self.early_send) |*protector| {
         protector.deinit();
         self.early_send = null;
@@ -1626,6 +1772,7 @@ fn completeHandshake(self: *ClientHandshake, arm: anytype, message: handshake.Me
     // reader can check it: nothing reaches `connected` unauthenticated.
     assert(self.resumed or self.peer.verified or
         self.config.certificate_policy == .insecure_no_verification);
+    // A record header at least, or over QUIC the bare Finished at least.
     assert(flight.len >= record.header_bytes);
     return .{ .connected = flight };
 }
@@ -1648,6 +1795,7 @@ fn completeHandshake(self: *ClientHandshake, arm: anytype, message: handshake.Me
 /// either.
 pub fn drain(self: *ClientHandshake, out: []u8) Error!?Event {
     assert(out.len >= out_bytes_min);
+    assert(self.config.quic == null);
     // Only the post-handshake stream is drained. The server's flight is
     // assembled by `drainFlight`, which already reads every message a
     // record carried.
@@ -1833,6 +1981,8 @@ pub fn resumptionPsk(
 
 pub fn sendApplicationData(self: *ClientHandshake, bytes: []const u8, out: []u8) Error![]const u8 {
     assert(self.writable());
+    // QUIC's application data is the transport's, under the 1-RTT secrets.
+    assert(self.config.quic == null);
     assert(bytes.len <= record.plaintext_bytes_max);
     errdefer self.state = .failed;
     switch (self.ladder.?) {
@@ -1842,6 +1992,7 @@ pub fn sendApplicationData(self: *ClientHandshake, bytes: []const u8, out: []u8)
 
 pub fn sendClose(self: *ClientHandshake, out: []u8) Error![]const u8 {
     assert(self.writable());
+    assert(self.config.quic == null); // RFC 9001 §4.8: CONNECTION_CLOSE, the transport's.
     errdefer self.state = .failed;
     const bytes = alert.encode(.close_notify);
     switch (self.ladder.?) {
@@ -1861,6 +2012,9 @@ pub fn sendClose(self: *ClientHandshake, out: []u8) Error![]const u8 {
 /// decides. Answers an empty slice when nothing can be sealed.
 pub fn sendAlert(self: *ClientHandshake, description: alert.Description, out: []u8) []const u8 {
     assert(out.len >= alert_bytes_min);
+    // RFC 9001 §4.8: over QUIC the alert becomes the transport's
+    // CONNECTION_CLOSE, carrying `quic.errorCode`.
+    assert(self.config.quic == null);
     // Callable in every state, `closed` included: §6.1 lets each side
     // close its own direction, so an embedder answering a peer's
     // close_notify with one of its own is doing the ordinary thing. The
@@ -1909,6 +2063,8 @@ pub const alert_bytes_min: u8 = @intCast(server_messages.change_cipher_spec_reco
 
 pub fn sendKeyUpdate(self: *ClientHandshake, request_update: bool, out: []u8) Error![]const u8 {
     assert(self.writable());
+    // RFC 9001 §6: "Endpoints MUST NOT send a TLS KeyUpdate message."
+    assert(self.config.quic == null);
     assert(out.len >= record.header_bytes + handshake.header_bytes + 1 + 256);
     errdefer self.state = .failed;
     switch (self.ladder.?) {
@@ -1923,6 +2079,7 @@ pub fn exportKeyMaterial(self: *const ClientHandshake, direction: Direction) ktl
     // Not `writable()`: handing a half-closed connection to the kernel
     // would hand it a direction that is already over.
     assert(self.state == .connected);
+    assert(self.config.quic == null); // QUIC hands out secrets, not records.
     switch (self.ladder.?) {
         inline else => |*arm| return arm.session.?.exportMaterial(direction),
     }
@@ -1954,6 +2111,219 @@ pub fn exporter(
     }
 }
 
+/// One thing that happened, as `handleCrypto` and `drainCrypto` hand it
+/// back: RFC 9001 §4's half of the seam, in §4.1.4's order. Null from
+/// either means nothing more until more bytes arrive.
+pub const QuicEvent = union(enum) {
+    /// Handshake bytes to send at a level: the retry's second
+    /// ClientHello at Initial, our Finished flight at Handshake. Borrowed
+    /// until the next call.
+    crypto: quic.Crypto,
+    /// A traffic secret to install: the Handshake pair at the
+    /// ServerHello, the 1-RTT pair once our Finished is out.
+    secret: quic.Secret,
+    /// The server's `quic_transport_parameters` body (§8.2), opaque and
+    /// borrowed until the next call.
+    transport_parameters: []const u8,
+    /// A NewSessionTicket at the application level; views as `Event.ticket`.
+    ticket: Ticket,
+    /// §4.1.1: our Finished is out and the server's verified, so the
+    /// handshake is complete. Confirmation (§4.1.2) is HANDSHAKE_DONE,
+    /// which is the transport's.
+    connected,
+};
+
+/// `out` for the QUIC entry points: our Finished flight at its largest,
+/// with a client certificate chain and its CertificateVerify ahead of it.
+pub const quic_out_bytes_min: u16 = Credentials.chain_bytes_max + 1024;
+
+const QuicPending = enum {
+    handshake_receive,
+    handshake_send,
+    application_send,
+    application_receive,
+    connected,
+};
+
+/// §4.1.4's figure, the client column: Handshake keys at the ServerHello,
+/// and 1-RTT keys once our Finished is out — then complete.
+const quic_after_server_hello = [_]QuicPending{ .handshake_receive, .handshake_send };
+const quic_after_server_finished = [_]QuicPending{ .application_send, .application_receive, .connected };
+
+const QuicProgress = struct {
+    /// The level whose bytes the assembler holds; meaningful only while
+    /// it holds some.
+    level: quic.Level = .initial,
+    pending: []const QuicPending = &.{},
+    pending_index: u8 = 0,
+    /// The server's transport parameters, viewed where they arrived, and
+    /// whether its EncryptedExtensions carried them at all.
+    peer_transport_parameters: []const u8 = &.{},
+    peer_transport_parameters_seen: bool = false,
+};
+
+/// RFC 9001 §4's entry point: handshake bytes the transport received at
+/// `level`, in order and fragmented however its CRYPTO frames fell. Takes
+/// all of `bytes`; a message still arriving waits in `Config.reassembly`.
+/// The same loop as the server's:
+///
+///     var event = try client.handleCrypto(level, bytes, &out);
+///     while (event) |ready| : (event = try client.drainCrypto(&out)) { … }
+///
+/// On any error the machine is `failed`; `quic.errorCode` names the code.
+pub fn handleCrypto(self: *ClientHandshake, level: quic.Level, bytes: []const u8, out: []u8) Error!?QuicEvent {
+    assert(self.config.quic != null);
+    assert(out.len >= quic_out_bytes_min);
+    assert(self.state != .failed);
+    assert(self.state != .idle); // `startCrypto` first.
+    errdefer self.state = .failed;
+    if (self.quic_progress.pending_index < self.quic_progress.pending.len) return error.EventsPending;
+    if (self.assembler.hasComplete()) return error.EventsPending;
+    if (bytes.len == 0) return null;
+    // §4.1.3: data a lower level never finished, once the next one's
+    // bytes arrive, is PROTOCOL_VIOLATION.
+    if (!self.assembler.empty()) {
+        if (level != self.quic_progress.level) return error.QuicProtocolViolation;
+    }
+    if (!self.quicLevelOpen(level)) return error.UnexpectedMessage;
+    self.quic_progress.level = level;
+    try self.assembler.push(bytes);
+    return self.nextQuicEvent(out);
+}
+
+/// The next event, once `handleCrypto` has answered one.
+pub fn drainCrypto(self: *ClientHandshake, out: []u8) Error!?QuicEvent {
+    assert(self.config.quic != null);
+    assert(out.len >= quic_out_bytes_min);
+    assert(self.state != .failed);
+    errdefer self.state = .failed;
+    return self.nextQuicEvent(out);
+}
+
+/// Whether bytes at `level` can be anything but a protocol error from
+/// where the handshake stands — the server's question, from this side.
+fn quicLevelOpen(self: *const ClientHandshake, level: quic.Level) bool {
+    assert(self.config.quic != null);
+    assert(self.state != .idle);
+    return switch (level) {
+        .initial => self.state == .awaiting_server_hello,
+        .handshake => self.inFlight(),
+        .application => self.state == .connected,
+    };
+}
+
+fn nextQuicEvent(self: *ClientHandshake, out: []u8) Error!?QuicEvent {
+    assert(self.config.quic != null);
+    if (self.popQuicPending()) |event| return event;
+    // Silent messages exist only in the server's flight — a
+    // CertificateRequest, a Certificate, a CertificateVerify — and each
+    // moves the state on, so a fourth has nowhere to come from.
+    var silent: u8 = 0;
+    while (try self.assembler.next()) |message| : (silent += 1) {
+        assert(silent < 4);
+        if (try self.handleQuicMessage(message, out)) |event| return event;
+    }
+    return null;
+}
+
+fn handleQuicMessage(self: *ClientHandshake, message: handshake.Message, out: []u8) Error!?QuicEvent {
+    assert(self.config.quic != null);
+    assert(self.quic_progress.pending_index == self.quic_progress.pending.len);
+    switch (self.quic_progress.level) {
+        .initial => {
+            if (message.messageType() != .server_hello) return error.UnexpectedMessage;
+            if (!self.assembler.empty()) return error.UnexpectedMessage;
+            // A retry answers with CH2, borrowed from `hello_storage`; a
+            // ServerHello with nothing but the Handshake secrets.
+            if (try self.handleServerHello(message.bytes, out)) |answer| {
+                assert(answer == .send);
+                return .{ .crypto = .{ .level = .initial, .bytes = answer.send } };
+            }
+            assert(self.state == .awaiting_encrypted_extensions);
+            return self.startQuicPending(&quic_after_server_hello);
+        },
+        .handshake => switch (self.ladder.?) {
+            inline else => |*arm| {
+                // `completeHandshake` already refuses bytes behind the
+                // Finished, so the flight cannot outlive it; asked again
+                // here so that a message at this level after `connected`
+                // is an error by statement, not by an argument elsewhere.
+                if (!self.inFlight()) return error.UnexpectedMessage;
+                const event = (try self.flightMessage(arm, message, out)) orelse {
+                    if (message.messageType() != .encrypted_extensions) return null;
+                    // `checkQuicExtensions` has seen it present.
+                    assert(self.quic_progress.peer_transport_parameters_seen);
+                    return .{ .transport_parameters = self.quic_progress.peer_transport_parameters };
+                };
+                assert(event == .connected);
+                // The flight goes first, in `out`; the 1-RTT secrets and
+                // the completion wait behind it.
+                self.quic_progress.pending = &quic_after_server_finished;
+                self.quic_progress.pending_index = 0;
+                return .{ .crypto = .{ .level = .handshake, .bytes = event.connected } };
+            },
+        },
+        .application => return self.quicPostHandshake(message),
+    }
+}
+
+/// The application level, which carries one thing to a QUIC client: a
+/// NewSessionTicket. §6 refuses a KeyUpdate as unexpected_message —
+/// QUIC rotates its own keys — and §4.4 forbids the post-handshake
+/// CertificateRequest.
+fn quicPostHandshake(self: *ClientHandshake, message: handshake.Message) Error!?QuicEvent {
+    assert(self.config.quic != null);
+    assert(self.state == .connected);
+    if (message.messageType() != .new_session_ticket) return error.UnexpectedMessage;
+    var ticket = try parseTicket(message.body());
+    ticket.suite = self.ladder.?;
+    // §4.6.1: "A client MUST treat receipt of a NewSessionTicket that
+    // contains an early_data extension with any other value [than
+    // 0xffffffff] as a connection error of type PROTOCOL_VIOLATION."
+    if (ticket.early_data_bytes_max) |bytes_max| {
+        if (bytes_max != std.math.maxInt(u32)) return error.QuicProtocolViolation;
+    }
+    return .{ .ticket = ticket };
+}
+
+/// Begin handing out `pending` and answer its first event.
+fn startQuicPending(self: *ClientHandshake, pending: []const QuicPending) QuicEvent {
+    assert(pending.len >= 1);
+    assert(self.quic_progress.pending_index == self.quic_progress.pending.len);
+    self.quic_progress.pending = pending;
+    self.quic_progress.pending_index = 0;
+    return self.popQuicPending().?;
+}
+
+fn popQuicPending(self: *ClientHandshake) ?QuicEvent {
+    assert(self.config.quic != null);
+    assert(self.quic_progress.pending_index <= self.quic_progress.pending.len);
+    if (self.quic_progress.pending_index == self.quic_progress.pending.len) return null;
+    const next = self.quic_progress.pending[self.quic_progress.pending_index];
+    self.quic_progress.pending_index += 1;
+    return self.quicPendingEvent(next);
+}
+
+fn quicPendingEvent(self: *const ClientHandshake, pending: QuicPending) QuicEvent {
+    assert(self.config.quic != null);
+    assert(self.ladder != null);
+    switch (self.ladder.?) {
+        inline else => |*arm, suite| return switch (pending) {
+            .handshake_receive => quicSecret(.handshake, .receive, suite, &arm.server_handshake_traffic),
+            .handshake_send => quicSecret(.handshake, .send, suite, &arm.client_handshake_traffic),
+            .application_send => quicSecret(.application, .send, suite, &arm.client_application_traffic),
+            .application_receive => quicSecret(.application, .receive, suite, &arm.server_application_traffic),
+            .connected => .connected,
+        },
+    }
+}
+
+fn quicSecret(level: quic.Level, direction: quic.Direction, suite: CipherSuite, secret: []const u8) QuicEvent {
+    assert(level != .initial); // §5.2's Initial secrets are the transport's.
+    assert(secret.len == suite.hashBytes());
+    return .{ .secret = .{ .level = level, .direction = direction, .suite = suite, .bytes = secret } };
+}
+
 fn appendPlaintextRecord(builder: *wire.Builder, content_type: record.ContentType, payload: []const u8) void {
     assert(payload.len >= 1);
     assert(payload.len <= record.plaintext_bytes_max);
@@ -1964,6 +2334,10 @@ fn appendPlaintextRecord(builder: *wire.Builder, content_type: record.ContentTyp
     builder.index += record.header_bytes;
     builder.putSlice(payload);
 }
+
+/// How our handshake messages leave the machine: sealed into records over
+/// TCP, bare for the transport over QUIC (RFC 9001 §4).
+const Framing = enum { records, messages };
 
 const Ladder = union(CipherSuite) {
     aes_128_gcm_sha256: ArmOf(.aes_128_gcm_sha256),
@@ -1998,6 +2372,12 @@ fn ArmOf(comptime suite: CipherSuite) type {
         /// complete.
         exporter_master: [hash_bytes]u8,
         resumption_master: [hash_bytes]u8,
+        /// §7.1's application traffic secrets, from the server Finished.
+        /// Over TCP the session keys take copies and these are wiped at
+        /// once; over QUIC they are what the transport installs, so they
+        /// stay until `deinit`.
+        client_application_traffic: [hash_bytes]u8,
+        server_application_traffic: [hash_bytes]u8,
         recv: ?protect.Protector,
         send: ?protect.Protector,
         session: ?session_keys.SessionKeys(suite),
@@ -2011,6 +2391,8 @@ fn ArmOf(comptime suite: CipherSuite) type {
             .server_handshake_traffic = undefined,
             .exporter_master = undefined,
             .resumption_master = undefined,
+            .client_application_traffic = undefined,
+            .server_application_traffic = undefined,
             .recv = null,
             .send = null,
             .session = null,
@@ -2025,6 +2407,8 @@ fn ArmOf(comptime suite: CipherSuite) type {
             std.crypto.secureZero(u8, &self.server_handshake_traffic);
             std.crypto.secureZero(u8, &self.exporter_master);
             std.crypto.secureZero(u8, &self.resumption_master);
+            std.crypto.secureZero(u8, &self.client_application_traffic);
+            std.crypto.secureZero(u8, &self.server_application_traffic);
             self.* = undefined;
         }
 
@@ -2057,7 +2441,9 @@ fn ArmOf(comptime suite: CipherSuite) type {
         /// (EC)DHE secret the group's own width, and a retried handshake
         /// can land on secp384r1's 48 bytes. The server half has always
         /// taken a slice here for the same reason.
-        fn startHandshakeKeys(self: *Self, shared: []const u8, psk: ?[]const u8) protect.Error!void {
+        /// The secrets alone, which is all RFC 9001 wants: the transport
+        /// derives its own packet keys from them (§5.1).
+        fn deriveHandshakeSecrets(self: *Self, shared: []const u8, psk: ?[]const u8) void {
             assert(self.schedule == null);
             assert(self.recv == null);
             // The client offers only resumption PSKs, which §4.6.1
@@ -2070,6 +2456,12 @@ fn ArmOf(comptime suite: CipherSuite) type {
             const hello_hash = self.transcriptHash();
             self.client_handshake_traffic = schedule.deriveAt(.handshake, "c hs traffic", &hello_hash);
             self.server_handshake_traffic = schedule.deriveAt(.handshake, "s hs traffic", &hello_hash);
+            self.schedule = schedule;
+        }
+
+        fn startHandshakeKeys(self: *Self, shared: []const u8, psk: ?[]const u8) protect.Error!void {
+            self.deriveHandshakeSecrets(shared, psk);
+            assert(self.schedule.?.stage == .handshake);
             const receive_keys = Schedule.trafficKeys(&self.server_handshake_traffic);
             const transmit_keys = Schedule.trafficKeys(&self.client_handshake_traffic);
             self.recv = try protect.Protector.init(suite, &receive_keys.key, &receive_keys.iv);
@@ -2078,7 +2470,6 @@ fn ArmOf(comptime suite: CipherSuite) type {
                 self.recv = null;
             }
             self.send = try protect.Protector.init(suite, &transmit_keys.key, &transmit_keys.iv);
-            self.schedule = schedule;
         }
 
         /// Verify the server Finished, answer with ours, move to the
@@ -2102,6 +2493,7 @@ fn ArmOf(comptime suite: CipherSuite) type {
         fn sendClientAuth(
             self: *Self,
             client_auth: ?ClientAuthFlight,
+            framing: Framing,
             builder: *wire.Builder,
         ) Error!void {
             const auth = client_auth orelse return;
@@ -2118,12 +2510,7 @@ fn ArmOf(comptime suite: CipherSuite) type {
             else
                 server_messages.certificateChain(&empty_storage, &.{});
             self.transcript.update(certificate_message);
-            const sealed_certificate = try self.send.?.seal(
-                .handshake,
-                certificate_message,
-                builder.bytes[builder.index..],
-            );
-            builder.index += sealed_certificate.len;
+            try self.put(framing, certificate_message, builder);
 
             // Only if we sent one. §4.4.3 signs the certificate that
             // was presented, and an empty list presented nothing.
@@ -2142,23 +2529,31 @@ fn ArmOf(comptime suite: CipherSuite) type {
                     signature,
                 );
                 self.transcript.update(verify_message);
-                const sealed_verify = try self.send.?.seal(
-                    .handshake,
-                    verify_message,
-                    builder.bytes[builder.index..],
-                );
-                builder.index += sealed_verify.len;
+                try self.put(framing, verify_message, builder);
             };
         }
 
-        fn finishHandshake(
-            self: *Self,
-            message: handshake.Message,
-            send_ccs: bool,
-            client_auth: ?ClientAuthFlight,
-            early: ?*protect.Protector,
-            out: []u8,
-        ) Error![]const u8 {
+        /// One handshake message of our flight onto `builder`: sealed into
+        /// a record under the handshake key over TCP, as the bare message
+        /// over QUIC, where the transport protects it (RFC 9001 §4).
+        fn put(self: *Self, framing: Framing, message: []const u8, builder: *wire.Builder) Error!void {
+            assert(message.len >= handshake.header_bytes);
+            switch (framing) {
+                .records => {
+                    const sealed = try self.send.?.seal(.handshake, message, builder.bytes[builder.index..]);
+                    builder.index += sealed.len;
+                },
+                .messages => {
+                    assert(self.send == null);
+                    builder.putSlice(message);
+                },
+            }
+        }
+
+        /// §4.4.4's check of the server Finished, then the transcript
+        /// through it and §7.1's master-stage secrets at that point —
+        /// both transports' first half of the handshake's tail.
+        fn acceptServerFinished(self: *Self, message: handshake.Message) Error!void {
             assert(self.schedule != null);
             assert(self.schedule.?.stage == .handshake);
             // §4.4.4 gives one verdict to both ways a Finished can be
@@ -2175,12 +2570,60 @@ fn ArmOf(comptime suite: CipherSuite) type {
             const finished_hash = self.transcriptHash();
             self.schedule.?.advanceToMaster();
             self.exporter_master = self.schedule.?.deriveAt(.master, "exp master", &finished_hash);
-            var client_application = self.schedule.?.deriveAt(.master, "c ap traffic", &finished_hash);
-            var server_application = self.schedule.?.deriveAt(.master, "s ap traffic", &finished_hash);
+            self.client_application_traffic = self.schedule.?.deriveAt(.master, "c ap traffic", &finished_hash);
+            self.server_application_traffic = self.schedule.?.deriveAt(.master, "s ap traffic", &finished_hash);
+        }
+
+        /// Our Finished, over everything the transcript holds, onto
+        /// `builder` — and §7.1's last derivation, resumption_master, over
+        /// the transcript through it.
+        fn putFinished(self: *Self, framing: Framing, builder: *wire.Builder) Error!void {
+            assert(self.schedule != null);
+            assert(self.schedule.?.stage == .master);
+            const client_key = Schedule.finishedKey(&self.client_handshake_traffic);
+            const verify_data = Schedule.verifyData(&client_key, &self.transcriptHash());
+            var message_buffer: [handshake.header_bytes + cipher_suite.hash_bytes_max]u8 = undefined;
+            const finished_message = server_messages.finished(&message_buffer, &verify_data);
+            self.transcript.update(finished_message);
+            self.resumption_master = self.schedule.?.deriveAt(.master, "res master", &self.transcriptHash());
+            try self.put(framing, finished_message, builder);
+        }
+
+        /// RFC 9001 §4's tail: the same checks and secrets as
+        /// `finishHandshake`, and our flight — Certificate and
+        /// CertificateVerify if asked, then Finished — as bare messages in
+        /// `out` for the transport to send at Handshake. No session keys:
+        /// the transport protects 1-RTT with the secrets themselves.
+        fn finishQuicHandshake(
+            self: *Self,
+            message: handshake.Message,
+            client_auth: ?ClientAuthFlight,
+            out: []u8,
+        ) Error![]const u8 {
+            assert(self.send == null);
+            assert(self.session == null);
+            try self.acceptServerFinished(message);
+            var builder = wire.Builder.init(out);
+            try self.sendClientAuth(client_auth, .messages, &builder);
+            try self.putFinished(.messages, &builder);
+            assert(builder.index >= handshake.header_bytes + hash_bytes);
+            return builder.written();
+        }
+
+        fn finishHandshake(
+            self: *Self,
+            message: handshake.Message,
+            send_ccs: bool,
+            client_auth: ?ClientAuthFlight,
+            early: ?*protect.Protector,
+            out: []u8,
+        ) Error![]const u8 {
+            assert(self.send != null);
+            try self.acceptServerFinished(message);
             // `SessionKeys` takes its own copies and owns rotation from
             // here; ours are generation-0 material with no further use.
-            defer std.crypto.secureZero(u8, &client_application);
-            defer std.crypto.secureZero(u8, &server_application);
+            defer std.crypto.secureZero(u8, &self.client_application_traffic);
+            defer std.crypto.secureZero(u8, &self.server_application_traffic);
 
             var builder = wire.Builder.init(out);
             if (send_ccs) builder.putSlice(&server_messages.change_cipher_spec_record);
@@ -2206,24 +2649,16 @@ fn ArmOf(comptime suite: CipherSuite) type {
                 );
                 builder.index += sealed_end.len;
             }
-            try self.sendClientAuth(client_auth, &builder);
-            const client_key = Schedule.finishedKey(&self.client_handshake_traffic);
-            const verify_data = Schedule.verifyData(&client_key, &self.transcriptHash());
-            var message_buffer: [handshake.header_bytes + cipher_suite.hash_bytes_max]u8 = undefined;
-            const finished_message = server_messages.finished(&message_buffer, &verify_data);
-            self.transcript.update(finished_message);
-            self.resumption_master = self.schedule.?.deriveAt(.master, "res master", &self.transcriptHash());
-
-            const sealed = try self.send.?.seal(.handshake, finished_message, builder.bytes[builder.index..]);
-            builder.index += sealed.len;
+            try self.sendClientAuth(client_auth, .records, &builder);
+            try self.putFinished(.records, &builder);
 
             // Zero: a client has no 0.5-RTT window. Its own Finished
             // is the last thing it writes under the handshake keys, and
             // nothing goes out on the application ones until the
             // session exists.
             self.session = try session_keys.SessionKeys(suite).init(
-                &client_application,
-                &server_application,
+                &self.client_application_traffic,
+                &self.server_application_traffic,
                 0,
             );
             self.recv.?.deinit();

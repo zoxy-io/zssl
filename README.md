@@ -12,7 +12,8 @@ libcrypto only for the constant-time primitives (AEAD, X25519, ECDSA and
 RSA-PSS signing, and ECDSA verification); checking a peer's *RSA-PSS*
 signature is still `std.crypto`'s. It owns no
 sockets, no threads, and no memory: you feed it whole TLS records and
-transmit whatever it hands back.
+transmit whatever it hands back — or, for QUIC, handshake bytes by
+encryption level, and it hands back traffic secrets ([QUIC](#quic)).
 
 ```zig
 var event = try server.handleRecord(wire_record, &out);
@@ -254,6 +255,56 @@ then verifies the binder itself. A recognised identity with a bad binder
 aborts the handshake rather than falling back — a replayed ticket is
 refused, not downgraded.
 
+### QUIC
+
+RFC 9001 keeps TLS 1.3's messages and key schedule and drops the record
+layer: handshake bytes cross as CRYPTO data at an encryption level, and
+what comes back is a traffic secret per level. Set `Config.quic` and the
+same machines speak that, through `handleCrypto` and `drainCrypto`:
+
+```zig
+var flight: [zssl.ServerHandshake.quic_flight_bytes_min]u8 = undefined;
+var server = zssl.ServerHandshake.init(&.{
+    .credentials = &credentials,
+    .server_random = entropy[0..32].*,
+    .key_share_private = entropy[32..80].*,
+    .alpn_protocols = &.{"h3"}, // §8.1: mandatory over QUIC
+    .reassembly = &reassembly,
+    .flight = &flight,
+    // §8.2: your transport's encoding, carried opaque.
+    .quic = .{ .transport_parameters = transport_parameters },
+});
+defer server.deinit();
+
+var out: [zssl.ServerHandshake.quic_out_bytes_min]u8 = undefined;
+const bytes = connection.cryptoOut(level);
+var event = try server.handleCrypto(level, bytes, &out);
+connection.cryptoConsumed(level, bytes.len);
+while (event) |ready| : (event = try server.drainCrypto(&out)) {
+    switch (ready) {
+        .crypto => |crypto| try connection.cryptoIn(crypto.level, crypto.bytes),
+        .secret => |secret| try connection.installSecret(secret.level, secret.direction, secret.bytes, secret.suite),
+        .transport_parameters => |body| try connection.transportParametersIn(body),
+        .connected => connection.confirmHandshake(),
+    }
+}
+```
+
+Every event borrows until the next call. Secrets arrive in §4.1.4's
+order — the Handshake pair with the ServerHello, 1-RTT send with the
+flight, 1-RTT receive only once the client's Finished verifies — and an
+error is a connection to close with `zssl.quic.errorCode(err)`: §4.8's
+CRYPTO_ERROR, 0x0100 plus the alert, or PROTOCOL_VIOLATION for the rules
+RFC 9001 states as one. The client half is the same loop after
+`client.startCrypto()`, and adds a `.ticket` arm. Tickets go out with
+`sendNewSessionTicket` as bare messages for the application level;
+0-RTT, TLS KeyUpdate and compatibility mode are not part of this mode.
+
+Packet protection is here too, because libcrypto is: `zssl.quic.PacketKey`
+seals and opens a packet in place under §5.3's AEAD, and
+`zssl.quic.HeaderKey` produces §5.4's mask from a sample. Each is
+created once per key and allocates nothing per packet.
+
 ## Scope
 
 TLS 1.3 (RFC 8446) and nothing older, both handshake halves, the three
@@ -262,7 +313,7 @@ RSA-PSS, SNI, ALPN, HelloRetryRequest in both directions, PSK
 resumption, 0-RTT, mutual authentication in both directions, RFC 5705
 exporters, KeyUpdate, and kTLS key export.
 
-QUIC (RFC 9001): the server handshake at the message level, and packet
+QUIC (RFC 9001): both handshake halves at the message level, and packet
 and header protection.
 
 Not built: nothing. Never:
@@ -288,7 +339,7 @@ its own CI workflow, so they run in parallel and fail separately.
 | [**RFC 8448**](src/rfc8448_test.zig) | [![rfc8448](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml) | The RFC's traced bytes, reproduced exactly |
 | [**OpenSSL**](interop/main.zig) | [![interop](https://github.com/zoxy-io/zssl/actions/workflows/interop.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/interop.yml) | Five legs against a real `openssl` binary |
 | [**`std.crypto.tls`**](src/std_interop_test.zig) | [![std.crypto.tls](https://github.com/zoxy-io/zssl/actions/workflows/std-interop.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/std-interop.yml) | A second stack, in memory, both directions |
-| [**Fuzzing**](src/fuzz_test.zig) | [![fuzz](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml)<br>[![fuzz-search](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml) | Eleven targets: a value or an error, never a panic. Seeds per PR, coverage-guided search nightly |
+| [**Fuzzing**](src/fuzz_test.zig) | [![fuzz](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml)<br>[![fuzz-search](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml) | Twelve targets: a value or an error, never a panic. Seeds per PR, coverage-guided search nightly |
 
 Plus directed tests for what only breaks under adversity — fragmented
 ClientHellos, tampered Finished messages, corrupted binders, inverted

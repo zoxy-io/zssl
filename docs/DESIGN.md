@@ -83,10 +83,11 @@ the four decisions everything else follows from.
   by both machines: rotation resets the sequence space, and a rotation
   ceiling turns a request loop into an error rather than a spin.
 - **kTLS key export** (§4).
-- **QUIC** (RFC 9001), server half: `Config.quic` turns the same
-  `ServerHandshake` into RFC 9001 §4's message-level machine. Handshake
-  bytes go in and come out per encryption level (`handleCrypto`,
-  `drainCrypto`), traffic secrets come out in §4.1.4's order, and the
+- **QUIC** (RFC 9001), both halves: `Config.quic` turns the same
+  `ServerHandshake` or `ClientHandshake` into RFC 9001 §4's
+  message-level machine. Handshake bytes go in and come out per
+  encryption level (`handleCrypto`, `drainCrypto`, and the client's
+  `startCrypto`), traffic secrets come out in §4.1.4's order, and the
   record layer — framing, protection, ChangeCipherSpec — is simply not
   used. §8's rules hold: `quic_transport_parameters` is mandatory and
   opaque, ALPN is mandatory, a legacy_session_id is a PROTOCOL_VIOLATION,
@@ -152,9 +153,9 @@ it needs from a TLS library is therefore *less* than TCP does, provided
 the message core is not welded to records — and in zssl it was not,
 quite: reassembly, every parser and encoder, the transcript, the
 schedule and the state machine were already record-agnostic. The QUIC
-mode is the same `ServerHandshake` with its record framing, protectors
-and ChangeCipherSpec bypassed, so the negotiation, HelloRetryRequest,
-PSK, client-auth and ticket rules are the TCP ones, tested once.
+mode is the same two machines with their record framing, protectors and
+ChangeCipherSpec bypassed, so the negotiation, HelloRetryRequest, PSK,
+client-auth and ticket rules are the TCP ones, tested once.
 
 The embedder that made it worth doing is zoxy's HTTP/3 (zoxy-io/zoxy
 #449), over h3, a sans-I/O QUIC transport whose seam is exactly §4's:
@@ -351,8 +352,8 @@ derived from the RFCs rather than from any implementation, against the
 same harness. Both hold a passing count against a floor, so a quiet
 suppression stops the build. docs/TLSFUZZER.md, docs/TLSANVIL.md.
 
-**Fuzzing.** Eleven targets over every parser, both state machines
-(the server over QUIC as well as TCP), and QUIC's packet open,
+**Fuzzing.** Twelve targets over every parser, both state machines
+over both transports, and QUIC's packet open,
 asserting the one property that matters for a library whose assertions
 are claims about *our* state: arbitrary peer bytes produce a value or an
 error, never a panic. `zig build test-fuzz` runs each once over its
@@ -379,6 +380,20 @@ backend, and Debug on x86_64 Linux defaults to the self-hosted one. The
 daemon then reads an empty PC table and panics on `pcs[1..]`. Hence
 `use_llvm` on that suite — the same reason the `coverage` step sets it,
 which is the note that made the second bug findable at all.
+
+**RFC 9001 Appendix A**, reproduced the way RFC 8448 is: the Initial
+keys, both protected Initial packets, the Retry tag and the ChaCha20
+short-header packet, lifted from the RFC text by
+`scripts/extract_rfc9001.py` and derived independently by the tests.
+The QUIC server is also driven by a hand-rolled peer whose every secret
+comes from the key schedule directly, so the order and value of what
+the machine hands its transport are checked against §7.1, not against
+the machine. Then the production QUIC client meets the production QUIC
+server at every fragmentation from one octet up, through a retry, a
+resumption from a ticket issued at the application level, and client
+authentication, each level's bytes delivered only once the receiving
+side holds that level's key — and every secret one side sends under is
+the one the other receives under.
 
 **In-tree scenarios**, where both production machines run end to end:
 handshake, resumption, KeyUpdate in both directions with kTLS exports
