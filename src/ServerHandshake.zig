@@ -551,6 +551,10 @@ pub const Error = backend.SignError || protect.Error || handshake.Assembler.Erro
     TicketNotPermitted,
     /// The client offered ALPN and nothing on it matched (RFC 7301 §3.2).
     NoApplicationProtocol,
+    /// RFC 9001 §8.2: `quic_transport_parameters` in a ClientHello that
+    /// arrived over TCP. The extension is QUIC's, and an implementation
+    /// that knows it must refuse it anywhere else.
+    UnsupportedExtension,
     /// The client's second ClientHello broke an HRR rule (§4.1.4).
     IllegalRetry,
     /// The client's Finished MAC did not verify (§4.4.4).
@@ -871,6 +875,11 @@ fn handlePlaintextHandshake(self: *ServerHandshake, wire_record: []const u8, out
 fn handleClientHello(self: *ServerHandshake, message: []const u8, out: []u8) Error!Event {
     const hello = try client_hello.parse(message);
     if (!hello.supports_tls13) return error.HandshakeFailure;
+    // RFC 9001 §8.2, the TCP half: "A fatal unsupported_extension alert
+    // MUST be sent by an implementation that supports this extension if
+    // the extension is received when the transport is not QUIC." This
+    // library knows the extension, so it is held to the sentence.
+    if (hello.quic_transport_parameters != null) return error.UnsupportedExtension;
     const suite = negotiateSuite(&hello) orelse return error.HandshakeFailure;
     assert(hello.offersSuite(suite));
     assert(hello.cipher_suites_wire.len >= 2);
@@ -1373,6 +1382,7 @@ fn buildFlightPlaintext(
         flight[builder.index..],
         selected_alpn,
         early_data,
+        null,
     );
     builder.index += extensions.len;
     arm.absorbMessage(extensions);

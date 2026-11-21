@@ -505,7 +505,7 @@ test "a hostile server flight errors rather than panicking" {
         defer forger.deinit();
         var plaintext: [4096]u8 = undefined;
         var used: usize = 0;
-        const extensions = server_messages.encryptedExtensions(plaintext[used..], "http/1.1", false);
+        const extensions = server_messages.encryptedExtensions(plaintext[used..], "http/1.1", false, null);
         used += extensions.len;
         switch (shape.kind) {
             .verify_without_certificate => {
@@ -1053,7 +1053,7 @@ test "ALPN: a protocol the client never offered is refused" {
     defer forger.deinit();
     var plaintext: [4096]u8 = undefined;
     // "http/1.1" was never in the offer — only "h2" was.
-    const extensions = server_messages.encryptedExtensions(&plaintext, "http/1.1", false);
+    const extensions = server_messages.encryptedExtensions(&plaintext, "http/1.1", false, null);
     var forged_record: [record.wire_record_bytes_max]u8 = undefined;
     const sealed = try forger.seal(.handshake, extensions, &forged_record);
 
@@ -2420,7 +2420,7 @@ test "§4.4.3: a CertificateVerify scheme we never offered is illegal_parameter"
         // order, and this test is about the scheme, not the ordering.
         var plaintext: [4096]u8 = undefined;
         var forged: [record.wire_record_bytes_max]u8 = undefined;
-        const extensions = server_messages.encryptedExtensions(&plaintext, "http/1.1", false);
+        const extensions = server_messages.encryptedExtensions(&plaintext, "http/1.1", false, null);
         _ = try harness.client.handleRecord(try forger.seal(.handshake, extensions, &forged), &buffers.scratch);
         const chain = server_messages.certificateChain(&plaintext, harness.credentials.chain());
         _ = try harness.client.handleRecord(try forger.seal(.handshake, chain, &forged), &buffers.scratch);
@@ -2753,7 +2753,7 @@ test "§4.4: the client bounds its flight's message count, not the server" {
         var plaintext: [4096]u8 = undefined;
         var forged: [record.wire_record_bytes_max]u8 = undefined;
 
-        const extensions = server_messages.encryptedExtensions(&plaintext, "http/1.1", false);
+        const extensions = server_messages.encryptedExtensions(&plaintext, "http/1.1", false, null);
         _ = try harness.client.handleRecord(
             try forger.seal(.handshake, extensions, &forged),
             &buffers.scratch,
@@ -2762,7 +2762,7 @@ test "§4.4: the client bounds its flight's message count, not the server" {
         switch (shape) {
             // A second EncryptedExtensions, which §4.4 does not have.
             .extensions => {
-                const again = server_messages.encryptedExtensions(&plaintext, "http/1.1", false);
+                const again = server_messages.encryptedExtensions(&plaintext, "http/1.1", false, null);
                 try testing.expectError(
                     error.UnexpectedMessage,
                     harness.client.handleRecord(

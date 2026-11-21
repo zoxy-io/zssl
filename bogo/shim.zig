@@ -364,7 +364,7 @@ fn flagArity(name: []const u8) ?Arity {
         "-expect-alpn",                     "-host-name",                "-expect-curve-id",
         "-read-size",                       "-expect-early-data-reason", "-verify-prefs",
         "-expect-peer-signature-algorithm", "-signing-prefs",            "-export-keying-material",
-        "-export-label",                    "-export-context",
+        "-export-label",                    "-export-context",           "-quic-use-legacy-codepoint",
     };
     const without_value = [_][]const u8{
         "-ipv6",                     "-server",             "-shim-writes-first",
@@ -516,6 +516,14 @@ fn applyFlagB(connection: *Connection, name: []const u8, value: ?[]const u8) Par
             std.mem.eql(u8, reason, "no_session_offered") or
             std.mem.eql(u8, reason, "accept");
         if (!known) return unimplemented(name);
+    } else if (std.mem.eql(u8, name, "-quic-use-legacy-codepoint")) {
+        // Which of RFC 9001 §8.2's code point and the drafts' 0xffa5 a
+        // *QUIC* endpoint should read. This shim never runs QUIC — every
+        // `-quic` case is declined — so the flag reaches us only on a
+        // TCP connection, where the answer is the same either way: 57 is
+        // refused with unsupported_extension and 0xffa5 is an extension
+        // like any other we do not know. That is exactly what the
+        // `QUICTransportParams-NonQUICServer-*` cases assert.
     } else if (std.mem.eql(u8, name, "-read-size")) {
         // A buffering hint for the C shim's `SSL_read`; our record pump
         // reads whole records regardless.

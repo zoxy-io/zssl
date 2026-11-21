@@ -66,7 +66,16 @@ const extension_early_data: u16 = 42;
 const extension_supported_versions: u16 = 43;
 const extension_psk_key_exchange_modes: u16 = 45;
 const extension_key_share: u16 = 51;
+/// RFC 9001 §8.2's `quic_transport_parameters`. Repeated here rather than
+/// imported, as the other code points are: this parser names what it
+/// recognises, and `quic.transport_parameters_extension` is the same
+/// number for the embedder.
+const extension_quic_transport_parameters: u16 = 0x39;
 const tls13_wire_version: u16 = 0x0304;
+
+comptime {
+    assert(extension_quic_transport_parameters == @import("quic.zig").transport_parameters_extension);
+}
 
 pub const group_secp256r1: u16 = 0x0017;
 pub const group_secp384r1: u16 = 0x0018;
@@ -130,6 +139,13 @@ pub const ClientHello = struct {
     /// than ciphertext we failed to open.
     early_data: bool = false,
     pre_shared_key_wire: ?[]const u8 = null,
+    /// RFC 9001 §8.2: the client's QUIC transport parameters, the
+    /// extension body as it arrived. Opaque — RFC 9000 §18's encoding is
+    /// the transport's to parse — so it is captured whole and judged by
+    /// the machine: mandatory over QUIC, and over TCP a reason to refuse
+    /// the hello, because §8.2 says an implementation that knows the
+    /// extension MUST answer it there with unsupported_extension.
+    quic_transport_parameters: ?[]const u8 = null,
 
     /// Walk the offered suites for one of ours.
     pub fn offersSuite(self: *const ClientHello, suite: CipherSuite) bool {
@@ -374,6 +390,10 @@ fn applyExtension(extension_type: u16, data: []const u8, hello: *ClientHello) Er
             if (data.len < 12) return error.MalformedExtension;
             hello.pre_shared_key_wire = data;
         },
+        // Any length the u16 framing allows, empty included: an empty
+        // body is RFC 9000 §18's encoding of "every default", and whether
+        // the defaults are acceptable is the transport's verdict.
+        extension_quic_transport_parameters => hello.quic_transport_parameters = data,
         else => {}, // Unknown: skipped whole, contents never inspected.
     }
 }
@@ -684,4 +704,40 @@ test "§4.2.11: the three ways a PSK offer's two lists can be wrong" {
         // section's own bytes plus its two-byte length.
         try std.testing.expectEqual(@as(u16, hash_bytes + 3), offer.binders_section_bytes);
     }
+}
+
+test "RFC 9001 §8.2: quic_transport_parameters is captured whole, and once" {
+    // A minimal TLS 1.3 hello whose extension block is supplied, so the
+    // two shapes differ in exactly the block.
+    const build = struct {
+        fn hello(out: []u8, extensions: []const u8) []const u8 {
+            var b = wire.Builder.init(out);
+            b.putByte(client_hello_message_type);
+            const length = b.markU24();
+            b.putU16(0x0303);
+            b.putSlice(&@as([32]u8, @splat(0x01)));
+            b.putByte(0);
+            b.putU16(2);
+            b.putU16(0x1301);
+            b.putByte(1);
+            b.putByte(0);
+            b.putU16(@intCast(extensions.len));
+            b.putSlice(extensions);
+            b.patchU24(length);
+            return b.written();
+        }
+    };
+    var buffer: [128]u8 = undefined;
+    const one = [_]u8{ 0x00, 0x39, 0x00, 0x03, 0x01, 0x02, 0x03 };
+    const hello = try parse(build.hello(&buffer, &one));
+    try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x02, 0x03 }, hello.quic_transport_parameters.?);
+
+    // §4.2: one of each. Two copies is the client contradicting itself.
+    const twice = one ++ [_]u8{ 0x00, 0x39, 0x00, 0x00 };
+    try std.testing.expectError(error.DuplicateExtension, parse(build.hello(&buffer, &twice)));
+
+    // A body the u16 framing does not cover is a truncation, not a
+    // parameter set.
+    const short = [_]u8{ 0x00, 0x39, 0x00, 0x09, 0x01 };
+    try std.testing.expectError(error.Truncated, parse(build.hello(&buffer, &short)));
 }

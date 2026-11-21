@@ -34,12 +34,12 @@ const assert = std.debug.assert;
 const boringssl_url = "https://boringssl.googlesource.com/boringssl";
 const boringssl_commit = "193233b86d6cbbc20ce30c06a8775311c11be0c4";
 
-/// What the pin above scored on 2026-08-28, on a tree with every fix
-/// the BoGo and RSA slices landed, plus every finding 1 through 12 that
-/// was a defect.
+/// What the pin above scored on 2026-11-21, on a tree with every fix
+/// the BoGo and RSA slices landed, every finding 1 through 12 that was a
+/// defect, and finding 26's TCP refusal of RFC 9001's extension.
 /// Raise it whenever a fix moves the number up; a drop is either a
 /// regression or a suppression, and both deserve to stop the build.
-const passing_floor: u32 = 454;
+const passing_floor: u32 = 462;
 
 const work_dir = "zig-out/bogo";
 const checkout_dir = work_dir ++ "/boringssl";

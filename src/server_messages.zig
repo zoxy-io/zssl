@@ -10,6 +10,7 @@ const client_hello = @import("client_hello.zig");
 const Credentials = @import("Credentials.zig");
 const backend = @import("crypto/backend_openssl.zig");
 const handshake = @import("handshake.zig");
+const quic = @import("quic.zig");
 const wire = @import("wire.zig");
 const CipherSuite = cipher_suite.CipherSuite;
 
@@ -19,7 +20,12 @@ const extension_alpn: u16 = 16;
 const extension_early_data: u16 = 42;
 const extension_signature_algorithms: u16 = 13;
 const extension_pre_shared_key: u16 = 41;
+const extension_quic_transport_parameters: u16 = 0x39;
 const tls13_wire_version: u16 = 0x0304;
+
+comptime {
+    assert(extension_quic_transport_parameters == quic.transport_parameters_extension);
+}
 
 /// §4.1.3: the fixed random value that marks a ServerHello as a
 /// HelloRetryRequest — SHA-256 of "HelloRetryRequest".
@@ -121,13 +127,24 @@ pub fn helloRetryRequest(
     return builder.written();
 }
 
-/// §4.3.1. Empty unless ALPN was negotiated; zssl advertises nothing else
-/// in EncryptedExtensions today.
+/// §4.3.1. Empty unless ALPN was negotiated or this is QUIC.
 /// §4.2.10: `early_data` here, and empty, is the whole of how a server
 /// says it accepted 0-RTT. There is no other signal and no room for one
 /// — the client has already sent the data.
-pub fn encryptedExtensions(out: []u8, alpn_selected: ?[]const u8, early_data: bool) []const u8 {
-    assert(out.len >= 64);
+/// RFC 9001 §8.2: over QUIC the server's transport parameters ride here,
+/// opaque, and `transport_parameters` is null over TCP, where §8.2
+/// forbids them.
+pub fn encryptedExtensions(
+    out: []u8,
+    alpn_selected: ?[]const u8,
+    early_data: bool,
+    transport_parameters: ?[]const u8,
+) []const u8 {
+    const transport_parameters_bytes = if (transport_parameters) |body| body.len else 0;
+    // Ours, from the embedder's config: the same cap the client side's
+    // hello holds its own to.
+    assert(transport_parameters_bytes <= quic.transport_parameters_bytes_max);
+    assert(out.len >= 64 + 4 + transport_parameters_bytes);
     if (alpn_selected) |protocol| assert(protocol.len >= 1);
     var builder = wire.Builder.init(out);
     const message = handshake.beginMessage(&builder, .encrypted_extensions);
@@ -145,6 +162,11 @@ pub fn encryptedExtensions(out: []u8, alpn_selected: ?[]const u8, early_data: bo
         builder.putSlice(protocol);
         builder.patchU16(list);
         builder.patchU16(body);
+    }
+    if (transport_parameters) |body| {
+        builder.putU16(extension_quic_transport_parameters);
+        builder.putU16(@intCast(body.len));
+        builder.putSlice(body);
     }
     builder.patchU16(extensions);
     handshake.endMessage(&builder, message);

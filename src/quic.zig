@@ -38,6 +38,19 @@ pub const payload_bytes_max: u32 = backend.PacketAead.payload_bytes_max;
 
 pub const Error = backend.Error;
 
+/// §8.2: the `quic_transport_parameters` extension. Its body is the
+/// transport's encoding (RFC 9000 §18), opaque to TLS: zssl carries ours
+/// out in a ClientHello or EncryptedExtensions and hands the peer's back.
+pub const transport_parameters_extension: u16 = 0x39;
+
+/// The longest body *we* send. RFC 9000 sets no ceiling, but ours goes
+/// into fixed buffers — the ClientHello's and the server flight's — so
+/// it needs one. Every parameter v1 defines, at its widest, with a
+/// preferred address and three connection IDs, is under 200 octets;
+/// the rest is room for GREASE (§18.1's reserved identifiers). The
+/// peer's body has no such bound here: it is read where it lies.
+pub const transport_parameters_bytes_max: u16 = 512;
+
 comptime {
     assert(tag_bytes == 16);
     assert(nonce_bytes == 12);

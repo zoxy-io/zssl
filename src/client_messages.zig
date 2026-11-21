@@ -18,6 +18,7 @@ const cipher_suite = @import("cipher_suite.zig");
 const client_hello = @import("client_hello.zig");
 const handshake = @import("handshake.zig");
 const key_schedule = @import("key_schedule.zig");
+const quic = @import("quic.zig");
 const server_messages = @import("server_messages.zig");
 const wire = @import("wire.zig");
 const CipherSuite = cipher_suite.CipherSuite;
@@ -48,7 +49,15 @@ pub const signature_schemes_default = [_]backend.SignatureScheme{
 /// certificate is in the session, and offering one panicked
 /// `helloPreSharedKey` on an assertion — a crash any conforming server
 /// could trigger by issuing a large ticket.
-pub const hello_bytes_max: u16 = 5120;
+///
+/// Plus a QUIC hello's transport parameters at their cap, on top rather
+/// than out of the identity's share: they are ours and not a peer's, so
+/// they have no business shrinking the ticket a TCP client may resume.
+pub const hello_bytes_max: u16 = 5120 + transport_parameters_extension_bytes_max;
+
+/// RFC 9001 §8.2's extension at `quic.transport_parameters_bytes_max`:
+/// its type, its length, its body.
+const transport_parameters_extension_bytes_max: u16 = 4 + quic.transport_parameters_bytes_max;
 
 /// §4.2.2's cookie, echoed verbatim into the second ClientHello. Its
 /// size is the *server's* choice for a buffer that is ours, so it needs
@@ -60,7 +69,7 @@ pub const cookie_bytes_max: u16 = 512;
 /// conservative against the ~700 the encoder actually writes, and
 /// `"a maximal ClientHello fits its own buffer"` below is the check
 /// rather than this comment.
-const fixed_bytes_max: u16 = 768;
+const fixed_bytes_max: u16 = 768 + transport_parameters_extension_bytes_max;
 
 /// The largest PSK identity a hello can carry, which is what bounds a
 /// ticket an embedder may offer back. Derived from what is left of the
@@ -68,6 +77,14 @@ const fixed_bytes_max: u16 = 768;
 /// a *retried resumption* carries both at once, which is the case that
 /// makes this a subtraction rather than two independent bounds.
 pub const psk_identity_bytes_max: u16 = hello_bytes_max - fixed_bytes_max - cookie_bytes_max;
+
+comptime {
+    // The transport parameters grow the buffer and the fixed part by the
+    // same amount, so the identity a TCP client may resume is the 3840
+    // octets it was before QUIC — pinned rather than claimed.
+    assert(psk_identity_bytes_max == 3840);
+    assert(quic.transport_parameters_extension == 0x39);
+}
 
 /// ALPN offer caps. Four is what a client that speaks HTTP needs — `h2`
 /// and `http/1.1` with room to spare — and each name is bounded so the
@@ -116,6 +133,9 @@ pub const HelloParams = struct {
     /// Offered in preference order (RFC 7301 §3.1); empty omits the
     /// extension entirely.
     alpn_protocols: []const []const u8 = &.{},
+    /// RFC 9001 §8.2: our transport parameters, opaque, for a QUIC
+    /// hello — and null for a TCP one, which §8.2 forbids to carry them.
+    quic_transport_parameters: ?[]const u8 = null,
     psk: ?PskParams = null,
 };
 
@@ -133,6 +153,7 @@ pub fn clientHello(out: []u8, params: *const HelloParams) []const u8 {
     assert(params.share_public.len >= 1);
     if (params.cookie) |cookie| assert(cookie.len >= 1);
     if (params.cookie) |cookie| assert(cookie.len <= cookie_bytes_max);
+    if (params.quic_transport_parameters) |body| assert(body.len <= quic.transport_parameters_bytes_max);
     var builder = wire.Builder.init(out);
     const message = handshake.beginMessage(&builder, .client_hello);
     builder.putU16(0x0303);
@@ -223,6 +244,11 @@ fn helloExtensions(builder: *wire.Builder, params: *const HelloParams) void {
     builder.putSlice(params.share_public);
     builder.patchU16(share_list);
     builder.patchU16(shares);
+    if (params.quic_transport_parameters) |body| {
+        builder.putU16(quic.transport_parameters_extension);
+        builder.putU16(@intCast(body.len));
+        builder.putSlice(body);
+    }
     // psk_key_exchange_modes (§4.2.9), sent on *every* hello and not only
     // on the resuming one: §4.6.1 lets a server issue a NewSessionTicket
     // only to a client that has advertised a mode it can resume under, so
@@ -391,7 +417,8 @@ test "a maximal ClientHello fits its own buffer" {
     //
     // Every field at its documented maximum, and both peer-chosen ones
     // at once: a retried resumption is the flight that carries a cookie
-    // and a PSK identity in the same hello.
+    // and a PSK identity in the same hello. A QUIC one carries transport
+    // parameters besides, so they are at their cap too.
     var out: [hello_bytes_max]u8 = undefined;
     const identity: [psk_identity_bytes_max]u8 = @splat(0xa5);
     const cookie: [cookie_bytes_max]u8 = @splat(0xc0);
@@ -412,6 +439,7 @@ test "a maximal ClientHello fits its own buffer" {
             &@as([alpn_protocol_bytes_max]u8, @splat('c')),
             &@as([alpn_protocol_bytes_max]u8, @splat('d')),
         },
+        .quic_transport_parameters = &@as([quic.transport_parameters_bytes_max]u8, @splat(0x71)),
         .psk = .{ .identity = &identity, .obfuscated_age = 7, .binder_bytes = 48 },
     });
     // The assertion inside `clientHello` would already have fired; this
@@ -420,4 +448,33 @@ test "a maximal ClientHello fits its own buffer" {
     try std.testing.expect(encoded.len <= hello_bytes_max);
     const headroom = hello_bytes_max - encoded.len;
     try std.testing.expect(headroom < 1024); // Not wildly oversized either.
+}
+
+test "RFC 9001 §8.2: a QUIC hello carries its transport parameters, a TCP one none" {
+    var out: [hello_bytes_max]u8 = undefined;
+    const random: [32]u8 = @splat(0x07);
+    const public: [32]u8 = @splat(0x0b);
+    const parameters = [_]u8{ 0x04, 0x04, 0x80, 0x01, 0x00, 0x00, 0x0f, 0x00 };
+    var params: HelloParams = .{
+        .random = &random,
+        .session_id = &.{},
+        .share_group = client_hello.group_x25519,
+        .share_public = &public,
+        .signature_schemes = &signature_schemes_default,
+        .groups = &.{client_hello.group_x25519},
+        .alpn_protocols = &.{"h3"},
+        .quic_transport_parameters = &parameters,
+    };
+    const quic_hello = try client_hello.parse(clientHello(&out, &params));
+    try std.testing.expectEqualSlices(u8, &parameters, quic_hello.quic_transport_parameters.?);
+
+    // An empty body is RFC 9000 §18's "every default", and still the
+    // extension: present and empty is not absent.
+    params.quic_transport_parameters = &.{};
+    const empty_hello = try client_hello.parse(clientHello(&out, &params));
+    try std.testing.expectEqual(@as(usize, 0), empty_hello.quic_transport_parameters.?.len);
+
+    params.quic_transport_parameters = null;
+    const tcp_hello = try client_hello.parse(clientHello(&out, &params));
+    try std.testing.expectEqual(@as(?[]const u8, null), tcp_hello.quic_transport_parameters);
 }
