@@ -3,6 +3,15 @@
 //! Two halves, and they land on opposite sides of the trust split
 //! DESIGN.md §2 draws.
 //!
+//! **The handshake** is protocol: RFC 9001 §4 keeps TLS's messages and
+//! its key schedule and throws away its record layer. Handshake bytes
+//! cross as CRYPTO data at an encryption level, and what TLS hands back
+//! is a traffic secret per level rather than a sealed record. Both
+//! machines speak it when `Config.quic` is set — `handleCrypto` and
+//! `drainCrypto` in place of `handleRecord` and `drain` — and this file
+//! is the vocabulary they share with the transport: `Level`, `Secret`,
+//! `Crypto`, and the §4.8 mapping from a refusal to a QUIC error code.
+//!
 //! **Packet protection** is computation: §5.3's AEAD and §5.4's header
 //! protection, over keys the transport derived. It is libcrypto's for
 //! the reason record protection is — constant-time AEAD and AES are the
@@ -20,9 +29,55 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const alert = @import("alert.zig");
 const backend = @import("crypto/backend_openssl.zig");
 const cipher_suite = @import("cipher_suite.zig");
+const ClientHandshake = @import("ClientHandshake.zig");
+const ServerHandshake = @import("ServerHandshake.zig");
 const CipherSuite = cipher_suite.CipherSuite;
+
+/// §4.1.4's encryption levels, as far as TLS sees them: the three that
+/// carry handshake bytes. 0-RTT is the fourth level and is absent on
+/// purpose — §8.3 forbids CRYPTO frames in it, and zssl's QUIC mode never
+/// accepts or offers early data, so nothing TLS does ever happens there.
+/// `application` is 1-RTT, which h3 calls `one_rtt`.
+pub const Level = enum(u2) {
+    initial,
+    handshake,
+    application,
+};
+
+pub const Direction = enum { send, receive };
+
+/// A traffic secret for the transport to install (§4.1.4, §5.1): the
+/// level it protects, which way, and the suite whose hash and AEAD the
+/// transport derives packet keys under.
+///
+/// `bytes` is borrowed from the machine that derived it — one hash
+/// length, 32 or 48 octets — and valid until that machine's next call
+/// or `deinit`. Copy it into the transport's own storage, as h3's
+/// `installSecret` does, before calling in again.
+pub const Secret = struct {
+    level: Level,
+    direction: Direction,
+    suite: CipherSuite,
+    bytes: []const u8,
+};
+
+/// Handshake bytes for the transport to send at `level`, borrowed until
+/// the machine's next call.
+pub const Crypto = struct {
+    level: Level,
+    bytes: []const u8,
+};
+
+/// RFC 9000 §20.1's PROTOCOL_VIOLATION, which is what a handful of RFC
+/// 9001's rules name instead of an alert — see `errorCode`.
+pub const protocol_violation: u64 = 0x0a;
+
+/// §4.8: "the AlertDescription value is added to 0x0100 to produce a QUIC
+/// error code from the range reserved for CRYPTO_ERROR".
+pub const crypto_error_base: u64 = 0x0100;
 
 /// §5.3: AEAD_AES_128_GCM, AEAD_AES_256_GCM and AEAD_CHACHA20_POLY1305
 /// all carry a 16-octet tag and a 12-octet nonce.
@@ -81,14 +136,16 @@ pub fn nonce(iv: *const [nonce_bytes]u8, packet_number: u64) [nonce_bytes]u8 {
 pub const PacketKey = struct {
     aead: backend.PacketAead,
 
-    pub const Direction = backend.PacketAead.Direction;
+    /// Which of the two this key does: `.seal` on the sending side,
+    /// `.open` on the receiving one.
+    pub const Operation = backend.PacketAead.Direction;
 
     /// `key` is §5.1's "quic key" output: 16 octets for AES-128-GCM, 32
     /// for the other two.
-    pub fn init(suite: CipherSuite, key: []const u8, direction: Direction) Error!PacketKey {
+    pub fn init(suite: CipherSuite, key: []const u8, operation: Operation) Error!PacketKey {
         assert(key.len == suite.keyBytes());
-        const aead = try backend.PacketAead.init(suite, key, direction);
-        assert(aead.direction == direction);
+        const aead = try backend.PacketAead.init(suite, key, operation);
+        assert(aead.direction == operation);
         return .{ .aead = aead };
     }
 
@@ -202,3 +259,114 @@ pub const HeaderKey = struct {
         return result;
     }
 };
+
+/// Every refusal either machine can answer from a QUIC entry point.
+///
+/// The one place this file reaches above the vocabulary it defines: the
+/// machines import `Level` and `Secret` from here, and this imports
+/// their error sets back. Zig resolves the cycle lazily — neither error
+/// set depends on anything declared here — and the price is worth the
+/// exhaustive switch below, which a set of our own would not give.
+pub const HandshakeError = ServerHandshake.Error || ClientHandshake.Error;
+
+/// §4.8: the QUIC error code a failed handshake closes with — 0x0100 plus
+/// the TLS alert `alertFor` names, or PROTOCOL_VIOLATION for the rules
+/// RFC 9001 states as one (§8.4's session ID, §4.1.3's level change).
+pub fn errorCode(err: HandshakeError) u64 {
+    if (err == error.QuicProtocolViolation) return protocol_violation;
+    const code = crypto_error_base + @backingInt(alertFor(err));
+    assert(code >= crypto_error_base);
+    assert(code <= crypto_error_base + 0xff);
+    return code;
+}
+
+/// §4.8's alert for a refusal: what a TCP embedder would have sent as a
+/// record, which over QUIC becomes `errorCode`'s CRYPTO_ERROR.
+///
+/// zssl leaves this choice with a TCP embedder — the shims carry their
+/// own tables, on purpose — but a QUIC one has nowhere to send an alert
+/// and every refusal must become a code, so the library answers. The
+/// table is the shims' reading of RFC 8446 §6.2, and exhaustive on
+/// purpose: a new error is a compile error here until someone decides
+/// which alert it is.
+pub fn alertFor(err: HandshakeError) alert.Description {
+    return switch (err) {
+        // A message, or a KeyUpdate (§6), arriving where the handshake
+        // has no place for it.
+        error.UnexpectedMessage => .unexpected_message,
+        error.HandshakeFailure => .handshake_failure,
+        error.MissingExtension => .missing_extension,
+        error.UnsupportedExtension => .unsupported_extension,
+        error.NoApplicationProtocol => .no_application_protocol,
+        error.CertificateRequired => .certificate_required,
+        error.BadCertificate => .bad_certificate,
+        // §4.4.3 and §4.4.4 name decrypt_error for a CertificateVerify or
+        // Finished that does not check out, and §4.2.11.2 computes a
+        // binder "in the same way as the Finished message".
+        error.DecryptError, error.BadSignature, error.BadBinder => .decrypt_error,
+        // Legal grammar, illegal content.
+        error.IllegalRetry,
+        error.BadServerHello,
+        error.IdentityElement,
+        error.IllegalKeyUpdate,
+        error.IllegalCompression,
+        error.PskNotLast,
+        error.BadKeyShare,
+        error.NonMinimalEncoding,
+        error.BinderCountMismatch,
+        error.UnofferedSignatureScheme,
+        error.BadAlpn,
+        => .illegal_parameter,
+        // Bytes that do not decode into a decision.
+        error.MalformedMessage,
+        error.MalformedCertificate,
+        error.MalformedExtension,
+        error.MalformedAlert,
+        error.BadAlert,
+        error.DuplicateExtension,
+        error.SuiteOverflow,
+        error.ExtensionOverflow,
+        error.Truncated,
+        error.TrailingBytes,
+        => .decode_error,
+        // §8.4 and §4.1.3 name PROTOCOL_VIOLATION, which `errorCode`
+        // answers before asking here; unexpected_message is the nearest
+        // alert for a caller that wants one anyway.
+        error.QuicProtocolViolation => .unexpected_message,
+        // Our side, not the peer's: a buffer the embedder sized smaller
+        // than the message, libcrypto refusing, an embedder that skipped
+        // a drain or asked before the handshake finished. §6.2 has no
+        // alert for any of them.
+        error.BufferOverflow,
+        error.LibcryptoFailed,
+        error.EventsPending,
+        error.HandshakeNotComplete,
+        error.TicketNotPermitted,
+        error.UnsupportedKey,
+        error.DeterministicNonceUnsupported,
+        error.SignatureInvalid,
+        => .internal_error,
+        // The record layer's and its ceilings', and 0-RTT's. None is
+        // reachable from a QUIC entry point — there are no records and no
+        // early data — and they are named here only because the error sets
+        // are shared with TCP, where each has its alert.
+        error.AuthenticationFailed => .bad_record_mac,
+        error.RecordOverflow => .record_overflow,
+        error.NotATlsRecord => .protocol_version,
+        error.BadInnerPlaintext,
+        error.EmptyFragment,
+        error.UnexpectedRecordType,
+        error.UnknownContentType,
+        error.TooManyEmptyRecords,
+        error.TooManyKeyUpdates,
+        error.TooManyWarningAlerts,
+        error.TooMuchEarlyData,
+        error.TooMuchSkippedEarlyData,
+        => .unexpected_message,
+        error.SequenceExhausted, error.RotationsExhausted => .internal_error,
+        // A peer alert arrives over QUIC as a CONNECTION_CLOSE, never as
+        // TLS bytes; answering one with another is internal_error if it
+        // is anything.
+        error.PeerAlert => .internal_error,
+    };
+}

@@ -290,6 +290,95 @@ test "fuzz: ServerHandshake — arbitrary records error, never panic" {
     } });
 }
 
+/// Feed arbitrary bytes to a QUIC-mode machine as CRYPTO data: each
+/// chunk is a level byte, a length byte, and that many bytes, which is
+/// every way a transport could deliver them — any level, any
+/// fragmentation, any order. The property is the TCP one: error, then
+/// `failed`, and never a panic.
+fn feedCrypto(machine: anytype, input: []const u8) void {
+    var out: [ServerHandshake.quic_out_bytes_min]u8 = undefined;
+    const levels = [_]quic.Level{ .initial, .handshake, .application };
+    var offset: usize = 0;
+    var chunks: u16 = 0;
+    while (offset + 2 <= input.len) : (chunks += 1) {
+        // Each chunk consumes at least its two header bytes.
+        std.debug.assert(chunks <= input.len);
+        const level = levels[input[offset] % levels.len];
+        const end = @min(offset + 2 + input[offset + 1], input.len);
+        var event = machine.handleCrypto(level, input[offset + 2 .. end], &out) catch return;
+        var drained: u8 = 0;
+        while (event) |_| : (drained += 1) {
+            // A ClientHello's answer is six events, a Finished's two.
+            std.debug.assert(drained < 8);
+            event = machine.drainCrypto(&out) catch return;
+        }
+        offset = end;
+    }
+}
+
+fn fuzzQuicServerMachine(input: []const u8) !void {
+    var reassembly: [8192]u8 = undefined;
+    var flight: [ServerHandshake.quic_flight_bytes_min]u8 = undefined;
+    var server = ServerHandshake.init(&.{
+        .credentials = fuzzCredentials(),
+        .server_random = @splat(0x5c),
+        .key_share_private = @splat(0x77),
+        .alpn_protocols = &.{"h3"},
+        .reassembly = &reassembly,
+        .flight = &flight,
+        .quic = .{ .transport_parameters = "\x04\x02\x40\x80" },
+    });
+    defer server.deinit();
+    feedCrypto(&server, input);
+}
+
+/// RFC 8448's ClientHello with RFC 9001's two requirements appended to
+/// its extension block — ALPN "h3" and an empty quic_transport_parameters
+/// — and both length fields patched. Its session ID is already empty, so
+/// the seed is a hello a QUIC server answers, and the search starts from
+/// a working handshake rather than from noise.
+const quic_client_hello = blk: {
+    const extra = [_]u8{ 0x00, 0x10, 0x00, 0x05, 0x00, 0x03, 0x02, 'h', '3', 0x00, 0x39, 0x00, 0x00 };
+    var hello = vectors.client_hello ++ extra;
+    // The u24 message length's low octet, then the u16 extension block's.
+    hello[3] += extra.len;
+    hello[50] += extra.len;
+    break :blk hello;
+};
+
+/// One chunk at Initial: a level octet, a length octet, the hello.
+const quic_client_hello_seed = [_]u8{ 0x00, quic_client_hello.len } ++ quic_client_hello;
+
+test "the QUIC seed is a hello a QUIC server answers, so the search starts deep" {
+    var reassembly: [8192]u8 = undefined;
+    var flight: [ServerHandshake.quic_flight_bytes_min]u8 = undefined;
+    var server = ServerHandshake.init(&.{
+        .credentials = fuzzCredentials(),
+        .server_random = @splat(0x5c),
+        .key_share_private = @splat(0x77),
+        .alpn_protocols = &.{"h3"},
+        .reassembly = &reassembly,
+        .flight = &flight,
+        .quic = .{ .transport_parameters = "\x04\x02\x40\x80" },
+    });
+    defer server.deinit();
+    var out: [ServerHandshake.quic_out_bytes_min]u8 = undefined;
+    var events: u8 = 0;
+    var event = try server.handleCrypto(.initial, &quic_client_hello, &out);
+    while (event) |_| : (event = try server.drainCrypto(&out)) events += 1;
+    try std.testing.expectEqual(@as(u8, 6), events);
+    try std.testing.expectEqual(ServerHandshake.State.awaiting_finished, server.state);
+}
+
+test "fuzz: ServerHandshake QUIC mode — arbitrary CRYPTO bytes error, never panic" {
+    try std.testing.fuzz({}, adapt(fuzzQuicServerMachine, 8192), .{ .corpus = &.{
+        &quic_client_hello_seed,
+        "\x00\x04\x01\x00\x00\xc4",
+        "\x01\x04\x14\x00\x00\x20",
+        "\x02\x05\x18\x00\x00\x01\x00",
+    } });
+}
+
 fn fuzzClientMachine(input: []const u8) !void {
     var reassembly: [16384]u8 = undefined;
     var client = ClientHandshake.init(&.{

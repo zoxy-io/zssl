@@ -83,6 +83,17 @@ the four decisions everything else follows from.
   by both machines: rotation resets the sequence space, and a rotation
   ceiling turns a request loop into an error rather than a spin.
 - **kTLS key export** (§4).
+- **QUIC** (RFC 9001), server half: `Config.quic` turns the same
+  `ServerHandshake` into RFC 9001 §4's message-level machine. Handshake
+  bytes go in and come out per encryption level (`handleCrypto`,
+  `drainCrypto`), traffic secrets come out in §4.1.4's order, and the
+  record layer — framing, protection, ChangeCipherSpec — is simply not
+  used. §8's rules hold: `quic_transport_parameters` is mandatory and
+  opaque, ALPN is mandatory, a legacy_session_id is a PROTOCOL_VIOLATION,
+  a KeyUpdate is unexpected_message, no 0-RTT is accepted and no ticket
+  promises any. `quic.errorCode` turns any refusal into §4.8's
+  CRYPTO_ERROR. Packet protection (§5) is `quic.PacketKey` and
+  `quic.HeaderKey`, libcrypto's like every other AEAD; see "Why QUIC".
 
 ### Not built
 
@@ -92,9 +103,11 @@ purpose and lives under **Never** below.
 ### Never
 
 TLS 1.2 and earlier, renegotiation, compression, RSA and DSA key
-exchange, SSLv3-era anything, post-handshake client auth, and **QUIC and
-DTLS** — there is no datagram record layer and none planned. A caller
-that needs these wants a different library.
+exchange, SSLv3-era anything, post-handshake client auth, and **DTLS** —
+there is no datagram record layer and none planned. A caller that needs
+these wants a different library. QUIC was on this list for the same
+reason, and left it once it was clear QUIC wants no record layer at all;
+see "Why QUIC".
 
 **X.509 chain validation** is out too, but delegated rather than
 missing: `ClientHandshake.Config.chain_verifier` shows the embedder the
@@ -128,6 +141,38 @@ name it and never mention x25519 — so an x25519-only server was not
 merely narrow, it was close to untestable by anything but our own
 client. The same argument widened the client, where BoGo drove two dozen
 retry cases no single-group client could reach.
+
+### Why QUIC, having been out
+
+"No datagram record layer" was the reason, and for DTLS it still is.
+RFC 9001 is a different shape: §4 keeps TLS 1.3's messages and key
+schedule and discards the record layer outright, handing CRYPTO stream
+bytes across per encryption level and taking traffic secrets back. What
+it needs from a TLS library is therefore *less* than TCP does, provided
+the message core is not welded to records — and in zssl it was not,
+quite: reassembly, every parser and encoder, the transcript, the
+schedule and the state machine were already record-agnostic. The QUIC
+mode is the same `ServerHandshake` with its record framing, protectors
+and ChangeCipherSpec bypassed, so the negotiation, HelloRetryRequest,
+PSK, client-auth and ticket rules are the TCP ones, tested once.
+
+The embedder that made it worth doing is zoxy's HTTP/3 (zoxy-io/zoxy
+#449), over h3, a sans-I/O QUIC transport whose seam is exactly §4's:
+CRYPTO bytes in and out by level, secrets installed by level, transport
+parameters as opaque octets. That seam is why zssl owns no QUIC packet
+logic. What it does own is packet *protection* (§5): AEAD and header
+protection are the constant-time primitives §2 hands to libcrypto, and
+zssl is the one place an embedder's binary may bind it.
+
+Three refusals are QUIC's own rather than TLS's. 0-RTT is never accepted
+over QUIC — §8.3 removes EndOfEarlyData, and accepting would mean a
+second §8 story for a transport whose replay window is the transport's —
+so a ticket never carries `max_early_data_size`. A TLS KeyUpdate is
+refused (§6), because QUIC rotates its own keys from the secrets. And
+middlebox compatibility mode is out (§8.4): no ChangeCipherSpec is sent,
+and a ClientHello carrying a legacy_session_id is a PROTOCOL_VIOLATION —
+the one refusal `quic.errorCode` answers with a transport error code
+rather than §4.8's CRYPTO_ERROR.
 
 ### Why 0-RTT is in, having been out twice
 
@@ -306,8 +351,8 @@ derived from the RFCs rather than from any implementation, against the
 same harness. Both hold a passing count against a floor, so a quiet
 suppression stops the build. docs/TLSFUZZER.md, docs/TLSANVIL.md.
 
-**Fuzzing.** Ten targets over every parser, both state machines and
-QUIC's packet open,
+**Fuzzing.** Eleven targets over every parser, both state machines
+(the server over QUIC as well as TCP), and QUIC's packet open,
 asserting the one property that matters for a library whose assertions
 are claims about *our* state: arbitrary peer bytes produce a value or an
 error, never a panic. `zig build test-fuzz` runs each once over its

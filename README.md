@@ -262,9 +262,12 @@ RSA-PSS, SNI, ALPN, HelloRetryRequest in both directions, PSK
 resumption, 0-RTT, mutual authentication in both directions, RFC 5705
 exporters, KeyUpdate, and kTLS key export.
 
+QUIC (RFC 9001): the server handshake at the message level, and packet
+and header protection.
+
 Not built: nothing. Never:
 TLS 1.2 and earlier, renegotiation, compression, RSA and DSA key
-exchange, post-handshake client auth, QUIC and DTLS. X.509 chain
+exchange, post-handshake client auth, and DTLS. X.509 chain
 building and RFC 9525 name matching are yours, through
 `chain_verifier`, as above.
 
@@ -285,7 +288,7 @@ its own CI workflow, so they run in parallel and fail separately.
 | [**RFC 8448**](src/rfc8448_test.zig) | [![rfc8448](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml) | The RFC's traced bytes, reproduced exactly |
 | [**OpenSSL**](interop/main.zig) | [![interop](https://github.com/zoxy-io/zssl/actions/workflows/interop.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/interop.yml) | Five legs against a real `openssl` binary |
 | [**`std.crypto.tls`**](src/std_interop_test.zig) | [![std.crypto.tls](https://github.com/zoxy-io/zssl/actions/workflows/std-interop.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/std-interop.yml) | A second stack, in memory, both directions |
-| [**Fuzzing**](src/fuzz_test.zig) | [![fuzz](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml)<br>[![fuzz-search](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml) | Ten targets: a value or an error, never a panic. Seeds per PR, coverage-guided search nightly |
+| [**Fuzzing**](src/fuzz_test.zig) | [![fuzz](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml)<br>[![fuzz-search](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml) | Eleven targets: a value or an error, never a panic. Seeds per PR, coverage-guided search nightly |
 
 Plus directed tests for what only breaks under adversity — fragmented
 ClientHellos, tampered Finished messages, corrupted binders, inverted

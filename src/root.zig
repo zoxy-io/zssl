@@ -45,6 +45,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("rfc8448_test.zig");
     _ = @import("rfc9001_test.zig");
+    _ = @import("quic_test.zig");
     _ = @import("handshake_test.zig");
     _ = @import("std_interop_test.zig");
     _ = @import("resumption_test.zig");
