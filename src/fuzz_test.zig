@@ -17,6 +17,7 @@ const client_hello = @import("client_hello.zig");
 const handshake = @import("handshake.zig");
 const pem = @import("pem.zig");
 const protect = @import("protect.zig");
+const quic = @import("quic.zig");
 const record = @import("record.zig");
 const record_buffer = @import("record_buffer.zig");
 const vectors = @import("rfc8448_vectors.zig");
@@ -180,6 +181,40 @@ fn fuzzProtectorOpen(input: []const u8) !void {
 test "fuzz: record protection open — forgeries fail closed" {
     try std.testing.fuzz({}, adapt(fuzzProtectorOpen, 17000), .{ .corpus = &.{
         vectors.server_app_record[record.header_bytes..],
+    } });
+}
+
+/// RFC 9001 §5.3 from the receiving side: a packet whose first octet
+/// says how much of it is header, opened under a key the input never
+/// learned. The bytes are a peer's, so the only property is that a
+/// forgery — or a packet too short to hold a tag — fails as an error.
+fn fuzzPacketOpen(input: []const u8) !void {
+    if (input.len == 0) return;
+    const suites = [_]@import("cipher_suite.zig").CipherSuite{
+        .aes_128_gcm_sha256,
+        .aes_256_gcm_sha384,
+        .chacha20_poly1305_sha256,
+    };
+    const suite = suites[input[0] % suites.len];
+    const key: [32]u8 = @splat(0x5a);
+    var packet_key = quic.PacketKey.init(suite, key[0..suite.keyBytes()], .open) catch return;
+    defer packet_key.deinit();
+    var buffer: [2048]u8 = undefined;
+    const take = @min(input.len - 1, buffer.len);
+    @memcpy(buffer[0..take], input[1..][0..take]);
+    const header_bytes = @min(take, @as(usize, input[0] >> 2));
+    const packet_nonce = quic.nonce(&@as([quic.nonce_bytes]u8, @splat(0x17)), take);
+    _ = packet_key.open(&packet_nonce, buffer[0..header_bytes], buffer[header_bytes..take]) catch return;
+}
+
+/// A 22-octet header — A.2's shape — ahead of forty octets of ciphertext.
+const packet_open_seed = "\x58\xc3".* ++ @as([60]u8, @splat(0));
+
+test "fuzz: QUIC packet open — forgeries and truncations fail closed" {
+    try std.testing.fuzz({}, adapt(fuzzPacketOpen, 2049), .{ .corpus = &.{
+        &packet_open_seed,
+        "\x01",
+        "\x02\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
     } });
 }
 

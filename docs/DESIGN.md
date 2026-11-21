@@ -306,7 +306,8 @@ derived from the RFCs rather than from any implementation, against the
 same harness. Both hold a passing count against a floor, so a quiet
 suppression stops the build. docs/TLSFUZZER.md, docs/TLSANVIL.md.
 
-**Fuzzing.** Nine targets over every parser and both state machines,
+**Fuzzing.** Ten targets over every parser, both state machines and
+QUIC's packet open,
 asserting the one property that matters for a library whose assertions
 are claims about *our* state: arbitrary peer bytes produce a value or an
 error, never a panic. `zig build test-fuzz` runs each once over its

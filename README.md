@@ -285,7 +285,7 @@ its own CI workflow, so they run in parallel and fail separately.
 | [**RFC 8448**](src/rfc8448_test.zig) | [![rfc8448](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml) | The RFC's traced bytes, reproduced exactly |
 | [**OpenSSL**](interop/main.zig) | [![interop](https://github.com/zoxy-io/zssl/actions/workflows/interop.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/interop.yml) | Five legs against a real `openssl` binary |
 | [**`std.crypto.tls`**](src/std_interop_test.zig) | [![std.crypto.tls](https://github.com/zoxy-io/zssl/actions/workflows/std-interop.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/std-interop.yml) | A second stack, in memory, both directions |
-| [**Fuzzing**](src/fuzz_test.zig) | [![fuzz](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml)<br>[![fuzz-search](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml) | Nine targets: a value or an error, never a panic. Seeds per PR, coverage-guided search nightly |
+| [**Fuzzing**](src/fuzz_test.zig) | [![fuzz](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml)<br>[![fuzz-search](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml) | Ten targets: a value or an error, never a panic. Seeds per PR, coverage-guided search nightly |
 
 Plus directed tests for what only breaks under adversity — fragmented
 ClientHellos, tampered Finished messages, corrupted binders, inverted
@@ -332,7 +332,9 @@ zig fmt --check src interop bench bogo tlsanvil tlsfuzzer scripts build.zig buil
 
 RFC 8448 vectors are generated, never transcribed:
 `scripts/extract_rfc8448.py` parses the RFC text into
-`src/rfc8448_vectors.zig`. Regenerate rather than hand-editing.
+`src/rfc8448_vectors.zig`, and `scripts/extract_rfc9001.py` does the
+same for RFC 9001's Appendix A into `src/rfc9001_vectors.zig`.
+Regenerate rather than hand-editing.
 
 [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) is the style contract the tree
 is held to.
@@ -346,6 +348,7 @@ Two things travel with it under other terms:
 - **OpenSSL** (Apache-2.0) is compiled into any binary that links zssl,
   so that binary has to carry Apache-2.0's notice and attribution. This
   is an obligation on whoever ships the binary, not on zssl's source.
-- **`src/rfc8448_vectors.zig`** is generated from the text of RFC 8448,
-  which is IETF Trust material. The generator is in `scripts/`, so the
-  provenance of every byte is reproducible rather than asserted.
+- **`src/rfc8448_vectors.zig`** and **`src/rfc9001_vectors.zig`** are
+  generated from the texts of RFC 8448 and RFC 9001, which are IETF
+  Trust material. The generators are in `scripts/`, so the provenance of
+  every byte is reproducible rather than asserted.

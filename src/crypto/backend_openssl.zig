@@ -1,4 +1,5 @@
-//! The libcrypto primitive backend: AEAD record protection and X25519.
+//! The libcrypto primitive backend: AEAD record protection, RFC 9001
+//! packet and header protection, and X25519.
 //!
 //! This file and `c.zig` are the codebase's entire C surface. The division
 //! of trust is DESIGN.md §2: constant-time primitives come from the
@@ -16,7 +17,9 @@
 //! through libcrypto's allocator, which the embedder redirects to a fixed
 //! heap via `mem_hooks` at startup. AEAD contexts are created once per
 //! traffic key and reused per record; the X25519 objects live only for the
-//! duration of one handshake's key agreement.
+//! duration of one handshake's key agreement. QUIC's `PacketAead` and
+//! `HeaderProtection` follow the record rule: one context per key, made
+//! once, reused for every packet under it.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -158,6 +161,203 @@ pub const AeadKey = struct {
         if (c.EVP_CIPHER_CTX_ctrl(self.dec, c.EVP_CTRL_AEAD_SET_TAG, tag_bytes, @constCast(tag)) != 1) return error.LibcryptoFailed;
         if (c.EVP_DecryptFinal_ex(self.dec, plaintext.ptr + body_written, &written) != 1) return error.AuthenticationFailed;
         assert(body_written + @as(usize, @intCast(written)) == ciphertext.len);
+    }
+};
+
+/// RFC 9001 §5.3's packet AEAD: one key, one direction, one context.
+///
+/// `AeadKey` carries a context for each direction because the record
+/// tests seal and open under one key; a QUIC key is used one way only,
+/// and a connection holds up to eight of them (§4.1.4's three levels
+/// and §6's next generation, both ways), so a second context per key
+/// would double what a connection costs the embedder's fixed heap for
+/// nothing. Initialized once per key, which is the one allocation;
+/// `seal` and `open` reuse the context and allocate nothing.
+///
+/// Both work in place: the payload is overwritten with its own
+/// ciphertext or plaintext. libcrypto permits exactly-equal input and
+/// output for every AEAD here, and nothing else is ever passed.
+pub const PacketAead = struct {
+    context: *c.EVP_CIPHER_CTX,
+    direction: Direction,
+    key_bytes: u8,
+
+    pub const Direction = enum { seal, open };
+
+    /// libcrypto's lengths are `c_int`. A QUIC packet is at most 2^16
+    /// octets on the wire (RFC 9000 §14), so this is a bound no caller
+    /// holding a packet can reach, stated so the casts below are checked
+    /// ones rather than hopeful ones.
+    pub const payload_bytes_max: u32 = 1 << 16;
+
+    pub fn init(suite: CipherSuite, key: []const u8, direction: Direction) Error!PacketAead {
+        errdefer clearErrorQueue();
+        assert(key.len == suite.keyBytes());
+        assert(key.len == 16 or key.len == 32);
+        const context = c.EVP_CIPHER_CTX_new() orelse return error.LibcryptoFailed;
+        errdefer c.EVP_CIPHER_CTX_free(context);
+        const cipher = aeadCipher(suite);
+        const encrypt: c_int = switch (direction) {
+            .seal => 1,
+            .open => 0,
+        };
+        if (c.EVP_CipherInit_ex(context, cipher, null, null, null, encrypt) != 1) return error.LibcryptoFailed;
+        if (c.EVP_CIPHER_CTX_ctrl(context, c.EVP_CTRL_AEAD_SET_IVLEN, nonce_bytes, null) != 1) {
+            return error.LibcryptoFailed;
+        }
+        if (c.EVP_CipherInit_ex(context, null, null, key.ptr, null, encrypt) != 1) return error.LibcryptoFailed;
+        return .{ .context = context, .direction = direction, .key_bytes = @intCast(key.len) };
+    }
+
+    pub fn deinit(self: *PacketAead) void {
+        assert(self.key_bytes == 16 or self.key_bytes == 32);
+        c.EVP_CIPHER_CTX_free(self.context);
+        self.* = undefined;
+    }
+
+    /// Encrypt `payload` in place and write its tag to `tag`.
+    pub fn seal(
+        self: *PacketAead,
+        nonce: *const [nonce_bytes]u8,
+        additional_data: []const u8,
+        payload: []u8,
+        tag: *[tag_bytes]u8,
+    ) Error!void {
+        errdefer clearErrorQueue();
+        assert(self.direction == .seal);
+        assert(payload.len <= payload_bytes_max);
+        assert(additional_data.len <= payload_bytes_max);
+        var written: c_int = 0;
+        if (c.EVP_EncryptInit_ex(self.context, null, null, null, nonce) != 1) return error.LibcryptoFailed;
+        if (c.EVP_EncryptUpdate(self.context, null, &written, additional_data.ptr, @intCast(additional_data.len)) != 1) {
+            return error.LibcryptoFailed;
+        }
+        if (c.EVP_EncryptUpdate(self.context, payload.ptr, &written, payload.ptr, @intCast(payload.len)) != 1) {
+            return error.LibcryptoFailed;
+        }
+        const body_written: usize = @intCast(written);
+        if (c.EVP_EncryptFinal_ex(self.context, payload.ptr + body_written, &written) != 1) return error.LibcryptoFailed;
+        assert(body_written + @as(usize, @intCast(written)) == payload.len);
+        if (c.EVP_CIPHER_CTX_ctrl(self.context, c.EVP_CTRL_AEAD_GET_TAG, tag_bytes, tag) != 1) {
+            return error.LibcryptoFailed;
+        }
+    }
+
+    /// Decrypt `payload` in place against `tag`. On any error the payload
+    /// is zeroed: libcrypto has already written unauthenticated plaintext
+    /// over it by the time the tag is checked, and bytes no key vouched
+    /// for must not outlive the call that refused them.
+    pub fn open(
+        self: *PacketAead,
+        nonce: *const [nonce_bytes]u8,
+        additional_data: []const u8,
+        payload: []u8,
+        tag: *const [tag_bytes]u8,
+    ) Error!void {
+        errdefer clearErrorQueue();
+        errdefer std.crypto.secureZero(u8, payload);
+        assert(self.direction == .open);
+        assert(payload.len <= payload_bytes_max);
+        assert(additional_data.len <= payload_bytes_max);
+        var written: c_int = 0;
+        // Absorbing the associated data checks nothing, so a failure there
+        // is libcrypto's; the payload update is where a cipher may refuse
+        // what it was given, and that is the forgery verdict `AeadKey`
+        // gives the same call.
+        if (c.EVP_DecryptInit_ex(self.context, null, null, null, nonce) != 1) return error.LibcryptoFailed;
+        if (c.EVP_DecryptUpdate(self.context, null, &written, additional_data.ptr, @intCast(additional_data.len)) != 1) {
+            return error.LibcryptoFailed;
+        }
+        if (c.EVP_DecryptUpdate(self.context, payload.ptr, &written, payload.ptr, @intCast(payload.len)) != 1) {
+            return error.AuthenticationFailed;
+        }
+        const body_written: usize = @intCast(written);
+        // SET_TAG reads through the mutable pointer the control API demands.
+        if (c.EVP_CIPHER_CTX_ctrl(self.context, c.EVP_CTRL_AEAD_SET_TAG, tag_bytes, @constCast(tag)) != 1) {
+            return error.LibcryptoFailed;
+        }
+        if (c.EVP_DecryptFinal_ex(self.context, payload.ptr + body_written, &written) != 1) {
+            return error.AuthenticationFailed;
+        }
+        assert(body_written + @as(usize, @intCast(written)) == payload.len);
+    }
+};
+
+/// RFC 9001 §5.4's header protection: a five-octet mask from a sixteen-
+/// octet sample, under one header-protection key.
+///
+/// §5.4.3's AES variant is one raw block — ECB over exactly one block,
+/// the one place that is not a mistake — so the context is keyed once
+/// and each mask is a single update. §5.4.4's ChaCha20 variant takes the
+/// sample's first four octets as a little-endian block counter and the
+/// other twelve as the nonce, which is octet for octet the sixteen-octet
+/// IV libcrypto's `EVP_chacha20` defines, so each mask re-IVs the context
+/// and encrypts five zero octets. Neither allocates after `init`.
+pub const HeaderProtection = struct {
+    context: *c.EVP_CIPHER_CTX,
+    kind: Kind,
+
+    pub const Kind = enum { aes, chacha20 };
+    pub const sample_bytes: u8 = 16;
+    pub const mask_bytes: u8 = 5;
+
+    pub fn init(suite: CipherSuite, key: []const u8) Error!HeaderProtection {
+        errdefer clearErrorQueue();
+        // §5.4.3/§5.4.4: the header-protection key is the AEAD key's
+        // length — 16 octets for AES-128, 32 for the other two.
+        assert(key.len == suite.keyBytes());
+        assert(key.len == 16 or key.len == 32);
+        const kind: Kind = switch (suite) {
+            .aes_128_gcm_sha256, .aes_256_gcm_sha384 => .aes,
+            .chacha20_poly1305_sha256 => .chacha20,
+        };
+        const cipher = switch (suite) {
+            .aes_128_gcm_sha256 => c.EVP_aes_128_ecb(),
+            .aes_256_gcm_sha384 => c.EVP_aes_256_ecb(),
+            .chacha20_poly1305_sha256 => c.EVP_chacha20(),
+        } orelse unreachable; // Statically linked, so always present.
+        const context = c.EVP_CIPHER_CTX_new() orelse return error.LibcryptoFailed;
+        errdefer c.EVP_CIPHER_CTX_free(context);
+        // The IV is each mask's sample, so ChaCha20 is keyed without one.
+        if (c.EVP_EncryptInit_ex(context, cipher, null, key.ptr, null) != 1) return error.LibcryptoFailed;
+        // One block in, one block out: PKCS#7 padding would owe a second
+        // block to a mask that is only ever one.
+        if (kind == .aes) {
+            if (c.EVP_CIPHER_CTX_set_padding(context, 0) != 1) return error.LibcryptoFailed;
+        }
+        return .{ .context = context, .kind = kind };
+    }
+
+    pub fn deinit(self: *HeaderProtection) void {
+        assert(self.kind == .aes or self.kind == .chacha20);
+        c.EVP_CIPHER_CTX_free(self.context);
+        self.* = undefined;
+    }
+
+    pub fn mask(self: *HeaderProtection, sample: *const [sample_bytes]u8) Error![mask_bytes]u8 {
+        errdefer clearErrorQueue();
+        assert(self.kind == .aes or self.kind == .chacha20);
+        var written: c_int = 0;
+        switch (self.kind) {
+            .aes => {
+                var block: [sample_bytes]u8 = undefined;
+                if (c.EVP_EncryptUpdate(self.context, &block, &written, sample, sample_bytes) != 1) {
+                    return error.LibcryptoFailed;
+                }
+                if (written != sample_bytes) return error.LibcryptoFailed;
+                return block[0..mask_bytes].*;
+            },
+            .chacha20 => {
+                if (c.EVP_EncryptInit_ex(self.context, null, null, null, sample) != 1) return error.LibcryptoFailed;
+                const zeroes: [mask_bytes]u8 = @splat(0);
+                var keystream: [mask_bytes]u8 = undefined;
+                if (c.EVP_EncryptUpdate(self.context, &keystream, &written, &zeroes, mask_bytes) != 1) {
+                    return error.LibcryptoFailed;
+                }
+                if (written != mask_bytes) return error.LibcryptoFailed;
+                return keystream;
+            },
+        }
     }
 };
 
