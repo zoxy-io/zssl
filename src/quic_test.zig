@@ -47,15 +47,24 @@ const ServerHarness = struct {
         groups: []const u16 = &client_hello.groups_supported,
         client_auth: ?ServerHandshake.ClientAuth = null,
         psk_lookup: ?ServerHandshake.PskLookup = null,
+        leaf: enum { p256, p384 } = .p256,
     };
 
     fn init(harness: *ServerHarness, options: Options) !void {
-        harness.credentials = try Credentials.load(
-            @embedFile("testdata/cert.pem"),
-            @embedFile("testdata/key.pem"),
-            &harness.chain_storage,
-            true,
-        );
+        harness.credentials = switch (options.leaf) {
+            .p256 => try Credentials.load(
+                @embedFile("testdata/cert.pem"),
+                @embedFile("testdata/key.pem"),
+                &harness.chain_storage,
+                true,
+            ),
+            .p384 => try Credentials.load(
+                @embedFile("testdata/p384-cert.pem"),
+                @embedFile("testdata/p384-key.pem"),
+                &harness.chain_storage,
+                true,
+            ),
+        };
         harness.server = ServerHandshake.init(&.{
             .credentials = &harness.credentials,
             .server_random = @splat(0x5c),
@@ -77,6 +86,7 @@ const ServerHarness = struct {
 };
 
 const HelloOptions = struct {
+    server_name: []const u8 = "quic.zssl.test",
     session_id: []const u8 = &.{},
     alpn: []const []const u8 = &.{"h3"},
     parameters: ?[]const u8 = &client_parameters,
@@ -95,7 +105,7 @@ fn quicHello(out: []u8, options: HelloOptions) ![]const u8 {
         .share_public = options.share_public orelse &x25519_public,
         .signature_schemes = &client_messages.signature_schemes_default,
         .groups = &.{ client_hello.group_x25519, client_hello.group_secp256r1 },
-        .server_name = "quic.zssl.test",
+        .server_name = options.server_name,
         .alpn_protocols = options.alpn,
         .quic_transport_parameters = options.parameters,
     });
@@ -942,5 +952,39 @@ test "QUIC: nothing may ride behind a Finished at the Handshake level, on either
         const both = derived.client_finished ++ trailing;
         try testing.expectError(error.UnexpectedMessage, harness.server.handleCrypto(.handshake, &both, &harness.out));
         try testing.expectEqual(ServerHandshake.State.failed, harness.server.state);
+    }
+}
+
+test "QUIC server: SNI chooses the certificate before the handshake exists, as over TCP" {
+    // A TCP embedder reads server_name off the first record and only then
+    // builds the machine with the certificate it selects. Over QUIC the
+    // same order holds with the Initial CRYPTO stream: wait for a whole
+    // ClientHello, parse it, choose, init, feed.
+    for ([_][]const u8{ "p384.zssl.test", "quic.zssl.test" }) |name| {
+        var hello_buffer: [client_messages.hello_bytes_max]u8 = undefined;
+        const hello = try quicHello(&hello_buffer, .{ .server_name = name });
+        // Still arriving, whatever the prefix — and a declared length a
+        // peer will never send is a wait, not a fault.
+        for ([_]usize{ 0, 3, 4, hello.len - 1 }) |prefix| {
+            try testing.expectEqual(@as(?[]const u8, null), quic.firstMessage(hello[0..prefix]));
+        }
+        try testing.expectEqual(@as(?[]const u8, null), quic.firstMessage(&.{ 1, 0xff, 0xff, 0xff, 0 }));
+        // Whole, and exactly the message even with more queued behind it.
+        var queued: [client_messages.hello_bytes_max + 4]u8 = undefined;
+        @memcpy(queued[0..hello.len], hello);
+        @memcpy(queued[hello.len..][0..4], &[_]u8{ 1, 0, 0, 9 });
+        const message = quic.firstMessage(queued[0 .. hello.len + 4]).?;
+        try testing.expectEqualSlices(u8, hello, message);
+        const parsed = try client_hello.parse(message);
+        const p384 = std.mem.eql(u8, parsed.server_name.?, "p384.zssl.test");
+
+        var harness: ServerHarness = undefined;
+        try harness.init(.{ .leaf = if (p384) .p384 else .p256 });
+        defer harness.deinit();
+        var events: Events = .{};
+        try events.feed(&harness, .initial, message, 1);
+        try testing.expectEqual(@as(u8, 6), events.count);
+        const expected: backend.SignatureScheme = if (p384) .ecdsa_secp384r1_sha384 else .ecdsa_secp256r1_sha256;
+        try testing.expectEqual(expected, harness.server.signature_scheme);
     }
 }

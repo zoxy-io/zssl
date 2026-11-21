@@ -300,6 +300,12 @@ RFC 9001 states as one. The client half is the same loop after
 `sendNewSessionTicket` as bare messages for the application level;
 0-RTT, TLS KeyUpdate and compatibility mode are not part of this mode.
 
+Choosing a certificate by SNI works as it does over TCP, before the
+machine exists: `zssl.quic.firstMessage(connection.cryptoOut(.initial))`
+answers the ClientHello once it is whole, `zssl.client_hello.parse`
+reads its `server_name`, and the server is built with the `Credentials`
+that name selects and fed the same bytes.
+
 Packet protection is here too, because libcrypto is: `zssl.quic.PacketKey`
 seals and opens a packet in place under §5.3's AEAD, and
 `zssl.quic.HeaderKey` produces §5.4's mask from a sample. Each is

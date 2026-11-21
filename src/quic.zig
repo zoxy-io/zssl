@@ -71,6 +71,29 @@ pub const Crypto = struct {
     bytes: []const u8,
 };
 
+/// The first whole handshake message at the front of `bytes` — a
+/// transport's Initial CRYPTO stream, as h3's `cryptoOut` hands it over
+/// — or null while it is still arriving.
+///
+/// For choosing a certificate before the handshake exists, the way a TCP
+/// embedder reads a ClientHello's server_name off the first record: wait
+/// for this to answer, `client_hello.parse` it, pick the `Credentials`
+/// the name selects, and only then `init` the server and feed it the same
+/// bytes. Nothing is consumed and nothing is judged here; the machine
+/// will refuse whatever the parse let through on its own terms. A peer
+/// can declare a length it never sends, so the wait is bounded by the
+/// transport's CRYPTO buffer, not by this.
+pub fn firstMessage(bytes: []const u8) ?[]const u8 {
+    if (bytes.len < 4) return null;
+    const declared = std.mem.readInt(u24, bytes[1..4], .big);
+    const total = 4 + @as(usize, declared);
+    if (bytes.len < total) return null;
+    assert(total <= bytes.len);
+    const message = bytes[0..total];
+    assert(message.len >= 4);
+    return message;
+}
+
 /// RFC 9000 §20.1's PROTOCOL_VIOLATION, which is what a handful of RFC
 /// 9001's rules name instead of an alert — see `errorCode`.
 pub const protocol_violation: u64 = 0x0a;
