@@ -17,6 +17,7 @@ const client_hello = @import("client_hello.zig");
 const handshake = @import("handshake.zig");
 const pem = @import("pem.zig");
 const protect = @import("protect.zig");
+const quic = @import("quic.zig");
 const record = @import("record.zig");
 const record_buffer = @import("record_buffer.zig");
 const vectors = @import("rfc8448_vectors.zig");
@@ -183,6 +184,40 @@ test "fuzz: record protection open — forgeries fail closed" {
     } });
 }
 
+/// RFC 9001 §5.3 from the receiving side: a packet whose first octet
+/// says how much of it is header, opened under a key the input never
+/// learned. The bytes are a peer's, so the only property is that a
+/// forgery — or a packet too short to hold a tag — fails as an error.
+fn fuzzPacketOpen(input: []const u8) !void {
+    if (input.len == 0) return;
+    const suites = [_]@import("cipher_suite.zig").CipherSuite{
+        .aes_128_gcm_sha256,
+        .aes_256_gcm_sha384,
+        .chacha20_poly1305_sha256,
+    };
+    const suite = suites[input[0] % suites.len];
+    const key: [32]u8 = @splat(0x5a);
+    var packet_key = quic.PacketKey.init(suite, key[0..suite.keyBytes()], .open) catch return;
+    defer packet_key.deinit();
+    var buffer: [2048]u8 = undefined;
+    const take = @min(input.len - 1, buffer.len);
+    @memcpy(buffer[0..take], input[1..][0..take]);
+    const header_bytes = @min(take, @as(usize, input[0] >> 2));
+    const packet_nonce = quic.nonce(&@as([quic.nonce_bytes]u8, @splat(0x17)), take);
+    _ = packet_key.open(&packet_nonce, buffer[0..header_bytes], buffer[header_bytes..take]) catch return;
+}
+
+/// A 22-octet header — A.2's shape — ahead of forty octets of ciphertext.
+const packet_open_seed = "\x58\xc3".* ++ @as([60]u8, @splat(0));
+
+test "fuzz: QUIC packet open — forgeries and truncations fail closed" {
+    try std.testing.fuzz({}, adapt(fuzzPacketOpen, 2049), .{ .corpus = &.{
+        &packet_open_seed,
+        "\x01",
+        "\x02\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+    } });
+}
+
 var fuzz_chain_storage: [Credentials.chain_bytes_max]u8 = undefined;
 /// Loaded once and shared: parsing a key per iteration would spend the
 /// fuzzer's budget in libcrypto rather than in our parsers. The lazy
@@ -252,6 +287,124 @@ test "fuzz: ServerHandshake — arbitrary records error, never panic" {
         &client_hello_record,
         "\x14\x03\x03\x00\x01\x01",
         "\x15\x03\x03\x00\x02\x02\x28",
+    } });
+}
+
+/// Feed arbitrary bytes to a QUIC-mode machine as CRYPTO data: each
+/// chunk is a level byte, a length byte, and that many bytes, which is
+/// every way a transport could deliver them — any level, any
+/// fragmentation, any order. The property is the TCP one: error, then
+/// `failed`, and never a panic.
+fn feedCrypto(machine: anytype, input: []const u8) void {
+    var out: [@max(ServerHandshake.quic_out_bytes_min, ClientHandshake.quic_out_bytes_min)]u8 = undefined;
+    const levels = [_]quic.Level{ .initial, .handshake, .application };
+    var offset: usize = 0;
+    var chunks: u16 = 0;
+    while (offset + 2 <= input.len) : (chunks += 1) {
+        // Each chunk consumes at least its two header bytes.
+        std.debug.assert(chunks <= input.len);
+        const level = levels[input[offset] % levels.len];
+        const end = @min(offset + 2 + input[offset + 1], input.len);
+        var event = machine.handleCrypto(level, input[offset + 2 .. end], &out) catch return;
+        var drained: u8 = 0;
+        while (event) |_| : (drained += 1) {
+            // A ClientHello's answer is six events, a Finished's two.
+            std.debug.assert(drained < 8);
+            event = machine.drainCrypto(&out) catch return;
+        }
+        offset = end;
+    }
+}
+
+fn fuzzQuicServerMachine(input: []const u8) !void {
+    var reassembly: [8192]u8 = undefined;
+    var flight: [ServerHandshake.quic_flight_bytes_min]u8 = undefined;
+    var server = ServerHandshake.init(&.{
+        .credentials = fuzzCredentials(),
+        .server_random = @splat(0x5c),
+        .key_share_private = @splat(0x77),
+        .alpn_protocols = &.{"h3"},
+        .reassembly = &reassembly,
+        .flight = &flight,
+        .quic = .{ .transport_parameters = "\x04\x02\x40\x80" },
+    });
+    defer server.deinit();
+    feedCrypto(&server, input);
+}
+
+/// RFC 8448's ClientHello with RFC 9001's two requirements appended to
+/// its extension block — ALPN "h3" and an empty quic_transport_parameters
+/// — and both length fields patched. Its session ID is already empty, so
+/// the seed is a hello a QUIC server answers, and the search starts from
+/// a working handshake rather than from noise.
+const quic_client_hello = blk: {
+    const extra = [_]u8{ 0x00, 0x10, 0x00, 0x05, 0x00, 0x03, 0x02, 'h', '3', 0x00, 0x39, 0x00, 0x00 };
+    var hello = vectors.client_hello ++ extra;
+    // The u24 message length's low octet, then the u16 extension block's.
+    hello[3] += extra.len;
+    hello[50] += extra.len;
+    break :blk hello;
+};
+
+/// One chunk at Initial: a level octet, a length octet, the hello.
+const quic_client_hello_seed = [_]u8{ 0x00, quic_client_hello.len } ++ quic_client_hello;
+
+test "the QUIC seed is a hello a QUIC server answers, so the search starts deep" {
+    var reassembly: [8192]u8 = undefined;
+    var flight: [ServerHandshake.quic_flight_bytes_min]u8 = undefined;
+    var server = ServerHandshake.init(&.{
+        .credentials = fuzzCredentials(),
+        .server_random = @splat(0x5c),
+        .key_share_private = @splat(0x77),
+        .alpn_protocols = &.{"h3"},
+        .reassembly = &reassembly,
+        .flight = &flight,
+        .quic = .{ .transport_parameters = "\x04\x02\x40\x80" },
+    });
+    defer server.deinit();
+    var out: [ServerHandshake.quic_out_bytes_min]u8 = undefined;
+    var events: u8 = 0;
+    var event = try server.handleCrypto(.initial, &quic_client_hello, &out);
+    while (event) |_| : (event = try server.drainCrypto(&out)) events += 1;
+    try std.testing.expectEqual(@as(u8, 6), events);
+    try std.testing.expectEqual(ServerHandshake.State.awaiting_finished, server.state);
+}
+
+test "fuzz: ServerHandshake QUIC mode — arbitrary CRYPTO bytes error, never panic" {
+    try std.testing.fuzz({}, adapt(fuzzQuicServerMachine, 8192), .{ .corpus = &.{
+        &quic_client_hello_seed,
+        "\x00\x04\x01\x00\x00\xc4",
+        "\x01\x04\x14\x00\x00\x20",
+        "\x02\x05\x18\x00\x00\x01\x00",
+    } });
+}
+
+fn fuzzQuicClientMachine(input: []const u8) !void {
+    var reassembly: [16384]u8 = undefined;
+    var client = ClientHandshake.init(&.{
+        .client_random = @splat(0x1a),
+        .x25519_private = @splat(0x31),
+        .server_name = "spike.zoxy.test",
+        .alpn_protocols = &.{"h3"},
+        .certificate_policy = .leaf_signature,
+        .reassembly = &reassembly,
+        .quic = .{ .transport_parameters = "\x04\x02\x40\x80" },
+    });
+    defer client.deinit();
+    _ = client.startCrypto();
+    feedCrypto(&client, input);
+}
+
+/// RFC 8448's ServerHello as one chunk at Initial. Its session-ID echo is
+/// empty, as a QUIC client's must be, and its x25519 share agrees with
+/// any scalar, so the seed carries the client into its Handshake level.
+const quic_server_hello_seed = [_]u8{ 0x00, vectors.server_hello.len } ++ vectors.server_hello;
+
+test "fuzz: ClientHandshake QUIC mode — arbitrary CRYPTO bytes error, never panic" {
+    try std.testing.fuzz({}, adapt(fuzzQuicClientMachine, 8192), .{ .corpus = &.{
+        &quic_server_hello_seed,
+        "\x01\x06\x08\x00\x00\x02\x00\x00",
+        "\x02\x05\x18\x00\x00\x01\x01",
     } });
 }
 

@@ -65,9 +65,21 @@ pub fn Hkdf(comptime Hash: type) type {
         }
 
         /// HKDF-Extract(salt, ikm) — HMAC keyed by the salt (RFC 5869 §2.2).
+        ///
+        /// No floor on `ikm`. RFC 5869 defines Extract over any octet
+        /// string; the TLS schedule never passes an empty one, but RFC
+        /// 9001 §5.2's legitimately can: Initial secrets extract from a
+        /// Destination Connection ID, and after a Retry that is whatever
+        /// the server chose — RFC 9000 §17.2.5 lets it be zero octets. A
+        /// floor here would be an assertion a peer reaches through any
+        /// transport that derives its Initial keys with this.
+        ///
+        /// The ceiling stays, and is the caller's to meet: RFC 9000
+        /// §17.2 lets a long header *encode* a 255-octet connection ID,
+        /// and version 1 caps it at 20, so a transport checks that before
+        /// deriving anything from one.
         pub fn extract(salt: []const u8, ikm: []const u8) [prk_bytes]u8 {
             assert(salt.len <= prk_bytes);
-            assert(ikm.len >= 1);
             assert(ikm.len <= 64);
             var prk: [prk_bytes]u8 = undefined;
             Hmac.create(&prk, ikm, salt);

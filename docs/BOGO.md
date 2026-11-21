@@ -9,7 +9,7 @@ because every other oracle in the tree tests what we accept.
 It now runs: `zig build bogo`.
 
 ```
-bogo: 454 passed, 0 failed, 6490 declined by the shim (89), floor 454
+bogo: 462 passed, 0 failed, 6458 declined by the shim (89), floor 462
 bogo: PASS
 ```
 
@@ -41,8 +41,10 @@ it means re-deriving the floor in the same commit.
 
 ## The three numbers
 
-**454 passed.** Cases the runner ran end to end and we satisfied —
-including the alert we sent, which BoGo checks by name. It was 424
+**462 passed.** Cases the runner ran end to end and we satisfied —
+including the alert we sent, which BoGo checks by name. It was 454
+until the server learned RFC 9001's extension well enough to refuse it
+over TCP (finding 26), 424
 until a review found the server role still declining two flags it could
 answer (finding 24), 401 until client certificates landed (finding 23), 367 until §7.5's exporter
 did (finding 21), 348 until the server's
@@ -82,7 +84,9 @@ extension block, and 143 until §4.6.3's update requests were coalesced, and
 either gets fixed or gets an entry in `DisabledTests` with a one-line
 reason. There are no silent skips.
 
-**6490 declined** — 82% of the corpus. The shim exited 89, PORTING.md's
+**6458 declined** — 82% of the corpus. The breakdown below was taken at
+6490, before finding 26 un-declined 32 cases; it is kept as measured
+rather than re-derived from a guess. The shim exited 89, PORTING.md's
 "unimplemented", and the runner counted the case without running it.
 That number is large enough to be the first thing anyone asks about, so
 here is what it is made of — counted two ways, because one of them
@@ -1235,6 +1239,25 @@ laxity, and laxity is what BoGo exists to find.
     leads at 1617. It was plausible when written and nobody could have
     checked it, because the runner swallows the shim's stderr and the
     reasons were not recoverable until this audit made them so.
+
+26. **RFC 9001's extension, refused where it does not belong.** Eight
+    more cases, 454 to 462. zssl grew a QUIC mode, which makes it "an
+    implementation that supports" `quic_transport_parameters` — and RFC
+    9001 §8.2 says such an implementation "MUST" answer the extension
+    with a fatal unsupported_extension "if the extension is received
+    when the transport is not QUIC". Until it knew the extension, zssl
+    skipped code point 57 as it skips every unknown one, which was right
+    then and is a violation now.
+
+    BoGo has the case: `QUICTransportParams-NonQUICServer-*` sends 57,
+    the drafts' 0xffa5, both or neither to a TCP server and wants the
+    alert exactly when 57 is present. It was declined only because the
+    shim did not know `-quic-use-legacy-codepoint`, which names the code
+    point a *QUIC* endpoint should read and means nothing on a TCP one;
+    it is a no-op now. The four that send 57 pass because the server
+    refuses it, and the four that do not pass because it does not. The
+    24 pre-1.3 twins run far enough to end at `protocol_version` and are
+    in the ledger with the standard reason.
 
 ## Running it
 

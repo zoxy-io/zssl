@@ -29,6 +29,7 @@ pub const mem_hooks = @import("crypto/mem_hooks.zig");
 pub const peer_certificate = @import("peer_certificate.zig");
 pub const pem = @import("pem.zig");
 pub const protect = @import("protect.zig");
+pub const quic = @import("quic.zig");
 pub const record = @import("record.zig");
 pub const record_buffer = @import("record_buffer.zig");
 pub const server_messages = @import("server_messages.zig");
@@ -43,6 +44,8 @@ pub const backend = @import("crypto/backend_openssl.zig");
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("rfc8448_test.zig");
+    _ = @import("rfc9001_test.zig");
+    _ = @import("quic_test.zig");
     _ = @import("handshake_test.zig");
     _ = @import("std_interop_test.zig");
     _ = @import("resumption_test.zig");

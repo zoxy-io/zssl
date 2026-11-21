@@ -12,7 +12,8 @@ libcrypto only for the constant-time primitives (AEAD, X25519, ECDSA and
 RSA-PSS signing, and ECDSA verification); checking a peer's *RSA-PSS*
 signature is still `std.crypto`'s. It owns no
 sockets, no threads, and no memory: you feed it whole TLS records and
-transmit whatever it hands back.
+transmit whatever it hands back — or, for QUIC, handshake bytes by
+encryption level, and it hands back traffic secrets ([QUIC](#quic)).
 
 ```zig
 var event = try server.handleRecord(wire_record, &out);
@@ -254,6 +255,67 @@ then verifies the binder itself. A recognised identity with a bad binder
 aborts the handshake rather than falling back — a replayed ticket is
 refused, not downgraded.
 
+### QUIC
+
+RFC 9001 keeps TLS 1.3's messages and key schedule and drops the record
+layer: handshake bytes cross as CRYPTO data at an encryption level, and
+what comes back is a traffic secret per level. Set `Config.quic` and the
+same machines speak that, through `handleCrypto` and `drainCrypto`:
+
+```zig
+var flight: [zssl.ServerHandshake.quic_flight_bytes_min]u8 = undefined;
+var server = zssl.ServerHandshake.init(&.{
+    .credentials = &credentials,
+    .server_random = entropy[0..32].*,
+    .key_share_private = entropy[32..80].*,
+    .alpn_protocols = &.{"h3"}, // §8.1: mandatory over QUIC
+    .reassembly = &reassembly,
+    .flight = &flight,
+    // §8.2: your transport's encoding, carried opaque.
+    .quic = .{ .transport_parameters = transport_parameters },
+});
+defer server.deinit();
+
+var out: [zssl.ServerHandshake.quic_out_bytes_min]u8 = undefined;
+const bytes = connection.cryptoOut(level);
+var event = try server.handleCrypto(level, bytes, &out);
+connection.cryptoConsumed(level, bytes.len);
+while (event) |ready| : (event = try server.drainCrypto(&out)) {
+    switch (ready) {
+        .crypto => |crypto| try connection.cryptoIn(crypto.level, crypto.bytes),
+        .secret => |secret| try connection.installSecret(secret.level, secret.direction, secret.bytes, secret.suite),
+        .transport_parameters => |body| try connection.transportParametersIn(body),
+        .connected => connection.confirmHandshake(),
+    }
+}
+```
+
+Every event borrows until the next call. Secrets arrive in §4.1.4's
+order — the Handshake pair with the ServerHello, 1-RTT send with the
+flight, 1-RTT receive only once the client's Finished verifies — and an
+error is a connection to close with `zssl.quic.errorCode(err)`: §4.8's
+CRYPTO_ERROR, 0x0100 plus the alert, or PROTOCOL_VIOLATION for the rules
+RFC 9001 states as one. The client half is the same loop after
+`client.startCrypto()`, and adds a `.ticket` arm. Tickets go out with
+`sendNewSessionTicket` as bare messages for the application level;
+0-RTT, TLS KeyUpdate and compatibility mode are not part of this mode.
+
+Choosing a certificate by SNI works as it does over TCP, before the
+machine exists: `zssl.quic.firstMessage(connection.cryptoOut(.initial))`
+answers the ClientHello once it is whole, `zssl.client_hello.parse`
+reads its `server_name`, and the server is built with the `Credentials`
+that name selects and fed the same bytes.
+
+Packet protection is here too, because libcrypto is: `zssl.quic.PacketKey`
+seals and opens a packet in place under §5.3's AEAD, and
+`zssl.quic.HeaderKey` produces §5.4's mask from a sample. Each is
+created once per key and allocates nothing per packet. `rekey` points
+either at another key of the same suite in place, also without
+allocating, and `HeaderKey.encryptBlock` and `writeKeystream` give the
+raw block and keystream the mask is taken from — for a caller whose
+interface passes the raw key on every call, as h3's packet-protection
+backend does: it keeps one key per suite for the process and rekeys it.
+
 ## Scope
 
 TLS 1.3 (RFC 8446) and nothing older, both handshake halves, the three
@@ -262,9 +324,12 @@ RSA-PSS, SNI, ALPN, HelloRetryRequest in both directions, PSK
 resumption, 0-RTT, mutual authentication in both directions, RFC 5705
 exporters, KeyUpdate, and kTLS key export.
 
+QUIC (RFC 9001): both handshake halves at the message level, and packet
+and header protection.
+
 Not built: nothing. Never:
 TLS 1.2 and earlier, renegotiation, compression, RSA and DSA key
-exchange, post-handshake client auth, QUIC and DTLS. X.509 chain
+exchange, post-handshake client auth, and DTLS. X.509 chain
 building and RFC 9525 name matching are yours, through
 `chain_verifier`, as above.
 
@@ -279,20 +344,20 @@ its own CI workflow, so they run in parallel and fail separately.
 
 | Oracle | Status | Details |
 | --- | --- | --- |
-| [**BoGo**](docs/BOGO.md) | [![bogo](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml)<br>[![bogo passing](https://img.shields.io/badge/bogo-454%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6490%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | Hostile-peer corpus; checks *which* alert we send |
+| [**BoGo**](docs/BOGO.md) | [![bogo](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/bogo.yml)<br>[![bogo passing](https://img.shields.io/badge/bogo-462%20passing-brightgreen)](docs/BOGO.md)<br>[![bogo declined](https://img.shields.io/badge/bogo-6458%20declined-lightgrey)](docs/BOGO.md#the-three-numbers) | Hostile-peer corpus; checks *which* alert we send |
 | [**tlsfuzzer**](docs/TLSFUZZER.md) | [![tlsfuzzer](https://github.com/zoxy-io/zssl/actions/workflows/tlsfuzzer.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/tlsfuzzer.yml)<br>[![tlsfuzzer](https://img.shields.io/badge/tlsfuzzer-22%2F62%20scripts-yellow)](docs/TLSFUZZER.md) | A third implementation, driving our *server* |
 | [**TLS-Anvil**](docs/TLSANVIL.md) | [![tlsanvil](https://github.com/zoxy-io/zssl/actions/workflows/tlsanvil.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/tlsanvil.yml)<br>[![tlsanvil passing](https://img.shields.io/badge/tls--anvil-115%20passing-brightgreen)](docs/TLSANVIL.md)<br>[![tlsanvil declined](https://img.shields.io/badge/tls--anvil-321%20declined-lightgrey)](docs/TLSANVIL.md#it-scopes-itself) | A corpus derived from the RFCs, not an implementation |
 | [**RFC 8448**](src/rfc8448_test.zig) | [![rfc8448](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/rfc8448.yml) | The RFC's traced bytes, reproduced exactly |
 | [**OpenSSL**](interop/main.zig) | [![interop](https://github.com/zoxy-io/zssl/actions/workflows/interop.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/interop.yml) | Five legs against a real `openssl` binary |
 | [**`std.crypto.tls`**](src/std_interop_test.zig) | [![std.crypto.tls](https://github.com/zoxy-io/zssl/actions/workflows/std-interop.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/std-interop.yml) | A second stack, in memory, both directions |
-| [**Fuzzing**](src/fuzz_test.zig) | [![fuzz](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml)<br>[![fuzz-search](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml) | Nine targets: a value or an error, never a panic. Seeds per PR, coverage-guided search nightly |
+| [**Fuzzing**](src/fuzz_test.zig) | [![fuzz](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz.yml)<br>[![fuzz-search](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml/badge.svg)](https://github.com/zoxy-io/zssl/actions/workflows/fuzz-search.yml) | Twelve targets: a value or an error, never a panic. Seeds per PR, coverage-guided search nightly |
 
 Plus directed tests for what only breaks under adversity — fragmented
 ClientHellos, tampered Finished messages, corrupted binders, inverted
 flights, sequence exhaustion.
 
 The gaps, stated plainly. All three adversarial gates decline far more
-than they run: BoGo never ran 6490 of its cases, tlsfuzzer runs 22
+than they run: BoGo never ran 6458 of its cases, tlsfuzzer runs 22
 scripts of 62, and 321 of TLS-Anvil's 437 tests opt out against a
 TLS 1.3-only server. That is why each carries a second, counted badge
 rather than a bare pass mark, and why each holds its passing count
@@ -332,7 +397,9 @@ zig fmt --check src interop bench bogo tlsanvil tlsfuzzer scripts build.zig buil
 
 RFC 8448 vectors are generated, never transcribed:
 `scripts/extract_rfc8448.py` parses the RFC text into
-`src/rfc8448_vectors.zig`. Regenerate rather than hand-editing.
+`src/rfc8448_vectors.zig`, and `scripts/extract_rfc9001.py` does the
+same for RFC 9001's Appendix A into `src/rfc9001_vectors.zig`.
+Regenerate rather than hand-editing.
 
 [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) is the style contract the tree
 is held to.
@@ -346,6 +413,7 @@ Two things travel with it under other terms:
 - **OpenSSL** (Apache-2.0) is compiled into any binary that links zssl,
   so that binary has to carry Apache-2.0's notice and attribution. This
   is an obligation on whoever ships the binary, not on zssl's source.
-- **`src/rfc8448_vectors.zig`** is generated from the text of RFC 8448,
-  which is IETF Trust material. The generator is in `scripts/`, so the
-  provenance of every byte is reproducible rather than asserted.
+- **`src/rfc8448_vectors.zig`** and **`src/rfc9001_vectors.zig`** are
+  generated from the texts of RFC 8448 and RFC 9001, which are IETF
+  Trust material. The generators are in `scripts/`, so the provenance of
+  every byte is reproducible rather than asserted.

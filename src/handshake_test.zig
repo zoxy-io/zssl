@@ -395,6 +395,46 @@ test "§9.2: an omitted key_share is missing_extension, an empty one is a retry"
     }
 }
 
+test "RFC 9001 §8.2: quic_transport_parameters over TCP is unsupported_extension" {
+    // "A fatal unsupported_extension alert MUST be sent by an
+    // implementation that supports this extension if the extension is
+    // received when the transport is not QUIC." The hello is otherwise
+    // the production client's, so the extension is the only thing wrong.
+    const client_hello = @import("client_hello.zig");
+    const client_messages = @import("client_messages.zig");
+    var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
+    var wire_record: [record.header_bytes + client_messages.hello_bytes_max]u8 = undefined;
+    var public: [backend.x25519_key_bytes]u8 = undefined;
+    try backend.x25519Public(&client_x25519_private, &public);
+    for ([_]?[]const u8{ &.{ 0x01, 0x02 }, null }) |parameters| {
+        var harness: Harness = undefined;
+        try harness.init(&.{});
+        defer harness.deinit();
+        const hello = client_messages.clientHello(wire_record[record.header_bytes..], &.{
+            .random = &@as([32]u8, @splat(0x3c)),
+            .session_id = &.{},
+            .share_group = client_hello.group_x25519,
+            .share_public = &public,
+            .signature_schemes = &client_messages.signature_schemes_default,
+            .groups = &.{client_hello.group_x25519},
+            .quic_transport_parameters = parameters,
+        });
+        record.writeHeader(
+            .{ .content_type = .handshake, .length = @intCast(hello.len) },
+            wire_record[0..record.header_bytes],
+        );
+        const framed = wire_record[0 .. record.header_bytes + hello.len];
+        if (parameters != null) {
+            try testing.expectError(error.UnsupportedExtension, harness.server.handleRecord(framed, &server_out));
+            try testing.expectEqual(ServerHandshake.State.failed, harness.server.state);
+        } else {
+            // The control: the same hello without it is answered.
+            const answer = (try harness.server.handleRecord(framed, &server_out)).?;
+            try testing.expectEqual(std.meta.activeTag(answer), .send);
+        }
+    }
+}
+
 test "§4.2.9 and §4.6.1: psk_key_exchange_modes gates both the offer and the ticket" {
     var server_out: [2 * record.wire_record_bytes_max]u8 = undefined;
     var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;
