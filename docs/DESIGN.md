@@ -163,7 +163,12 @@ CRYPTO bytes in and out by level, secrets installed by level, transport
 parameters as opaque octets. That seam is why zssl owns no QUIC packet
 logic. What it does own is packet *protection* (§5): AEAD and header
 protection are the constant-time primitives §2 hands to libcrypto, and
-zssl is the one place an embedder's binary may bind it.
+zssl is the one place an embedder's binary may bind it. h3's backend
+passes the raw key on every call and keeps nothing between calls, so the
+keys can also be pointed at another key in place (`rekey`), and the
+header key gives its whole AES block and ChaCha20 keystream: an embedder
+keeps one context per suite and direction for the process and rekeys it
+per packet, which never reaches the libcrypto heap after startup.
 
 Three refusals are QUIC's own rather than TLS's. 0-RTT is never accepted
 over QUIC — §8.3 removes EndOfEarlyData, and accepting would mean a

@@ -178,6 +178,18 @@ pub const PacketKey = struct {
         self.* = undefined;
     }
 
+    /// Key this context afresh for `key`, of the suite it was made for, in
+    /// place and without allocating. A caller whose interface passes the
+    /// raw key on every call — h3's packet-protection backend — keeps one
+    /// key per suite and direction for the process and rekeys it per call,
+    /// so it never reaches the libcrypto heap after startup. After an
+    /// error the key is unspecified: nothing may be sealed or opened until
+    /// a `rekey` succeeds.
+    pub fn rekey(self: *PacketKey, key: []const u8) Error!void {
+        assert(key.len == self.aead.key_bytes);
+        try self.aead.rekey(key);
+    }
+
     /// Encrypt `payload` in place; the tag goes to `tag`. `associated_data`
     /// is the packet's header up to and including the packet number, in
     /// the clear — §5.3, before §5.4 masks it.
@@ -271,6 +283,28 @@ pub const HeaderKey = struct {
         self.protection.deinit();
         self.* = undefined;
     }
+
+    /// `PacketKey.rekey`'s twin: a key of the length this key's cipher
+    /// reads, and the same rule after an error.
+    pub fn rekey(self: *HeaderKey, key: []const u8) Error!void {
+        assert(key.len == self.protection.key_bytes);
+        try self.protection.rekey(key);
+    }
+
+    /// The whole AES block the §5.4.3 mask is the first five octets of.
+    pub fn encryptBlock(self: *HeaderKey, input: *const [sample_bytes]u8, output: *[sample_bytes]u8) Error!void {
+        assert(self.protection.kind == .aes);
+        try self.protection.encryptBlock(input, output);
+    }
+
+    /// ChaCha20 keystream from `counter_and_nonce`, the §5.4.4 sample:
+    /// up to `keystream_bytes_max` octets, of which the mask is five.
+    pub fn writeKeystream(self: *HeaderKey, counter_and_nonce: *const [sample_bytes]u8, output: []u8) Error!void {
+        assert(self.protection.kind == .chacha20);
+        try self.protection.writeKeystream(counter_and_nonce, output);
+    }
+
+    pub const keystream_bytes_max = backend.HeaderProtection.keystream_bytes_max;
 
     /// §5.4.3 or §5.4.4, by the suite this key was made for: the mask
     /// whose first octet covers the header's low bits and whose other

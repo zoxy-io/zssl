@@ -341,3 +341,81 @@ test "HKDF-Extract admits the empty connection ID a Retry may leave" {
     const theirs = std.crypto.kdf.hkdf.HkdfSha256.extract(&vectors.initial_salt, &.{});
     try testing.expectEqualSlices(u8, &theirs, &ours);
 }
+
+test "a rekeyed context seals, opens and protects headers as a fresh one does" {
+    // One context per suite and direction, rekeyed per call, is how a
+    // backend whose every call carries the raw key (h3's) stays off the
+    // libcrypto heap after startup. So the context is used before each
+    // rekey — the case with stale state to leave behind — and a failed
+    // open precedes one, and every result is held to a fresh context's.
+    inline for (.{ CipherSuite.aes_128_gcm_sha256, CipherSuite.aes_256_gcm_sha384, CipherSuite.chacha20_poly1305_sha256 }) |suite| {
+        var keys: [3][suite.keyBytes()]u8 = undefined;
+        for (&keys, 0..) |*key, round| {
+            for (key, 0..) |*octet, index| octet.* = @truncate(index *% 5 + round * 0x31 + 0x11);
+        }
+        var sealer = try quic.PacketKey.init(suite, &keys[0], .seal);
+        defer sealer.deinit();
+        var opener = try quic.PacketKey.init(suite, &keys[0], .open);
+        defer opener.deinit();
+        var header = try quic.HeaderKey.init(suite, &keys[0]);
+        defer header.deinit();
+        const sample = vectors.client_crypto_frame[0..quic.sample_bytes];
+        for (keys, 0..) |key, round| {
+            if (round > 0) {
+                try sealer.rekey(&key);
+                try opener.rekey(&key);
+                try header.rekey(&key);
+            }
+            var fresh = try quic.PacketKey.init(suite, &key, .seal);
+            defer fresh.deinit();
+            const packet_nonce = quic.nonce(&vectors.server_iv, round);
+            var ours: [32 + @as(usize, quic.tag_bytes)]u8 = @splat(0x5a);
+            var theirs: [32 + @as(usize, quic.tag_bytes)]u8 = @splat(0x5a);
+            _ = try sealer.seal(&packet_nonce, "header", &ours, 32);
+            _ = try fresh.seal(&packet_nonce, "header", &theirs, 32);
+            try testing.expectEqualSlices(u8, &theirs, &ours);
+            // A forgery first, then the real packet: a refused open must
+            // leave nothing behind for the next one to trip over.
+            var forged = ours;
+            forged[0] ^= 1;
+            try testing.expectError(error.AuthenticationFailed, opener.open(&packet_nonce, "header", &forged));
+            const opened = try opener.open(&packet_nonce, "header", &ours);
+            try testing.expect(std.mem.allEqual(u8, opened, 0x5a));
+            var header_fresh = try quic.HeaderKey.init(suite, &key);
+            defer header_fresh.deinit();
+            try testing.expectEqualSlices(u8, &try header_fresh.mask(sample), &try header.mask(sample));
+        }
+    }
+}
+
+test "the header key's whole AES block and ChaCha20 keystream agree with std.crypto" {
+    // h3's backend takes the block and the keystream rather than the
+    // mask; the mask is their first five octets.
+    const sample = vectors.client_crypto_frame[0..quic.sample_bytes];
+    var key128: [16]u8 = undefined;
+    for (&key128, 0..) |*octet, index| octet.* = @truncate(index *% 3 + 9);
+    var aes = try quic.HeaderKey.init(.aes_128_gcm_sha256, &key128);
+    defer aes.deinit();
+    var ours: [16]u8 = undefined;
+    try aes.encryptBlock(sample, &ours);
+    var theirs: [16]u8 = undefined;
+    std.crypto.core.aes.Aes128.initEnc(key128).encrypt(&theirs, sample);
+    try testing.expectEqualSlices(u8, &theirs, &ours);
+    try testing.expectEqualSlices(u8, theirs[0..quic.mask_bytes], &try aes.mask(sample));
+
+    var key256: [32]u8 = undefined;
+    for (&key256, 0..) |*octet, index| octet.* = @truncate(index *% 11 + 2);
+    var chacha = try quic.HeaderKey.init(.chacha20_poly1305_sha256, &key256);
+    defer chacha.deinit();
+    const counter = std.mem.readInt(u32, sample[0..4], .little);
+    for ([_]usize{ 1, 5, 16, 64 }) |length| {
+        var stream: [quic.HeaderKey.keystream_bytes_max]u8 = undefined;
+        try chacha.writeKeystream(sample, stream[0..length]);
+        var expected: [quic.HeaderKey.keystream_bytes_max]u8 = @splat(0);
+        std.crypto.stream.chacha.ChaCha20IETF.xor(expected[0..length], expected[0..length], counter, key256, sample[4..16].*);
+        try testing.expectEqualSlices(u8, expected[0..length], stream[0..length]);
+    }
+    var stream: [quic.mask_bytes]u8 = undefined;
+    try chacha.writeKeystream(sample, &stream);
+    try testing.expectEqualSlices(u8, &stream, &try chacha.mask(sample));
+}

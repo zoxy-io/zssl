@@ -171,8 +171,10 @@ pub const AeadKey = struct {
 /// and a connection holds up to eight of them (§4.1.4's three levels
 /// and §6's next generation, both ways), so a second context per key
 /// would double what a connection costs the embedder's fixed heap for
-/// nothing. Initialized once per key, which is the one allocation;
-/// `seal` and `open` reuse the context and allocate nothing.
+/// nothing. `init` is the one allocation; `seal` and `open` reuse the
+/// context and allocate nothing, and `rekey` points it at another key of
+/// the same suite, also without allocating — for a caller that passes
+/// the raw key per call and keeps one context per suite and direction.
 ///
 /// Both work in place: the payload is overwritten with its own
 /// ciphertext or plaintext. libcrypto permits exactly-equal input and
@@ -213,6 +215,28 @@ pub const PacketAead = struct {
         assert(self.key_bytes == 16 or self.key_bytes == 32);
         c.EVP_CIPHER_CTX_free(self.context);
         self.* = undefined;
+    }
+
+    /// Key the context afresh, in place, for a key of the same suite: no
+    /// allocation, so a caller that keeps one context per suite and
+    /// direction can seal under any number of keys without touching the
+    /// libcrypto heap after `init`. The IV length `init` set survives —
+    /// a null-IV init leaves it — and `seal` and `open` set each packet's
+    /// nonce themselves, which is what makes a context sealed under one key
+    /// and then rekeyed exactly a fresh one.
+    ///
+    /// After an error the context's key is unspecified: it must not seal
+    /// or open again until a `rekey` succeeds, and a caller treats the
+    /// error as fatal to the packet in hand.
+    pub fn rekey(self: *PacketAead, key: []const u8) Error!void {
+        errdefer clearErrorQueue();
+        assert(key.len == self.key_bytes);
+        const encrypt: c_int = switch (self.direction) {
+            .seal => 1,
+            .open => 0,
+        };
+        assert(encrypt == 0 or encrypt == 1);
+        if (c.EVP_CipherInit_ex(self.context, null, null, key.ptr, null, encrypt) != 1) return error.LibcryptoFailed;
     }
 
     /// Encrypt `payload` in place and write its tag to `tag`.
@@ -287,8 +311,8 @@ pub const PacketAead = struct {
 /// octet sample, under one header-protection key.
 ///
 /// §5.4.3's AES variant is one raw block — ECB over exactly one block,
-/// the one place that is not a mistake — so the context is keyed once
-/// and each mask is a single update. §5.4.4's ChaCha20 variant takes the
+/// the one place that is not a mistake — so the context is keyed at
+/// `init`, or again by `rekey`, and each mask is a single update. §5.4.4's ChaCha20 variant takes the
 /// sample's first four octets as a little-endian block counter and the
 /// other twelve as the nonce, which is octet for octet the sixteen-octet
 /// IV libcrypto's `EVP_chacha20` defines, so each mask re-IVs the context
@@ -296,7 +320,10 @@ pub const PacketAead = struct {
 pub const HeaderProtection = struct {
     context: *c.EVP_CIPHER_CTX,
     kind: Kind,
-
+    /// The key length the cipher reads: 16 for AES-128, 32 for AES-256 and
+    /// ChaCha20. `rekey` holds a new key to it, since libcrypto reads the
+    /// cipher's length from the pointer whatever the slice says.
+    key_bytes: u8,
     pub const Kind = enum { aes, chacha20 };
     pub const sample_bytes: u8 = 16;
     pub const mask_bytes: u8 = 5;
@@ -325,7 +352,7 @@ pub const HeaderProtection = struct {
         if (kind == .aes) {
             if (c.EVP_CIPHER_CTX_set_padding(context, 0) != 1) return error.LibcryptoFailed;
         }
-        return .{ .context = context, .kind = kind };
+        return .{ .context = context, .kind = kind, .key_bytes = @intCast(key.len) };
     }
 
     pub fn deinit(self: *HeaderProtection) void {
@@ -333,6 +360,47 @@ pub const HeaderProtection = struct {
         c.EVP_CIPHER_CTX_free(self.context);
         self.* = undefined;
     }
+
+    /// `PacketAead.rekey`'s twin: the same cipher, a new key, in place, and
+    /// the same rule after an error. A key-only init keeps the padding
+    /// `init` turned off, so there is nothing else to set again.
+    pub fn rekey(self: *HeaderProtection, key: []const u8) Error!void {
+        errdefer clearErrorQueue();
+        assert(key.len == self.key_bytes);
+        assert(self.kind == .aes or self.kind == .chacha20);
+        if (c.EVP_EncryptInit_ex(self.context, null, null, key.ptr, null) != 1) return error.LibcryptoFailed;
+    }
+
+    /// The whole AES block §5.4.3 takes its mask from: for a caller whose
+    /// interface is the block rather than the mask (h3's backend).
+    pub fn encryptBlock(self: *HeaderProtection, input: *const [sample_bytes]u8, output: *[sample_bytes]u8) Error!void {
+        errdefer clearErrorQueue();
+        assert(self.kind == .aes);
+        var written: c_int = 0;
+        if (c.EVP_EncryptUpdate(self.context, output, &written, input, sample_bytes) != 1) return error.LibcryptoFailed;
+        if (written != sample_bytes) return error.LibcryptoFailed;
+    }
+
+    /// `output.len` octets of RFC 8439's ChaCha20 keystream from the
+    /// sixteen-octet IV `counter_and_nonce` (§5.4.4's sample: a
+    /// little-endian block counter, then the nonce) — the mask §5.4.4
+    /// takes five of, for a caller whose interface is the keystream.
+    pub fn writeKeystream(self: *HeaderProtection, counter_and_nonce: *const [sample_bytes]u8, output: []u8) Error!void {
+        errdefer clearErrorQueue();
+        assert(self.kind == .chacha20);
+        assert(output.len >= 1);
+        assert(output.len <= keystream_bytes_max);
+        if (c.EVP_EncryptInit_ex(self.context, null, null, null, counter_and_nonce) != 1) return error.LibcryptoFailed;
+        var written: c_int = 0;
+        if (c.EVP_EncryptUpdate(self.context, output.ptr, &written, &keystream_zeroes, @intCast(output.len)) != 1) {
+            return error.LibcryptoFailed;
+        }
+        if (written != @as(c_int, @intCast(output.len))) return error.LibcryptoFailed;
+    }
+
+    /// The most keystream one `writeKeystream` call writes: a ChaCha20 block.
+    pub const keystream_bytes_max: u8 = 64;
+    const keystream_zeroes: [keystream_bytes_max]u8 = @splat(0);
 
     pub fn mask(self: *HeaderProtection, sample: *const [sample_bytes]u8) Error![mask_bytes]u8 {
         errdefer clearErrorQueue();

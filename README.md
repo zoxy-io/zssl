@@ -309,7 +309,12 @@ that name selects and fed the same bytes.
 Packet protection is here too, because libcrypto is: `zssl.quic.PacketKey`
 seals and opens a packet in place under §5.3's AEAD, and
 `zssl.quic.HeaderKey` produces §5.4's mask from a sample. Each is
-created once per key and allocates nothing per packet.
+created once per key and allocates nothing per packet. `rekey` points
+either at another key of the same suite in place, also without
+allocating, and `HeaderKey.encryptBlock` and `writeKeystream` give the
+raw block and keystream the mask is taken from — for a caller whose
+interface passes the raw key on every call, as h3's packet-protection
+backend does: it keeps one key per suite for the process and rekeys it.
 
 ## Scope
 
